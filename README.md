@@ -245,30 +245,74 @@ npm 下可能"碰巧能跑"，pnpm 下会立刻报错。这是**期望行为**�
 > 日常开发建议同时开两个终端：`pnpm run dev`（Worker + D1）与 `pnpm run dev:web`（Vue HMR）。
 > 只跑 `pnpm run dev` 也可以，此时访问的是 `pnpm run build` 产出的静态面板。
 
-部署：
+### 部署
+
+> **无头 / 远程主机上的认证**
+> `wrangler login` 会在本机 `http://localhost:8976` 开一个 OAuth 回调服务器，
+> 无头机收不到回调，因此**用不了**。二选一：
+>
+> **方式 A — 设备码**（交互式，码只有 5 分钟有效期）
+> ```bash
+> pnpm exec wrangler login --device --browser=false
+> # 然后在任意能上网的浏览器打开提示的 URL 并输入设备码
+> ```
+>
+> **方式 B — API Token**（推荐，无需竞速，也适合 CI）
+> 在 https://dash.cloudflare.com/profile/api-tokens 建 token，权限：
+> `Workers Scripts:Edit`、`D1:Edit`、`Workers Routes:Edit`、`Account Settings:Read`。
+> ```bash
+> export CLOUDFLARE_API_TOKEN=...
+> export CLOUDFLARE_ACCOUNT_ID=...
+> ```
+> Wrangler 会自动读取这两个环境变量，之后所有命令都无需登录。
 
 ```bash
-pnpm exec wrangler d1 create teleport-db-prod        # 填 id 到 [env.production]
-pnpm run db:migrate:remote
-pnpm exec wrangler secret put AGENT_SECRET_KEY   --env production
-pnpm exec wrangler secret put SESSION_SECRET     --env production
+# 1. 建生产库（需先把 database_id 填进 [env.production.d1_databases]）
+pnpm exec wrangler d1 create teleport-db-prod
+
+# 2. 建表（--env production 不能漏，否则会打到别的库）
+pnpm exec wrangler d1 migrations apply DB --remote --env production
+
+# 3. 三个密钥，逐个 --env production
+pnpm exec wrangler secret put AGENT_SECRET_KEY    --env production
+pnpm exec wrangler secret put SESSION_SECRET      --env production
+pnpm run hash-password '你的面板密码'              # 复制输出
 pnpm exec wrangler secret put ADMIN_PASSWORD_HASH --env production
-pnpm exec wrangler deploy --env production             # 先 vite build，再 wrangler deploy
+
+# 4. 构建 + 部署
+pnpm run deploy
+
+# 5. 把部署输出的 URL 填回 PUBLIC_BASE_URL，再部署一次
+pnpm run deploy
 ```
+
+> **第 5 步为何要部署两次**：`PUBLIC_BASE_URL` 决定 API 返回的分享链接前缀。
+> 首次部署前你不知道真正的 `*.workers.dev` 子域名，只能先占位；
+> 拿到真实地址后填回去重部署，分享链接才是对的。
+>
+> **关于域名**：`workers.dev` 子域名免费、免备案，够用就不必买域名。
+> 想挂自定义域名，取消 `[[env.production.routes]]` 注释并把
+> `workers_dev` 改为 `false` —— **两者必须同时改**，否则 Worker 没有任何可访问入口。
 
 | 命令 | 作用 |
 |---|---|
 | `pnpm run dev` | Worker 开发服务器（含本地 D1） |
 | `pnpm run dev:web` | Vite 前端开发服务器（HMR + `/api` 代理） |
 | `pnpm run build` | 构建 Vue 面板到 `public/` |
-| `pnpm run deploy` | 构建 + 部署到 Cloudflare |
+| `pnpm run deploy` | 构建 + 部署到 production |
+| `pnpm run deploy:staging` | 构建 + 部署到 staging |
 | `pnpm run typecheck` | Worker 类型检查（`tsc --noEmit`） |
 | `pnpm run typecheck:web` | 前端类型检查（`vue-tsc`） |
 | `pnpm run typecheck:all` | 两侧一起检查 |
 | `pnpm run cf-typegen` | 依据 wrangler.toml 重新生成绑定类型 |
-| `pnpm run db:migrate:local` / `:remote` | 应用 D1 迁移 |
+| `pnpm run db:migrate:local` | 本地 D1 迁移 |
+| `pnpm run db:migrate:remote` | 生产 D1 迁移（`--env production`） |
+| `pnpm run db:migrate:staging` | staging D1 迁移 |
 | `pnpm run db:check-schema` | 校验 `schema.sql` 与迁移文件一致 |
 | `pnpm run hash-password` | 生成管理员口令哈希 |
+
+> 迁移脚本用 **binding 名 `DB`** 而非数据库名，这样 `--env` 会自动解析到该环境
+> 对应的 `database_id`。若写死数据库名，跨环境时容易迁移到错误的库。
 
 ---
 
