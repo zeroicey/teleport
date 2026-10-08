@@ -1,0 +1,21 @@
+# Local development secrets — copy to `.dev.vars` and fill in.
+# `.dev.vars` is git-ignored; NEVER commit real values.
+#
+#   cp .dev.vars.example .dev.vars
+#
+# Production secrets are set with:
+#   npx wrangler secret put AGENT_SECRET_KEY
+#   npx wrangler secret put SESSION_SECRET
+#   npx wrangler secret put ADMIN_PASSWORD_HASH
+
+# Bearer token required by POST /api/reports (agents).
+# Generate: openssl rand -base64 32
+AGENT_SECRET_KEY="dev-agent-secret-change-me"
+
+# HMAC key that signs the dashboard session cookie.
+# Generate: openssl rand -base64 48
+SESSION_SECRET="dev-session-secret-change-me-please-32-bytes-min"
+
+# PBKDF2 hash of the dashboard password.
+# Generate: node scripts/hash-password.mjs 'your password'
+ADMIN_PASSWORD_HASH="pbkdf2$210000$REPLACE_SALT$REPLACE_HASH"

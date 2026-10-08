@@ -1,0 +1,41 @@
+{
+  "name": "teleport",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "dev:web": "vite",
+    "build": "vite build",
+    "deploy": "pnpm run build && wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "typecheck:web": "vue-tsc --noEmit -p tsconfig.web.json",
+    "typecheck:all": "pnpm run typecheck && pnpm run typecheck:web",
+    "cf-typegen": "wrangler types",
+    "db:migrate:local": "wrangler d1 migrations apply teleport-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply teleport-db --remote",
+    "db:check-schema": "node scripts/check-schema-sync.mjs",
+    "hash-password": "node scripts/hash-password.mjs"
+  },
+  "dependencies": {
+    "highlight.js": "^11.12.0",
+    "hono": "^4.13.13",
+    "markdown-it": "^15.0.2",
+    "mermaid": "^12.1.0",
+    "vue": "^3.5.43",
+    "vue-router": "^4.6.4"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "^14.2.0",
+    "@types/node": "^26.6.4",
+    "@vitejs/plugin-vue": "^6.0.9",
+    "typescript": "^5.9.3",
+    "vite": "^8.3.3",
+    "vue-tsc": "^3.3.12",
+    "wrangler": "^4.148.0"
+  }
+}

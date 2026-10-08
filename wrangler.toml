@@ -1,0 +1,125 @@
+#:schema node_modules/wrangler/config-schema.json
+# ============================================================================
+#  Teleport — AI report publishing & expiring-share platform
+#  Cloudflare Workers + D1 + Workers Assets
+# ============================================================================
+#  Docs: https://developers.cloudflare.com/workers/wrangler/configuration/
+#
+#  Quick start
+#    1. npx wrangler d1 create teleport-db        # copy the printed database_id
+#    2. paste that id into [[d1_databases]].database_id below
+#    3. npx wrangler d1 migrations apply teleport-db --local
+#    4. cp .dev.vars.example .dev.vars            # then edit the secrets
+#    5. npm run dev
+# ============================================================================
+
+name = "teleport"
+main = "src/index.ts"
+
+# Pin the runtime contract. Bump deliberately, then re-run `npm run cf-typegen`.
+compatibility_date = "2026-10-07"
+compatibility_flags = ["nodejs_compat"]
+
+# Serve on <worker-name>.<subdomain>.workers.dev. Set false once a custom
+# domain is attached via `routes` / `custom_domain`.
+workers_dev = true
+
+# ---------------------------------------------------------------------------
+# Static assets (Workers Assets — replaces the legacy Pages deployment)
+# ---------------------------------------------------------------------------
+# `public/` holds the built dashboard SPA. The Worker stays in the request path
+# for the paths listed in `run_worker_first`; everything else is served straight
+# from the edge cache with no Worker invocation.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+html_handling = "auto-trailing-slash"
+not_found_handling = "single-page-application"
+#   /api/*  → REST API (never an asset)
+#   /s/*    → public share pages: server-rendered so we can return a real
+#             404/410 for unknown, revoked or expired tokens instead of
+#             leaking a shell that then fails client-side.
+#   /dashboard/* → falls through to the SPA assets (client-side auth check).
+run_worker_first = ["/api/*", "/s/*"]
+
+# ---------------------------------------------------------------------------
+# D1 database binding (SQLite)
+# ---------------------------------------------------------------------------
+# Create it once:
+#   npx wrangler d1 create teleport-db
+# The command prints a database_id — paste it here. It is not a secret, but it
+# is account-specific, so it is intentionally left as a placeholder.
+[[d1_databases]]
+binding = "DB"                       # -> env.DB in the Worker
+database_name = "teleport-db"
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+migrations_dir = "migrations"        # `wrangler d1 migrations apply` reads here
+
+# ---------------------------------------------------------------------------
+# Non-secret environment variables
+# ---------------------------------------------------------------------------
+[vars]
+ENVIRONMENT = "development"
+# Public origin used to build share URLs returned by the API. No trailing slash.
+PUBLIC_BASE_URL = "http://localhost:8787"
+# Default lifetime (hours) when a caller omits `autoShareHours`. 0 = never expires.
+DEFAULT_SHARE_HOURS = "168"
+# Max accepted report body size in bytes (guards D1 row/CPU limits).
+MAX_CONTENT_BYTES = "1048576"
+
+# Secrets are NOT stored here. Set them per environment:
+#   npx wrangler secret put AGENT_SECRET_KEY     # AI agents -> POST /api/reports
+#   npx wrangler secret put SESSION_SECRET       # signs the dashboard session cookie
+#   npx wrangler secret put ADMIN_PASSWORD_HASH  # PBKDF2 hash for /dashboard login
+# For local dev put the same names in .dev.vars (git-ignored).
+
+# ---------------------------------------------------------------------------
+# Staging
+# ---------------------------------------------------------------------------
+[env.staging]
+name = "teleport-staging"
+workers_dev = true
+
+[env.staging.vars]
+ENVIRONMENT = "staging"
+PUBLIC_BASE_URL = "https://teleport-staging.<your-subdomain>.workers.dev"
+DEFAULT_SHARE_HOURS = "168"
+MAX_CONTENT_BYTES = "1048576"
+
+# Staging gets its own D1 database so experiments never touch production data.
+[[env.staging.d1_databases]]
+binding = "DB"
+database_name = "teleport-db-staging"
+database_id = "REPLACE_WITH_YOUR_STAGING_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# ---------------------------------------------------------------------------
+# Production
+# ---------------------------------------------------------------------------
+[env.production]
+name = "teleport"
+workers_dev = false
+
+[env.production.vars]
+ENVIRONMENT = "production"
+PUBLIC_BASE_URL = "https://reports.<your-domain>.com"
+DEFAULT_SHARE_HOURS = "168"
+MAX_CONTENT_BYTES = "1048576"
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "teleport-db-prod"
+database_id = "REPLACE_WITH_YOUR_PROD_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+# Optional: attach a custom domain instead of workers.dev
+# [[env.production.routes]]
+# pattern = "reports.<your-domain>.com"
+# custom_domain = true
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+[observability]
+enabled = true
+head_sampling_rate = 1

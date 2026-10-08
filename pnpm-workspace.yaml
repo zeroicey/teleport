@@ -1,0 +1,13 @@
+# pnpm 10 blocks postinstall scripts by default (supply-chain hardening).
+# These four genuinely need to run — without them the toolchain breaks:
+#   esbuild  — downloads/builds the platform binary Vite depends on
+#   workerd  — Cloudflare's Workers runtime binary, required by `wrangler dev`
+#   sharp    — native image library used by miniflare/wrangler
+#   blake3-wasm — build step used by miniflare
+# Approval is by exact package name only (never a wildcard), so a compromised
+# transitive dependency still cannot execute code at install time.
+onlyBuiltDependencies:
+  - esbuild
+  - workerd
+  - sharp
+  - blake3-wasm
