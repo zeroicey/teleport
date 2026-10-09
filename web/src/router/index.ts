@@ -40,6 +40,11 @@ export const router = createRouter({
       component: () => import('../views/ReportDetailView.vue'),
       props: true,
     },
+    {
+      path: '/dashboard/keys',
+      name: 'keys',
+      component: () => import('../views/KeyManagementView.vue'),
+    },
     { path: '/:pathMatch(.*)*', redirect: '/dashboard' },
   ],
 });

@@ -15,8 +15,10 @@ package aidoc
 
 import (
 	_ "embed"
+	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/zeroicey/teleport/backend/internal/config"
 )
@@ -34,6 +36,9 @@ const (
 	phDefaultShareHrs = "{{DEFAULT_SHARE_HOURS}}"
 	phMaxContent      = "{{MAX_CONTENT_BYTES}}"
 	phEnvironment     = "{{ENVIRONMENT}}"
+	phKeyAppTTL       = "{{KEY_APPLICATION_TTL}}"
+	phKeyClaimWindow  = "{{KEY_CLAIM_WINDOW}}"
+	phKeyApplyPerHour = "{{KEY_APPLY_PER_HOUR}}"
 )
 
 // Facts are the live deployment values substituted into the guide.
@@ -43,6 +48,12 @@ type Facts struct {
 	DefaultShareHours int
 	MaxContentBytes   int64
 	Environment       string
+	// The key-application limits are surfaced too: they are what tells a polling
+	// agent how long it may wait, how long it has to claim, and when it is being
+	// rate-limited, and all three change with configuration.
+	KeyApplicationTTL time.Duration
+	KeyClaimWindow    time.Duration
+	KeyApplyPerHour   int
 }
 
 // FactsFrom extracts the substitution values from a loaded Config.
@@ -53,6 +64,9 @@ func FactsFrom(cfg *config.Config) Facts {
 		DefaultShareHours: cfg.DefaultShareHours,
 		MaxContentBytes:   cfg.MaxContentBytes,
 		Environment:       cfg.Environment,
+		KeyApplicationTTL: cfg.KeyApplicationTTL,
+		KeyClaimWindow:    cfg.KeyClaimWindow,
+		KeyApplyPerHour:   cfg.KeyApplyPerHour,
 	}
 }
 
@@ -64,5 +78,39 @@ func Markdown(f Facts) string {
 		phDefaultShareHrs, strconv.Itoa(f.DefaultShareHours),
 		phMaxContent, strconv.FormatInt(f.MaxContentBytes, 10),
 		phEnvironment, f.Environment,
+		phKeyAppTTL, HumanDuration(f.KeyApplicationTTL),
+		phKeyClaimWindow, HumanDuration(f.KeyClaimWindow),
+		phKeyApplyPerHour, strconv.Itoa(f.KeyApplyPerHour),
 	).Replace(guideTemplate)
+}
+
+// HumanDuration renders a duration the way a person writes it: "24h", "30m",
+// "45s", "1h30m".
+//
+// time.Duration.String() would render 24h as "24h0m0s", which reads like a
+// machine value pasted into prose and makes the guide harder to skim. Zero and
+// negative are reported as 0s rather than "0s" by accident of sign handling.
+func HumanDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	d = d.Round(time.Second)
+	var b strings.Builder
+
+	if days := d / (24 * time.Hour); days > 0 {
+		fmt.Fprintf(&b, "%dd", days)
+		d -= days * 24 * time.Hour
+	}
+	if hours := d / time.Hour; hours > 0 {
+		fmt.Fprintf(&b, "%dh", hours)
+		d -= hours * time.Hour
+	}
+	if minutes := d / time.Minute; minutes > 0 {
+		fmt.Fprintf(&b, "%dm", minutes)
+		d -= minutes * time.Minute
+	}
+	if seconds := d / time.Second; seconds > 0 {
+		fmt.Fprintf(&b, "%ds", seconds)
+	}
+	return b.String()
 }

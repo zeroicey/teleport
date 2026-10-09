@@ -3,6 +3,7 @@ package aidoc
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zeroicey/teleport/backend/internal/config"
 	"github.com/zeroicey/teleport/backend/internal/views"
@@ -175,4 +176,48 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// The guide embeds configured durations, so their rendering is part of the
+// contract a reader sees. time.Duration.String() would give "24h0m0s", which
+// reads like a machine value leaked into prose.
+func TestHumanDurationIsReadable(t *testing.T) {
+	cases := []struct {
+		in   time.Duration
+		want string
+	}{
+		{30 * time.Minute, "30m"},
+		{45 * time.Second, "45s"},
+		{90 * time.Minute, "1h30m"},
+		{24 * time.Hour, "1d"},
+		{7 * 24 * time.Hour, "7d"},
+		{36 * time.Hour, "1d12h"},
+		{0, "0s"},
+		{-time.Hour, "0s"},
+	}
+	for _, c := range cases {
+		if got := HumanDuration(c.in); got != c.want {
+			t.Errorf("HumanDuration(%v) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// A rendered guide must never show a raw placeholder to a reader, and the key
+// limits must actually reflect the configuration rather than the defaults.
+func TestKeyLimitPlaceholdersFollowConfiguration(t *testing.T) {
+	f := Facts{
+		AppBase: "https://example.test/p", RoutePrefix: "/p", Environment: "test",
+		KeyApplicationTTL: 48 * time.Hour,
+		KeyClaimWindow:    15 * time.Minute,
+		KeyApplyPerHour:   7,
+	}
+	got := Markdown(f)
+	if strings.Contains(got, "{{") {
+		t.Error("rendered guide still contains a placeholder")
+	}
+	for _, want := range []string{"2d", "15m", "7"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("rendered guide is missing configured value %q", want)
+		}
+	}
 }

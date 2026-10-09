@@ -28,6 +28,7 @@ import (
 
 	"github.com/zeroicey/teleport/backend/internal/api"
 	"github.com/zeroicey/teleport/backend/internal/config"
+	"github.com/zeroicey/teleport/backend/internal/httpx"
 	"github.com/zeroicey/teleport/backend/internal/password"
 	"github.com/zeroicey/teleport/backend/internal/store"
 	"github.com/zeroicey/teleport/backend/internal/webui"
@@ -104,6 +105,17 @@ func main() {
 	if cfg.Environment == "production" && !cfg.CookieSecure {
 		slog.Warn("COOKIE_SECURE is false in production; the session cookie can be sent over plain HTTP")
 	}
+
+	// The CF Access identity header is an authentication shortcut that must stay
+	// off unless Cloudflare actually fronts this process. Warn at startup so that
+	// switching it on can never be quiet.
+	//
+	// There is deliberately NO environment variable that enables it: turning it on
+	// requires editing httpx.TrustCFAccess in code and redeploying. That is the
+	// point — this shortcut authenticates anyone who can send a header, so it must
+	// not be one typo in an env file away. This call guards a future code edit, not
+	// a runtime configuration.
+	httpx.WarnIfTrustingCFAccess()
 
 	handler, err := api.New(cfg, store.New(db))
 	if err != nil {

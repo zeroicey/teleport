@@ -80,6 +80,27 @@ type Config struct {
 
 	// Environment is echoed by /api/health.
 	Environment string
+
+	// -- agent self-service keys -------------------------------------------
+	//
+	// These bound the public application endpoint. Anyone on the internet can
+	// submit an application (there is no shared secret to hand over first), so
+	// the limits are what stand between the service and a flooded approval
+	// queue. The counters are in-process, so they reset on restart: a known and
+	// accepted trade-off for a single-binary personal deployment.
+	//
+	// KeyApplyPerHour caps applications per source IP per hour.
+	KeyApplyPerHour int
+	// KeyApplicationTTL is how long an unapproved application stays open.
+	KeyApplicationTTL time.Duration
+	// KeyClaimWindow is how long an approved application can still be claimed.
+	// After it lapses the credential is never issued at all.
+	KeyClaimWindow time.Duration
+	// KeyMaxPending caps outstanding applications, approved or not.
+	KeyMaxPending int
+	// KeyMaxActive caps live credentials, so a compromised approver or a runaway
+	// agent cannot mint unbounded keys.
+	KeyMaxActive int
 }
 
 // Load builds a Config from the environment, after optionally loading a .env
@@ -153,6 +174,38 @@ func Load() (*Config, error) {
 	}
 	if cfg.SessionTTL, err = envDuration("SESSION_TTL", 12*time.Hour); err != nil {
 		return nil, err
+	}
+	if cfg.KeyApplyPerHour, err = envInt("KEY_APPLY_PER_HOUR", 5); err != nil {
+		return nil, err
+	}
+	if cfg.KeyApplicationTTL, err = envDuration("KEY_APPLICATION_TTL", 24*time.Hour); err != nil {
+		return nil, err
+	}
+	if cfg.KeyClaimWindow, err = envDuration("KEY_CLAIM_WINDOW", 30*time.Minute); err != nil {
+		return nil, err
+	}
+	if cfg.KeyMaxPending, err = envInt("KEY_MAX_PENDING", 50); err != nil {
+		return nil, err
+	}
+	if cfg.KeyMaxActive, err = envInt("KEY_MAX_ACTIVE", 100); err != nil {
+		return nil, err
+	}
+	// A zero or negative limit would reject every request, which reads as a
+	// broken deployment rather than a strict one. Reject it at startup instead.
+	if cfg.KeyApplyPerHour <= 0 {
+		return nil, fmt.Errorf("KEY_APPLY_PER_HOUR must be positive (got %d)", cfg.KeyApplyPerHour)
+	}
+	if cfg.KeyMaxPending <= 0 {
+		return nil, fmt.Errorf("KEY_MAX_PENDING must be positive (got %d)", cfg.KeyMaxPending)
+	}
+	if cfg.KeyMaxActive <= 0 {
+		return nil, fmt.Errorf("KEY_MAX_ACTIVE must be positive (got %d)", cfg.KeyMaxActive)
+	}
+	if cfg.KeyApplicationTTL <= 0 {
+		return nil, fmt.Errorf("KEY_APPLICATION_TTL must be positive (got %s)", cfg.KeyApplicationTTL)
+	}
+	if cfg.KeyClaimWindow <= 0 {
+		return nil, fmt.Errorf("KEY_CLAIM_WINDOW must be positive (got %s)", cfg.KeyClaimWindow)
 	}
 	if cfg.CookieSecure, err = envBool("COOKIE_SECURE", true); err != nil {
 		return nil, err

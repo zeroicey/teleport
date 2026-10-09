@@ -14,7 +14,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/zeroicey/teleport/backend/internal/agentkey"
 	"github.com/zeroicey/teleport/backend/internal/aidoc"
 	"github.com/zeroicey/teleport/backend/internal/config"
 	"github.com/zeroicey/teleport/backend/internal/domain"
@@ -31,6 +33,14 @@ type Server struct {
 	cfg    *config.Config
 	store  *store.Store
 	render *markdown.Renderer
+	// kDerive is the agent-key derivation subkey, computed once from the session
+	// secret. Deriving it per request would be an HMAC on the hot path for no
+	// benefit; keeping it here also means no handler has to reach for the root
+	// secret directly.
+	kDerive []byte
+	// applyLimiter throttles the public application endpoint. In-process by
+	// design: one binary, and a restart merely resets the window.
+	applyLimiter *applyLimiter
 }
 
 // New builds the HTTP handler for the whole API.
@@ -39,7 +49,13 @@ type Server struct {
 // failure: a misconfigured StaticDir should stop the process with a clear
 // message, not silently serve an API with no frontend.
 func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
-	s := &Server{cfg: cfg, store: st, render: markdown.New()}
+	s := &Server{
+		cfg:          cfg,
+		store:        st,
+		render:       markdown.New(),
+		kDerive:      agentkey.KDerive(cfg.SessionSecret),
+		applyLimiter: newApplyLimiter(cfg.KeyApplyPerHour, time.Hour),
+	}
 
 	authCfg := httpx.AuthConfig{
 		AgentSecretKey: cfg.AgentSecretKey,
@@ -48,7 +64,11 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 		CookiePath:     cfg.CookiePath,
 		SessionTTL:     cfg.SessionTTL,
 	}
-	requireAgent := httpx.RequireAgent(authCfg)
+	// The resolver is what makes a named key in agent_keys usable at all: the
+	// middleware hashes the bearer token and asks the store whether that hash is
+	// a live key. Root stays a property of the environment credential and never
+	// passes through here.
+	requireAgent := httpx.RequireAgent(authCfg, keyResolver{store: st})
 	requireSession := httpx.RequireSession(authCfg)
 
 	mux := http.NewServeMux()
@@ -77,6 +97,20 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	mux.Handle("GET "+p+"/api/reports/{id}", requireAgent(http.HandlerFunc(s.handleGetReport)))
 	mux.Handle("POST "+p+"/api/share/{token}/revoke", requireAgent(http.HandlerFunc(s.handleRevoke)))
 
+	// Key self-service. The application and renewal poll endpoints are their own
+	// public surface, protected by the claim secret in X-Teleport-Claim rather
+	// than a bearer token — an agent has no credential yet when it applies.
+	//
+	// POST applications is the one write an anonymous caller may make, so it is
+	// the one route behind the per-IP limiter.
+	mux.Handle("POST "+p+"/api/agent-keys/applications",
+		s.limitKeyApplications(http.HandlerFunc(s.handleCreateKeyApplication)))
+	mux.HandleFunc("GET "+p+"/api/agent-keys/applications/{id}", s.handlePollKeyApplication)
+	mux.HandleFunc("GET "+p+"/api/agent-keys/renewals/{id}", s.handlePollRenewal)
+
+	mux.Handle("GET "+p+"/api/agent-keys/me", requireAgent(http.HandlerFunc(s.handleKeyMe)))
+	mux.Handle("POST "+p+"/api/agent-keys/renewals", requireAgent(http.HandlerFunc(s.handleCreateRenewal)))
+
 	// -- dashboard ------------------------------------------------------------
 	mux.HandleFunc("POST "+p+"/api/admin/login", s.handleLogin)
 	mux.HandleFunc("POST "+p+"/api/admin/logout", s.handleLogout)
@@ -86,6 +120,18 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	mux.Handle("POST "+p+"/api/admin/reports/{id}/shares", requireSession(http.HandlerFunc(s.handleCreateShare)))
 	mux.Handle("PATCH "+p+"/api/admin/shares/{token}", requireSession(http.HandlerFunc(s.handlePatchShare)))
 	mux.Handle("DELETE "+p+"/api/admin/shares/{token}", requireSession(http.HandlerFunc(s.handleDeleteShare)))
+
+	// Key administration. Every one of these is Session-gated: a human manages
+	// all keys, and no agent credential reaches this surface at all.
+	mux.Handle("GET "+p+"/api/admin/keys", requireSession(http.HandlerFunc(s.handleAdminListKeys)))
+	mux.Handle("POST "+p+"/api/admin/keys", requireSession(http.HandlerFunc(s.handleAdminCreateKey)))
+	mux.Handle("PATCH "+p+"/api/admin/keys/{id}", requireSession(http.HandlerFunc(s.handleAdminPatchKey)))
+	mux.Handle("GET "+p+"/api/admin/key-applications", requireSession(http.HandlerFunc(s.handleAdminListKeyApplications)))
+	mux.Handle("POST "+p+"/api/admin/key-applications/{id}/approve", requireSession(http.HandlerFunc(s.handleAdminApproveKeyApplication)))
+	mux.Handle("POST "+p+"/api/admin/key-applications/{id}/reject", requireSession(http.HandlerFunc(s.handleAdminRejectKeyApplication)))
+	mux.Handle("GET "+p+"/api/admin/key-renewals", requireSession(http.HandlerFunc(s.handleAdminListRenewals)))
+	mux.Handle("POST "+p+"/api/admin/key-renewals/{id}/approve", requireSession(http.HandlerFunc(s.handleAdminApproveRenewal)))
+	mux.Handle("POST "+p+"/api/admin/key-renewals/{id}/reject", requireSession(http.HandlerFunc(s.handleAdminRejectRenewal)))
 
 	// Anything else under the prefix is a JSON 404 rather than Go's plain-text
 	// "404 page not found", so clients can rely on the envelope everywhere.
@@ -318,6 +364,14 @@ func (s *Server) handleCreateReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Authorship is taken from the authenticated principal, never from the body:
+	// a caller must not be able to claim a report it did not publish. Root has
+	// no key row, so its reports store "" as the owner and only root and the
+	// dashboard may read them.
+	if principal := httpx.PrincipalFrom(r.Context()); principal != nil {
+		input.OwnerKeyID = principal.KeyID
+	}
+
 	report, share, err := s.store.CreateReport(input, s.cfg.DefaultShareHours)
 	if err != nil {
 		httpx.WriteError(w, r, httpx.Internal("Failed to create report").WithCause(err))
@@ -357,6 +411,13 @@ func (s *Server) handleGetReport(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, httpx.NotFound("Report not found"))
 		return
 	}
+	// Ownership is the permission model: a key may read only what it published.
+	// "Not yours" answers 404, not 403, so a caller cannot confirm that a report
+	// it is not allowed to see exists — the same rule unknown share tokens use.
+	if !ownerCanAccess(httpx.PrincipalFrom(r.Context()), report.OwnerKeyID) {
+		httpx.WriteError(w, r, httpx.NotFound("Report not found"))
+		return
+	}
 	httpx.OK(w, r, report)
 }
 
@@ -366,7 +427,25 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, err)
 		return
 	}
-	found, err := s.store.RevokeToken(token)
+
+	// Resolve the owning report before mutating anything: revoking someone
+	// else's link must be indistinguishable from revoking a link that does not
+	// exist, so the ownership test has to happen before the write.
+	owner, _, found, err := s.store.ShareTokenOwner(token)
+	if err != nil {
+		httpx.WriteError(w, r, httpx.Internal("Failed to resolve share token").WithCause(err))
+		return
+	}
+	if !found {
+		httpx.WriteError(w, r, httpx.NotFound("Share token not found"))
+		return
+	}
+	if !ownerCanAccess(httpx.PrincipalFrom(r.Context()), owner) {
+		httpx.WriteError(w, r, httpx.NotFound("Share token not found"))
+		return
+	}
+
+	found, err = s.store.RevokeToken(token)
 	if err != nil {
 		httpx.WriteError(w, r, httpx.Internal("Failed to revoke share token").WithCause(err))
 		return
@@ -637,6 +716,23 @@ func (s *Server) handleDeleteShare(w http.ResponseWriter, r *http.Request) {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// ownerCanAccess reports whether the authenticated principal may read or revoke
+// a report owned by ownerKeyID.
+//
+// Root passes everything. A named key passes only for its own reports. The
+// empty-KeyID guard is not decorative: root's reports store "" as their owner,
+// so without it a principal that somehow carried an empty key id would match
+// every root-published report. Callers turn a false into 404, never 403.
+func ownerCanAccess(principal *domain.Principal, ownerKeyID string) bool {
+	if principal == nil {
+		return false
+	}
+	if principal.Root {
+		return true
+	}
+	return principal.KeyID != "" && principal.KeyID == ownerKeyID
+}
 
 // shareToken validates the {token} path value, returning a 404 (not a 400) when
 // the shape is wrong so a malformed token is indistinguishable from an unknown

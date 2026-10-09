@@ -32,9 +32,15 @@ async function handleLogout() {
 
   <div v-else>
     <header class="topbar">
-      <RouterLink to="/dashboard/reports" class="brand">
-        Teleport<span>报告控制台</span>
-      </RouterLink>
+      <div class="row" style="gap: 20px">
+        <RouterLink to="/dashboard/reports" class="brand">
+          Teleport<span>报告控制台</span>
+        </RouterLink>
+        <nav class="topnav">
+          <RouterLink to="/dashboard/reports">报告</RouterLink>
+          <RouterLink to="/dashboard/keys">密钥</RouterLink>
+        </nav>
+      </div>
       <div class="row">
         <button class="ghost" type="button" @click="handleLogout">退出登录</button>
       </div>

@@ -53,6 +53,10 @@ a { color: var(--accent); }
 }
 .brand { font-weight: 650; letter-spacing: -0.01em; text-decoration: none; color: var(--fg); }
 .brand span { color: var(--fg-muted); font-weight: 400; margin-left: 8px; font-size: 13px; }
+.topnav { display: flex; align-items: center; gap: 14px; font-size: 14px; }
+.topnav a { color: var(--fg-muted); text-decoration: none; }
+.topnav a:hover { color: var(--fg); }
+.topnav a.router-link-active { color: var(--fg); font-weight: 550; }
 .container { max-width: 1080px; margin: 0 auto; padding: 32px 24px 80px; }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
 .page-head h1 { margin: 0; font-size: 1.5rem; letter-spacing: -0.02em; }
@@ -137,6 +141,17 @@ label { display: block; font-size: 13px; color: var(--fg-muted); margin-bottom: 
 .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; font-size: 13px; }
 .meta-grid dt { color: var(--fg-muted); margin-bottom: 2px; }
 .meta-grid dd { margin: 0; }
+
+.ua { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* -- modal ----------------------------------------------------------------- */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 40;
+  display: grid; place-items: center; padding: 24px;
+  background: rgba(0, 0, 0, .45);
+}
+.modal { width: 100%; max-width: 480px; max-height: 90vh; overflow-y: auto; }
+.modal h2 { margin: 0; font-size: 1.05rem; }
 
 pre.content {
   background: color-mix(in srgb, var(--fg) 5%, transparent);

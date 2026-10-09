@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zeroicey/teleport/backend/internal/domain"
@@ -51,8 +52,25 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err := db2.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
 		t.Fatalf("count migrations: %v", err)
 	}
-	if count != 1 {
-		t.Errorf("expected exactly 1 recorded migration, got %d", count)
+	// Compare against the number of embedded migrations rather than a literal.
+	// The point of this test is "re-opening does not replay migrations", and a
+	// hardcoded count turns every future migration into a spurious failure here
+	// — which trains people to bump the number instead of reading the test.
+	entries, err := migrationFS.ReadDir("migrations")
+	if err != nil {
+		t.Fatalf("list embedded migrations: %v", err)
+	}
+	want := 0
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			want++
+		}
+	}
+	if want == 0 {
+		t.Fatal("no migrations are embedded; the embed directive is broken")
+	}
+	if count != want {
+		t.Errorf("recorded %d migrations, want %d (one per embedded file)", count, want)
 	}
 }
 

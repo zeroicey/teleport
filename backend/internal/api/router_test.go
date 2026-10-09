@@ -29,6 +29,19 @@ const (
 // testServer builds a fully-wired handler against a throwaway database.
 func testServer(t *testing.T) (http.Handler, *config.Config) {
 	t.Helper()
+	return testServerWith(t, nil)
+}
+
+// testServerWith is testServer with a hook that can override the configuration
+// before the handler is built.
+//
+// Some knobs are read exactly once, in New (the rate limiter's budget, the
+// derivation subkey), so a test cannot change them afterwards; others are worth
+// driving to an extreme to make a timing-dependent state deterministic (a claim
+// window that is already closed). The hook is how both are expressed without
+// duplicating the whole fixture.
+func testServerWith(t *testing.T, mutate func(*config.Config)) (http.Handler, *config.Config) {
+	t.Helper()
 
 	hash, err := password.Hash(testPassword, 10_000) // low cost: tests run often
 	if err != nil {
@@ -53,6 +66,17 @@ func testServer(t *testing.T) (http.Handler, *config.Config) {
 		// the public host is shared with an unrelated service.
 		CookiePath:  testPrefix,
 		Environment: "test",
+		// Production defaults for the key lifecycle. They are set explicitly
+		// because a hand-built Config skips validation, and a zero rate limit or
+		// zero TTL would change behaviour rather than merely tighten it.
+		KeyApplyPerHour:   5,
+		KeyApplicationTTL: 24 * time.Hour,
+		KeyClaimWindow:    30 * time.Minute,
+		KeyMaxPending:     50,
+		KeyMaxActive:      100,
+	}
+	if mutate != nil {
+		mutate(cfg)
 	}
 
 	db, err := store.Open(cfg.DBPath)

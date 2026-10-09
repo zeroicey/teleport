@@ -72,9 +72,9 @@ func (s *Store) CreateReport(input domain.CreateReportInput, defaultShareHours i
 	defer tx.Rollback()
 
 	if _, err := tx.Exec(
-		`INSERT INTO reports (id, title, category, format, content, metadata, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, input.Title, category, string(format), input.Content, string(metadataJSON), ts, ts,
+		`INSERT INTO reports (id, title, category, format, content, metadata, created_at, updated_at, owner_key_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, input.Title, category, string(format), input.Content, string(metadataJSON), ts, ts, input.OwnerKeyID,
 	); err != nil {
 		return nil, nil, fmt.Errorf("insert report: %w", err)
 	}
@@ -82,6 +82,7 @@ func (s *Store) CreateReport(input domain.CreateReportInput, defaultShareHours i
 	report := &domain.Report{
 		ID: id, Title: input.Title, Category: category, Format: format,
 		Content: input.Content, Metadata: metadata, CreatedAt: ts, UpdatedAt: ts,
+		OwnerKeyID: input.OwnerKeyID,
 	}
 
 	token, err := NewShareToken()
@@ -235,7 +236,7 @@ func (s *Store) CleanupExpired() (int64, error) {
 
 func (s *Store) reportByID(id string) (*domain.Report, error) {
 	row := s.db.QueryRow(
-		`SELECT id, title, category, format, content, metadata, created_at, updated_at
+		`SELECT id, title, category, format, content, metadata, created_at, updated_at, owner_key_id
 		   FROM reports WHERE id = ?`, id)
 	return scanReport(row)
 }
@@ -251,7 +252,7 @@ func (s *Store) GetReport(id string) (*domain.Report, error) {
 
 // ListReports returns newest-first summaries (content omitted).
 func (s *Store) ListReports(category string, limit, offset int) ([]domain.Report, error) {
-	base := `SELECT id, title, category, format, '' AS content, metadata, created_at, updated_at
+	base := `SELECT id, title, category, format, '' AS content, metadata, created_at, updated_at, owner_key_id
 	           FROM reports`
 	var rows *sql.Rows
 	var err error
@@ -378,7 +379,7 @@ func scanReport(row scannable) (*domain.Report, error) {
 		metadataJSON string
 	)
 	if err := row.Scan(&r.ID, &r.Title, &r.Category, &format, &r.Content, &metadataJSON,
-		&r.CreatedAt, &r.UpdatedAt); err != nil {
+		&r.CreatedAt, &r.UpdatedAt, &r.OwnerKeyID); err != nil {
 		return nil, err
 	}
 	r.Format = domain.ReportFormat(format)

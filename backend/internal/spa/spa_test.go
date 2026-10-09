@@ -23,7 +23,7 @@ func buildFixture(t *testing.T) string {
 		t.Fatalf("mkdir assets: %v", err)
 	}
 	files := map[string]string{
-		"index.html":            `<!DOCTYPE html><div id="app"></div>`,
+		"index.html":             `<!DOCTYPE html><div id="app"></div>`,
 		"assets/index-abc123.js": `console.log("bundle")`,
 		"assets/share.js":        `console.log("share")`,
 		"favicon.ico":            "not-really-an-ico",

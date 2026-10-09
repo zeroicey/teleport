@@ -29,6 +29,7 @@ Node、不需要 Go、也没有任何需要与二进制同步的静态目录。
 | 时效分享 | 每条链接独立设置有效期（1 小时 ~ 永不过期），可随时禁用 / 吊销 |
 | 内容渲染 | Markdown **服务端渲染**（Go + goldmark + Chroma）+ Mermaid 客户端懒加载 |
 | 管理面板 | Vue 3 SPA，登录后查看报告、管理分享链接、复制 / 调期 / 禁用 |
+| 密钥自助申请 | agent 提交申请 → 面板批准 → agent 一次性领取明文密钥（服务端只存哈希） |
 | 安全 | 原始 HTML 不渲染、严格 CSP、常量时间鉴权比较、失效链接语义化 404/410 |
 
 ---
@@ -120,10 +121,10 @@ teleport/
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| `POST` | `/api/reports` | `Authorization: Bearer <AGENT_SECRET_KEY>` | AI 上报报告；带 `autoShareHours` 时同步生成分享链接 |
-| `GET` | `/api/reports/:id` | Bearer | 读取单篇报告源文 |
+| `POST` | `/api/reports` | `Authorization: Bearer <agent 密钥>` | AI 上报报告；带 `autoShareHours` 时同步生成分享链接（密钥见「密钥自助申请」） |
+| `GET` | `/api/reports/:id` | Bearer | 读取单篇报告源文（**仅限该密钥自己发布的**，别人的返回 404） |
 | `GET` | `/api/share/:token` | 公开 | 只读获取报告；失效/过期分别返回 404 / 410 |
-| `POST` | `/api/share/:token/revoke` | Bearer | 手动禁用链接（幂等） |
+| `POST` | `/api/share/:token/revoke` | Bearer | 手动禁用链接（幂等；按报告归属判定，别人的返回 404） |
 | `GET` | `/s/:token` | 公开 | 服务端渲染的分享页面 |
 | `GET` | `/api/health` | 公开 | 健康检查 |
 | `POST` | `/api/admin/login` | 口令 | 登录并下发签名 Session Cookie |
@@ -156,10 +157,12 @@ https://api.hcyj.xyz/yeciorez/teleport/ai.md
   `<div id="app">` 外壳。
 - **分享链接会过期。** 挂成 `/s/<token>` 等于给每个已缓存了该链接的 AI 埋一颗定时炸弹
   （到期 410、被吊销 404）。这三个路由是**永久稳定**的。
-- **免鉴权是刻意的。** agent 必须在拿到密钥*之前*就能读到"你需要一个密钥"。
+- **免鉴权是刻意的。** agent 必须在申请到密钥*之前*就能读到这份说明（先从第 2 节
+  自助申请，才有密钥可用）。
 - **事实从 live 配置注入。** 正文里用 `{{APP_BASE}}`、`{{ROUTE_PREFIX}}`、
-  `{{DEFAULT_SHARE_HOURS}}`、`{{MAX_CONTENT_BYTES}}`、`{{ENVIRONMENT}}` 占位符，
-  每次请求从 `config.Config` 替换 —— 换域名或改前缀后文档自动跟着走，不会静默撒谎。
+  `{{DEFAULT_SHARE_HOURS}}`、`{{MAX_CONTENT_BYTES}}`、`{{ENVIRONMENT}}`、
+  `{{KEY_APPLICATION_TTL}}`、`{{KEY_CLAIM_WINDOW}}`、`{{KEY_APPLY_PER_HOUR}}` 占位符，
+  每次请求从 `config.Config` 替换 —— 换域名、改前缀或调限流后文档自动跟着走，不会静默撒谎。
 - **正文随二进制发布。** `guide.md` 经 `//go:embed` 编进去，与代码同一个 git revision，
   不存在"文档更新了、代码没更新"的错位。
 
@@ -175,11 +178,94 @@ https://api.hcyj.xyz/yeciorez/teleport/ai.md
 { "ok": false, "error": { "code": "gone", "message": "This share link has expired" }, "requestId": "..." }
 ```
 
+### 密钥自助申请（agent self-service keys）
+
+agent **不再向人类索取密钥**：自己提交申请 → 人类在面板点批准 → agent 按服务端给的间隔
+轮询、一次性取回明文密钥。决策与冻结契约见
+[`.ai/decisions/2026-10-10-agent-self-service-keys.md`](.ai/decisions/2026-10-10-agent-self-service-keys.md)。
+
+**字段命名约定**：**请求体 camelCase**（`label`、`purpose`、`requestedHours`、`expiresInHours`），
+**响应 snake_case**（`claim_secret`、`created_at`、`expires_at`、`token_prefix`）。下表所有响应形状
+都是响应字段。
+
+**公开（按 IP 限流）**
+
+| 方法 | 路径 | 认证 | 说明 |
+|---|---|---|---|
+| `POST` | `/api/agent-keys/applications` | 无 | 体 `{label, purpose?, requestedHours?}`；**201** 返回 `{id, claim_secret, status, created_at, expires_at, poll_interval_seconds}` |
+| `GET` | `/api/agent-keys/applications/:id` | 头 `X-Teleport-Claim: <claim_secret>` | 轮询状态；批准后**首次**领取返回明文 `key.token` 并把申请单转 `claimed`。`pending`/`rejected` 为 200 且无 `key`；二次领取 → 404；申请单过期或领取窗口关闭 → **410 `gone`**；活跃密钥满 → 409 `too_many_active_keys` |
+| `GET` | `/api/agent-keys/renewals/:id` | 头 `X-Teleport-Claim: <claim_secret>` | 查续期结果：`{id, key_id, requested_hours, status, created_at, decided_at, granted_expires_at}` |
+
+**agent 自有（`Authorization: Bearer <自己的密钥>`）**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/agent-keys/me` | 自身状态：`{id, name, token_prefix, created_at, expires_at, revoked_at, last_used_at, request_count, note, root}`；`expires_at = 0` = 永不过期（**无界，不是"已过期"**），`root` 对普通密钥恒为 `false` |
+| `POST` | `/api/agent-keys/renewals` | 体 `{requestedHours?}`；**201** 返回 `{id, key_id, status:"pending", requested_hours, created_at, claim_secret}`。**续期需人类批准**；批准后在现有到期时间上**叠加**批准时长：`granted = max(当前 expires_at, now) + 批准时长` —— **只延长、绝不缩短**，`0` 保持 `0`（因此提前续期不损失剩余时间）；已有 pending 时返回 **409 `renewal_exists`** |
+
+**面板（Session Cookie）**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/admin/key-applications?status=pending` | 审批队列（默认 `pending`，按 `created_at` 倒序），返回 `domain.KeyApplication` 数组：`{id, label, purpose, requested_hours, status, created_at, expires_at, decided_at, claim_deadline, issued_key_id, requester_ip, user_agent, approved_name, approved_hours, approved_note}` |
+| `POST` | `/api/admin/key-applications/:id/approve` | 体 `{name?, expiresInHours?, note?}`；`expiresInHours=0` → 永不过期，缺省则用申请里的 `requestedHours`；返回更新后的申请单 |
+| `POST` | `/api/admin/key-applications/:id/reject` | 体 `{reason?}`；返回更新后的申请单 |
+| `GET` | `/api/admin/keys` | 全部密钥（`domain.AgentKey` 数组，**绝不含 `token_hash` 与明文**） |
+| `POST` | `/api/admin/keys` | 体 `{name, expiresInHours?, note?}`；手动转交路径，**201** 返回 `{token, key}`（`token` 明文仅此一次） |
+| `PATCH` | `/api/admin/keys/:id` | 体 `{name?, expiresInHours?, revoked?, note?}`；改 `expiresInHours` 即用户直接续期（**重设**为 `now + 小时数` —— 这是显式**缩短**授权的唯一途径）；返回更新后的密钥 |
+| `GET` | `/api/admin/key-renewals?status=pending` | 续期申请列表 |
+| `POST` | `/api/admin/key-renewals/:id/approve` | 体 `{expiresInHours?}`；缺省则用申请里的 `requestedHours`；**在现有到期时间上叠加（只延长，见上）** |
+| `POST` | `/api/admin/key-renewals/:id/reject` | — |
+
+**只存哈希、明文仅此一次**
+
+- `agent_keys` 只有 `token_hash`（`sha256` hex，`UNIQUE`）与供人辨识的 `token_prefix`；
+  `key_applications.claim_hash` 同理只存 `sha256(claim_secret)`。
+- 明文密钥只在批准后的**首次领取**响应里出现一次，之后**永不可再取**：再领即 404，
+  服务端刻意不告诉你"已经领过"。人类也无法从面板或数据库读出 agent 的密钥再转交 ——
+  面板的"手动转交"路径是**新建**一把、当场显示一次明文。
+- `claim_secret` 同样只在提交申请 / 发起续期的响应里出现一次；丢了只能重新申请。
+  （续期的 `claim_secret` 不落库：它由同一个 `K_derive` 子密钥按 `renewal_id + key_id` 现场重算，
+  所以连它的哈希都不需要存。）
+- 鉴权时对来钥求 `sha256` 再查 `UNIQUE` 索引（O(log n)），**不做逐行常数时间比较**
+  （表大了就是 DoS 面）；`AGENT_SECRET_KEY` 这一路仍走 `subtle.ConstantTimeCompare`。
+  两路都失败统一 401，不用响应时间区分失败原因。
+
+**为什么密钥是派生出来的，而不是暂存明文**
+
+| 落选方案 | 为什么不用 |
+|---|---|
+| 批准到领取之间把明文暂存起来 | 暂存窗口内明文落盘，这一段的任何备份 / 快照 / WAL 副本都等于泄漏 |
+| 让 agent 自己生成密钥、只提交哈希 | 服务端无法约束熵：agent 可以提交 `"1234"` 的哈希，批准后即得弱密钥 |
+
+因此选择**服务端派生**：
+
+```
+K_derive = HMAC-SHA256(SessionSecret, "teleport/derive/agent-key/v1")   # 子密钥，避免跨协议复用
+token    = base64url(HMAC-SHA256(K_derive, "teleport/agent-key/v1|" + appID + "|" + claim_secret))
+```
+
+熵由服务端保证（256 位），领取时按上式重算并只落 `sha256(token)` ——
+**任何时刻数据库里都没有明文密钥**。代价是 `SessionSecret` 的地位上升：它现在同时是
+密钥派生根，泄漏后果从"可伪造会话"扩大到"可重算所有 agent 密钥"（已记入 `.ai/pitfalls/`）。
+
+**归属规则与限额**
+
+- `POST /api/reports` 落 `reports.owner_key_id = principal.KeyID`（root 密钥落 `''`）。
+- `GET /api/reports/:id`、`POST /api/share/:token/revoke`：**只有发布者本人**（或 root / 面板）
+  能操作；非归属者一律 **404**，不暴露"存在但不是你的"。
+- 申请入口完全开放但有限流：`KEY_APPLY_PER_HOUR`（默认 5，每个 IP 每小时）、
+  `KEY_APPLICATION_TTL`（默认 24h，申请单存活期，未批准即自动失效）、
+  `KEY_CLAIM_WINDOW`（默认 30m，批准后的领取窗口）、`KEY_MAX_PENDING`（50）、
+  `KEY_MAX_ACTIVE`（100）。限流是**进程内**计数，重启清零（单二进制的已知取舍）。
+- `AGENT_SECRET_KEY` 降级为 **root / 应急密钥**：保留全部权限，其发布的报告
+  `owner_key_id = ''`，只有 root 与面板能读；既有密钥与既有数据不受影响。
+
 ### 上报示例
 
 ```bash
 curl -X POST https://api.hcyj.xyz/yeciorez/teleport/api/reports \
-  -H "Authorization: Bearer $AGENT_SECRET_KEY" \
+  -H "Authorization: Bearer $TELEPORT_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "title": "内网渗透测试报告 #12",
@@ -637,8 +723,12 @@ CF 官方的大陆加速（China Network）需要企业版 + 域名 ICP 备案�
 
 ## 安全设计要点
 
-- **Agent 鉴权**：`POST /api/reports` 与所有写操作要求 Bearer Token，
-  比较使用 `subtle.ConstantTimeCompare` 常量时间函数。
+- **Agent 鉴权（双路）**：`POST /api/reports` 与所有 agent 接口要求 Bearer Token。
+  第一条路对 `AGENT_SECRET_KEY` 做 `subtle.ConstantTimeCompare`（root），
+  否则对来钥求 `sha256` 交给密钥表按 `UNIQUE` 索引查找；**两路都走完才判定失败**，
+  避免用响应时间区分"root 不匹配"与"表里没有"。失败统一 401。
+- **归属即权限**：`reports.owner_key_id` 记录发布者，非归属者的读 / 撤销一律 **404**
+  （与"未知 token 与已吊销都返回 404"同一套语义）；root 密钥与面板不受归属限制。
 - **失效链接语义**：未知 token 与被吊销 token 同样返回 **404**，避免通过状态码区分
   "从未存在"与"已被撤销"；仅**已过期**返回 **410**。分享页同样服务端返回 404/410，
   而不是先给 200 再由前端报错。
@@ -674,7 +764,7 @@ systemctl restart teleport && systemctl is-active teleport
 | 密钥 | 轮换影响 |
 |---|---|
 | `ADMIN_PASSWORD_HASH` | 旧口令立即失效。用 `./teleport hash-password '新口令'` 生成新值。**本次部署的口令是随机生成的，请首次登录后更换。** |
-| `AGENT_SECRET_KEY` | 所有上报端（AI agent）需同步更新，否则 401。 |
+| `AGENT_SECRET_KEY` | **root / 应急密钥**，拥有全部权限。轮换只影响 root 用途；普通 agent 用自助申请的密钥，在面板上单独撤销 / 调期即可，不需要改这个环境变量。 |
 | `SESSION_SECRET` | 所有已登录面板会话立即失效（签名密钥变了），需重新登录。 |
 
 > 值里若含 `$`，在 systemd 的 `EnvironmentFile` 与 Go 的 `.env` 解析器中都按**字面量**处理，

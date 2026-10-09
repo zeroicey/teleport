@@ -20,6 +20,10 @@ type Report struct {
 	Metadata  map[string]any `json:"metadata"`
 	CreatedAt int64          `json:"created_at"`
 	UpdatedAt int64          `json:"updated_at"`
+	// OwnerKeyID is the agent_keys.id that published this report, or "" when it
+	// came from the break-glass AGENT_SECRET_KEY (or from a deployment that
+	// predates keys). Ownership is what scopes an agent's read and revoke rights.
+	OwnerKeyID string `json:"owner_key_id,omitempty"`
 }
 
 // ShareToken is one independently-expiring link to a report.
@@ -46,6 +50,10 @@ type CreateReportInput struct {
 	// explicit 0 (= never expires). Fractional hours are accepted, matching the
 	// original Number() coercion.
 	AutoShareHours *float64
+	// OwnerKeyID is the authenticated principal's key id, or "" for root. Set by
+	// the API layer from the request context; never from the request body, or a
+	// caller could claim authorship of a report it did not publish.
+	OwnerKeyID string
 }
 
 // Resolution is the outcome of resolving a share token.
