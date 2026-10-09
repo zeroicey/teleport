@@ -874,3 +874,105 @@ func TestRoutesAreMountedUnderPrefix(t *testing.T) {
 		}
 	})
 }
+
+// The AI guide must be reachable at stable paths, and must not be swallowed by
+// the SPA catch-all (which owns the prefix root).
+func TestAIGuideIsServedEvenWithFrontendMounted(t *testing.T) {
+	h, cfg := testServerWithFrontend(t)
+	if cfg.StaticDir == "" {
+		t.Fatal("test setup error: expected a frontend")
+	}
+
+	t.Run("markdown", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, testPrefix+"/ai.md", "", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/markdown") {
+			t.Errorf("Content-Type = %q, want text/markdown", ct)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, cfg.AppBaseURL()) {
+			t.Error("guide does not contain the live base URL")
+		}
+		if strings.Contains(body, "{{") {
+			t.Error("served guide contains an unresolved placeholder")
+		}
+		if strings.Contains(body, "<div id=app>") {
+			t.Error("AI guide path was answered by the SPA shell")
+		}
+	})
+
+	t.Run("html", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, testPrefix+"/ai", "", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+			t.Errorf("Content-Type = %q, want text/html", ct)
+		}
+		if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "default-src 'none'") {
+			t.Errorf("CSP = %q, want a deny-by-default policy", csp)
+		}
+		if strings.Contains(rec.Body.String(), "<div id=app>") {
+			t.Error("AI guide HTML path was answered by the SPA shell")
+		}
+	})
+
+	t.Run("llms.txt", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, testPrefix+"/llms.txt", "", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200", rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/plain") {
+			t.Errorf("Content-Type = %q, want text/plain", ct)
+		}
+		if !strings.Contains(rec.Body.String(), cfg.AppBaseURL()+"/ai.md") {
+			t.Error("llms.txt does not point at the markdown guide")
+		}
+	})
+}
+
+// The guide is public: an agent has to be able to read it *before* it has a key,
+// otherwise it cannot discover that a key is what it needs.
+func TestAIGuideNeedsNoAuth(t *testing.T) {
+	h, _ := testServer(t)
+	for _, path := range []string{testPrefix + "/ai", testPrefix + "/ai.md", testPrefix + "/llms.txt"} {
+		rec := do(t, h, http.MethodGet, path, "", nil)
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: status = %d, want 200 without any credentials", path, rec.Code)
+		}
+	}
+}
+
+// The guide is read-only. A non-GET must not reach the handler.
+//
+// It answers 404 rather than 405: these paths are registered with method-scoped
+// patterns, so a POST simply does not match and the request falls through to the
+// prefix catch-all. That is the same behaviour every other read route here has;
+// what matters is that no guide content is served.
+func TestAIGuideRejectsNonGET(t *testing.T) {
+	h, _ := testServer(t)
+	for _, path := range []string{testPrefix + "/ai", testPrefix + "/ai.md", testPrefix + "/llms.txt"} {
+		rec := do(t, h, http.MethodPost, path, "", nil)
+		if rec.Code == http.StatusOK {
+			t.Errorf("POST %s: status = 200, want the request refused", path)
+		}
+		if body := rec.Body.String(); strings.Contains(body, "AGENT_KEY") || strings.Contains(body, "# Teleport") {
+			t.Errorf("POST %s: served guide content", path)
+		}
+	}
+}
+
+// A public page must never echo server-side secret material.
+func TestAIGuideDoesNotLeakSecrets(t *testing.T) {
+	h, _ := testServer(t)
+	for _, path := range []string{testPrefix + "/ai", testPrefix + "/ai.md", testPrefix + "/llms.txt"} {
+		body := do(t, h, http.MethodGet, path, "", nil).Body.String()
+		for _, secret := range []string{testAgentSecret, testSessionKey, testPassword} {
+			if strings.Contains(body, secret) {
+				t.Errorf("%s leaked a credential", path)
+			}
+		}
+	}
+}

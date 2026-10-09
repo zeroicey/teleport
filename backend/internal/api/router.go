@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/zeroicey/teleport/backend/internal/aidoc"
 	"github.com/zeroicey/teleport/backend/internal/config"
 	"github.com/zeroicey/teleport/backend/internal/domain"
 	"github.com/zeroicey/teleport/backend/internal/httpx"
@@ -57,6 +58,19 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	mux.HandleFunc("GET "+p+"/api/health", s.handleHealth)
 	mux.HandleFunc("GET "+p+"/api/share/{token}", s.handleReadShare)
 	mux.HandleFunc("GET "+p+"/s/{token}", s.handleSharePage)
+
+	// -- machine-readable usage guide -----------------------------------------
+	//
+	// Served by this process, not the SPA, because an agent fetching a URL gets
+	// only what the server sends: the SPA renders client-side and would hand
+	// back an empty shell.
+	//
+	// These sit at stable paths rather than behind a share link on purpose. A
+	// share link expires, so a guide distributed as one would eventually 410 on
+	// every agent that had cached it — the opposite of what this is for.
+	mux.HandleFunc("GET "+p+"/ai", s.handleAIGuideHTML)
+	mux.HandleFunc("GET "+p+"/ai.md", s.handleAIGuideMarkdown)
+	mux.HandleFunc("GET "+p+"/llms.txt", s.handleLLMsTxt)
 
 	// -- agent ----------------------------------------------------------------
 	mux.Handle("POST "+p+"/api/reports", requireAgent(http.HandlerFunc(s.handleCreateReport)))
@@ -155,6 +169,51 @@ func resolveFrontend(cfg *config.Config) (fs.FS, string, error) {
 // ---------------------------------------------------------------------------
 // public
 // ---------------------------------------------------------------------------
+
+// handleAIGuideMarkdown serves the usage guide as raw Markdown.
+//
+// This is the primary entry point for agents: plain text, no HTML to strip, and
+// safe to hand straight to a model.
+func (s *Server) handleAIGuideMarkdown(w http.ResponseWriter, r *http.Request) {
+	body := aidoc.Markdown(s.aiFacts())
+	w.Header().Set("Content-Type", aidoc.ContentTypeMarkdown)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	// The guide is regenerated from config on every request and is tiny, but it
+	// is also a contract: a stale cached copy would describe an old prefix.
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, body)
+}
+
+// handleAIGuideHTML serves the same guide as a readable, script-free page.
+func (s *Server) handleAIGuideHTML(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", aidoc.CSP)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, aidoc.HTML(s.aiFacts()))
+}
+
+// handleLLMsTxt serves the discovery index, so an agent that knows the
+// `llms.txt` convention can find the guide without being told the exact path.
+//
+// NOTE: this is mounted under ROUTE_PREFIX, not at the origin root. The root of
+// this host belongs to a different service that shares api.hcyj.xyz, and
+// claiming /llms.txt there would hijack another application's path.
+func (s *Server) handleLLMsTxt(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, aidoc.LLMSTxt(s.aiFacts()))
+}
+
+func (s *Server) aiFacts() aidoc.Facts {
+	return aidoc.FactsFrom(s.cfg)
+}
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	status := "ok"

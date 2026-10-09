@@ -61,6 +61,8 @@ teleport/
 │       ├── domain/               # 业务类型
 │       ├── views/                # 分享页服务端渲染模板
 │       ├── spa/                  # 静态前端托管（SPA 回退 / 缓存 / 路径穿越防护）
+│       ├── aidoc/                # 给 AI 的使用说明（/ai、/ai.md、/llms.txt）
+│       │   └── guide.md          # 正文，//go:embed 进二进制
 │       ├── webui/                # //go:embed 前端产物（dist/ 由 Vite 生成）
 │       └── api/                  # 路由挂载
 │
@@ -132,6 +134,39 @@ teleport/
 | `POST` | `/api/admin/reports/:id/shares` | Session | 为报告新建分享 Token（`expiresInHours`） |
 | `PATCH` | `/api/admin/shares/:token` | Session | 调整过期时间 / 启用禁用 |
 | `DELETE` | `/api/admin/shares/:token` | Session | 吊销链接 |
+
+### 给 AI 的使用说明（`/ai`、`/ai.md`、`/llms.txt`）
+
+这三个路由是**给 AI Agent 读的**：把站点地址交给 AI 就能让它独立发布报告。
+
+| 路径 | `Content-Type` | 用途 |
+|---|---|---|
+| `/ai.md` | `text/markdown` | **首选**。纯 Markdown 使用说明，agent 直接读，无需剥 HTML |
+| `/ai` | `text/html` | 同一份内容的网页版（无脚本，人也能看） |
+| `/llms.txt` | `text/plain` | 按约定提供的发现入口，指向上面两个 |
+
+```bash
+# 把这一条给 AI 就够了
+https://api.hcyj.xyz/yeciorez/teleport/ai.md
+```
+
+**为什么必须是服务端渲染的独立路由**，而不是 SPA 的一页、也不是一条分享链接：
+
+- **SPA 页面 AI 读不到。** 前端是客户端渲染的，agent 抓 URL 只会拿到空的
+  `<div id="app">` 外壳。
+- **分享链接会过期。** 挂成 `/s/<token>` 等于给每个已缓存了该链接的 AI 埋一颗定时炸弹
+  （到期 410、被吊销 404）。这三个路由是**永久稳定**的。
+- **免鉴权是刻意的。** agent 必须在拿到密钥*之前*就能读到"你需要一个密钥"。
+- **事实从 live 配置注入。** 正文里用 `{{APP_BASE}}`、`{{ROUTE_PREFIX}}`、
+  `{{DEFAULT_SHARE_HOURS}}`、`{{MAX_CONTENT_BYTES}}`、`{{ENVIRONMENT}}` 占位符，
+  每次请求从 `config.Config` 替换 —— 换域名或改前缀后文档自动跟着走，不会静默撒谎。
+- **正文随二进制发布。** `guide.md` 经 `//go:embed` 编进去，与代码同一个 git revision，
+  不存在"文档更新了、代码没更新"的错位。
+
+正文在 `backend/internal/aidoc/guide.md`。改它之后要重建才生效（`pnpm run build:release`）。
+
+> ⚠️ 这三个路由挂在 `ROUTE_PREFIX` **之下**，没有占用 `api.hcyj.xyz` 的根路径 ——
+> 该主机根路径属于另一个服务，抢 `/llms.txt` 会劫持别人的路由。
 
 所有响应统一封套（与旧版完全一致）：
 
@@ -745,10 +780,16 @@ Go 侧单元 / 集成测试（`pnpm run backend:test`，全部通过，含 `-rac
 | `internal/httpx` | 响应封套、错误隐藏、Bearer 变体、Session 往返 / 篡改 / 过期、Cookie 属性、严格 CORS、panic 恢复、请求 ID、真实 IP |
 | `internal/validate` | 默认值、空串视作缺省、`autoShareHours: 0` 有效、全部拒绝分支、边界值、UTF-16 emoji 计数、JS `trim()` 语义、请求体解析 |
 | `internal/spa` | 构建目录校验、SPA 深链接回退、哈希资源 `immutable`、缺失资源硬 404、`/api`「/`s` 不回退成 HTML、**路径穿越**（`../`、`%2e%2e`、`....//`）、非读方法 405、空前缀挂载 |
-| `internal/api` | 健康检查、鉴权、主流程、校验矩阵、体积上限、公开读取与计数、404/410、分享页渲染与 CSP、面板登录登出、前缀挂载断言、CORS 预检、未知路由（**含 SPA 接管根路径后仍返回 JSON 的回归测试**） |
+| `internal/aidoc` | **无未替换占位符**、占位符确实生效、没有声明却未使用的占位符、文档随配置变化、契约字段齐全（端点/Bearer/`data.share.url`/404/410/401）、**不含密钥**、HTML 页无 `<script>` 且 CSP 无 `script-src`、`llms.txt` 保持为指针（不复制正文）、HTML 渲染开关与文档说法一致的绊线 |
+| `internal/api` | 健康检查、鉴权、主流程、校验矩阵、体积上限、公开读取与计数、404/410、分享页渲染与 CSP、面板登录登出、前缀挂载断言、CORS 预检、未知路由（**含 SPA 接管根路径后仍返回 JSON 的回归测试**）、**AI 说明三端点免鉴权且不被 SPA 吞掉** |
 
 前端：`pnpm run typecheck`、`pnpm run build`、`pnpm run db:check-schema` 均通过。
 
 > `TestUnknownRouteWithSPAStaysJSON` 是刻意设计的回归测试：把
 > `mux.Handle(p+"/api/", root)` 与 `p+"/s/"` 两行删掉，它会**立刻失败**，
 > 因为未知 API 路径会退化成 SPA 的 HTML 404。
+
+> `aidoc` 的 `TestNoUnresolvedPlaceholders` 同理：在 `guide.md` 里写一个没有对应替换器的
+> `{{NEW_FACT}}`，它会让构建失败 —— 而不是让线上文档告诉 AI 去调用 `{{NEW_FACT}}/api/reports`。
+> `TestGuideContainsNoSecret` 则是被真实险情验证过的：初版文档写了服务器上密钥文件的路径，
+> 该测试当场拦下（见 `.ai/pitfalls/cases/2026-10-10-public-doc-disclosed-secret-file-path.md`）。
