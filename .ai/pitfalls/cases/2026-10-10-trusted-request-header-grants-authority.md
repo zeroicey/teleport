@@ -62,7 +62,7 @@ HTTP 200
 的值，不是代理观察到的对端地址。
 
 > ⚠️ **修正**：初稿这里写的是「Caddy `reverse_proxy` 会**追加** XFF」，**这是错的**。
-> 本仓 Caddyfile 实际是 `header_up X-Forwarded-For {remote}`（**覆盖**）。结论不变，理由改正：
+> 本仓 Caddyfile 当时是 `header_up X-Forwarded-For {remote}`（**覆盖**；现已改为 `{remote_host}`）。结论不变，理由改正：
 > 真正可利用的是 `Cf-Connecting-Ip` 那条腿（无条件信任 + 线上无 Cloudflare）。
 > XFF 那条腿被 Caddy 的覆盖行为消掉了，但那是**部署巧合**而非代码保证 ——
 > 能直连 `172.17.0.1:8788` 的进程对端即「可信」，仍可伪造 XFF。

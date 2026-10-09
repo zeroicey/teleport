@@ -356,8 +356,12 @@ var trustedProxyPrefixes = mustParsePrefixes(
 //     value usable as a security boundary.
 //  3. A trusted peer walks X-Forwarded-For right to left, skipping proxies in
 //     trustedProxyPrefixes, and returns the first untrusted address. Entries
-//     that are not single IP literals (bare junk, host:port, CIDRs) are skipped
-//     rather than guessed at, so a non-IP string can never become a bucket.
+//     that name no address at all (bare junk, CIDRs, names like "unknown") are
+//     skipped rather than guessed at, so a non-IP string can never become a
+//     bucket. An entry that names an address unambiguously is read even when it
+//     carries a port — see parseIP: Caddy's `{remote}` placeholder emits
+//     `host:port`, and treating that as junk collapsed every client behind the
+//     proxy into the proxy's own bucket.
 //  4. `Cf-Connecting-Ip` is ignored entirely unless TrustCloudflare is enabled.
 //
 // If nothing usable is found the peer is returned, so every unparseable case
@@ -427,18 +431,42 @@ func peerHost(remoteAddr string) string {
 	return strings.Trim(remoteAddr, "[]")
 }
 
-// parseIP parses a single address token. Ports, CIDRs and free-form junk are
-// rejected rather than guessed at: a value that is not an address must never
-// become a rate-limit bucket.
+// parseIP parses a single address token from a forwarded header or from
+// RemoteAddr.
+//
+// Accepted: a bare literal ("1.2.3.4", "2001:db8::1"), a bracketed literal
+// ("[2001:db8::1]"), and either of those with a port ("1.2.3.4:5678",
+// "[2001:db8::1]:5678").
+//
+// The port forms are read, not guessed at, because they still name exactly one
+// host. This is not hypothetical: Caddy's `{remote}` placeholder expands to
+// `host:port`, so refusing to read it discarded the only real client address in
+// the chain and fell back to the proxy's own address — every client in the world
+// shared one rate-limit bucket and requester_ip recorded the docker bridge. The
+// regression test uses Caddy's literal output format for that reason.
+//
+// Rejected, rather than guessed at: CIDRs, host names ("unknown", "_hidden",
+// "host:99"), empty and malformed tokens. A value that names no address must
+// never become a rate-limit bucket.
 //
 // IPv4-mapped IPv6 forms are unmapped so one host cannot be split into two
 // buckets, and any zone is dropped so a scoped literal keys like an unscoped one.
 func parseIP(s string) (netip.Addr, bool) {
-	addr, err := netip.ParseAddr(strings.TrimSpace(s))
-	if err != nil {
-		return netip.Addr{}, false
+	token := strings.TrimSpace(s)
+	if addr, err := netip.ParseAddr(token); err == nil {
+		return addr.Unmap().WithZone(""), true
 	}
-	return addr.Unmap().WithZone(""), true
+	// "host:port" and "[v6]:port".
+	if addrPort, err := netip.ParseAddrPort(token); err == nil {
+		return addrPort.Addr().Unmap().WithZone(""), true
+	}
+	// A bracketed literal with no port: "[2001:db8::1]".
+	if len(token) > 1 && token[0] == '[' && token[len(token)-1] == ']' {
+		if addr, err := netip.ParseAddr(token[1 : len(token)-1]); err == nil {
+			return addr.Unmap().WithZone(""), true
+		}
+	}
+	return netip.Addr{}, false
 }
 
 // isTrustedProxy reports whether addr is one of the proxies whose forwarded

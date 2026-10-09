@@ -1271,10 +1271,10 @@ func TestClientIPRejectsNonIPEntries(t *testing.T) {
 		xff    string
 		want   string
 	}{
-		{"host:port entry skipped", "172.17.0.1:5", "9.9.9.9, 1.2.3.4:80", "9.9.9.9"},
 		{"junk entry skipped", "172.17.0.1:5", "not-an-ip, 9.9.9.9", "9.9.9.9"},
 		{"all junk falls back to peer", "172.17.0.1:5", "not-an-ip, host:99, ", "172.17.0.1"},
 		{"cidr entry skipped", "172.17.0.1:5", "8.8.8.0/24, 9.9.9.9", "9.9.9.9"},
+		{"named host with port skipped", "172.17.0.1:5", "proxy.internal:80, 9.9.9.9", "9.9.9.9"},
 		{"v4 with port on remote", "1.2.3.4:5", "", "1.2.3.4"},
 		{"garbage remote passes through", "somewhere", "8.8.8.8", "somewhere"},
 		{"empty remote passes through", "", "8.8.8.8", ""},
@@ -1293,6 +1293,79 @@ func TestClientIPRejectsNonIPEntries(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestClientIPReadsCaddyRemoteFormat is the regression test for the rate-limit
+// collapse found in production: Caddy's `{remote}` placeholder expands to
+// `host:port`, not a bare address, and treating those entries as junk discarded
+// the only real client address in the chain. Every client then fell back to the
+// proxy's own address (the docker bridge), so three unrelated clients in
+// Guangzhou, Guangdong Telecom and Tencent Cloud shared one 5-per-hour quota and
+// requester_ip recorded 172.17.0.5 for all of them.
+//
+// The header values below are copied verbatim from what Caddy actually emits —
+// "121.9.113.26:54321" is a real `{remote}` expansion. Do NOT "simplify" them to
+// bare IPs: doing so is exactly how the original test missed this bug, because
+// the simulation of the proxy used a format the proxy never produces.
+func TestClientIPReadsCaddyRemoteFormat(t *testing.T) {
+	t.Cleanup(func() { TrustCloudflare = false })
+	TrustCloudflare = false
+
+	// The proxy peer is inside the docker bridge, i.e. a trusted proxy.
+	const caddyPeer = "172.17.0.5:41234"
+
+	cases := []struct {
+		name string
+		xff  string
+		want string
+	}{
+		{"caddy remote v4", "121.9.113.26:54321", "121.9.113.26"},
+		{"caddy remote v6", "[2001:db8::1]:54321", "2001:db8::1"},
+		{"caddy remote v4, other clients", "124.221.144.97:1024", "124.221.144.97"},
+		// Forged leftmost entry, real client appended by Caddy with a port.
+		// Before the fix this returned the peer 172.17.0.5.
+		{"forged prefix plus real client with port", "6.6.6.6, 121.9.113.26:54321", "121.9.113.26"},
+		// Rightmost is a trusted proxy, so the walk continues left and reads the
+		// ported entry rather than falling through to the peer.
+		{"trusted rightmost, ported entry to its left", "1.2.3.4:5678, 172.17.0.5", "1.2.3.4"},
+		{"bracketed v6 without port", "[2001:db8::1]", "2001:db8::1"},
+		{"bare literal still works", "9.9.9.9", "9.9.9.9"},
+		// Still not guessed at: these name no address, so they are skipped and
+		// the peer (fail-closed shared bucket) is the answer.
+		{"junk still falls back to the peer", "unknown, _hidden, 10.0.0.0/8", "172.17.0.5"},
+		{"named host with port still falls back", "proxy.internal:80", "172.17.0.5"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ClientIP(clientIPRequest(caddyPeer, tc.xff, "")); got != tc.want {
+				t.Errorf("ClientIP(xff=%q) = %q, want %q", tc.xff, got, tc.want)
+			}
+		})
+	}
+
+	// The production symptom itself: three unrelated clients must not collapse
+	// into one bucket.
+	t.Run("distinct clients get distinct buckets", func(t *testing.T) {
+		seen := map[string]bool{}
+		for _, remote := range []string{
+			"121.9.113.26:54321",   // Guangdong Telecom
+			"124.221.144.97:54321", // Tencent Cloud
+			"47.107.1.2:54321",     // Aliyun Guangzhou
+		} {
+			got := ClientIP(clientIPRequest(caddyPeer, remote, ""))
+			if got == "172.17.0.5" {
+				t.Errorf("ClientIP(xff=%q) collapsed to the proxy peer", remote)
+			}
+			if seen[got] {
+				t.Errorf("ClientIP(xff=%q) = %q, already used by another client", remote, got)
+			}
+			seen[got] = true
+		}
+		if len(seen) != 3 {
+			t.Errorf("got %d buckets for 3 clients, want 3", len(seen))
+		}
+	})
 }
 
 // TestClientIPCloudflareModeOffByDefault pins that Cf-Connecting-Ip is inert

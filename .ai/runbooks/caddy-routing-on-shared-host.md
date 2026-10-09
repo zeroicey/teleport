@@ -34,7 +34,7 @@
        reverse_proxy 172.17.0.1:8788 {
            header_up Host {host}
            header_up X-Real-IP {remote}
-           header_up X-Forwarded-For {remote}
+           header_up X-Forwarded-For {remote_host}
            header_up X-Forwarded-Proto {scheme}
        }
    }

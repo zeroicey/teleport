@@ -305,7 +305,8 @@ renewalID / keyID 即使泄漏也推不出该值；且创建续期本身已要�
 
 > ⚠️ **2026-10-10 修正**：本节初稿写的理由是「Caddy `reverse_proxy` 会**追加** XFF」。
 > 这是错的。本仓 README 与 `.ai/runbooks/caddy-routing-on-shared-host.md` 里的 Caddyfile
-> 实际是 `header_up X-Forwarded-For {remote}`，即**覆盖**（把整个头设成直连对端地址），
+> 实际是 `header_up X-Forwarded-For {remote}`，即**覆盖**（把整个头设成直连对端地址）——
+> 注意该行**已改为 `{remote_host}`**，原因见 `pitfalls/cases/2026-10-10-rate-limit-collapsed-to-one-bucket.md`，
 > 不是追加。审计员（task-6）逐字比对 Caddyfile 后指出了这一点。
 >
 > 结论不变（`RealIP` 不可信、限流必须用 `ClientIP`），但**理由必须改对**，否则会误导后续
