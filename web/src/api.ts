@@ -1,11 +1,39 @@
 /**
  * Typed wrapper around the dashboard API.
  *
- * Every response from the Worker uses the envelope
+ * Every response from the Go backend uses the envelope
  *   { ok: true, data } | { ok: false, error: { code, message } }
  * so this module unwraps it once and throws `ApiError` for the UI to catch.
  */
 import { ref } from 'vue';
+
+/**
+ * Application base path, derived from Vite's `base` (see vite.config.ts).
+ *
+ * This deployment does not live at an origin root: the app is mounted under a
+ * route prefix (`/yeciorez/teleport/`) on a host shared with other services, so
+ * a root-relative `/api/...` would hit the wrong service entirely. `BASE_URL`
+ * is exactly that prefix, with a trailing slash, so trimming it gives the
+ * string to prepend to every request path.
+ *
+ * Because it comes from `base`, the prefix is configured in one place and
+ * cannot drift between the HTML, the bundles and the API calls.
+ */
+export const APP_BASE = import.meta.env.BASE_URL.replace(/\/+$/, '');
+
+/**
+ * Optional API origin override, for pointing a build at a different host
+ * (e.g. a local backend while debugging against a deployed frontend).
+ *
+ * Production leaves `VITE_API_BASE` unset: every request is same-origin, which
+ * keeps the session cookie first-party and therefore immune to third-party
+ * cookie blocking. Setting it switches `request()` to credentialed
+ * cross-origin fetches.
+ */
+const API_ORIGIN = (import.meta.env.VITE_API_BASE ?? '').replace(/\/+$/, '');
+
+/** True when requests leave this origin and must opt into sending cookies. */
+export const isCrossOrigin = API_ORIGIN !== '';
 
 export interface ApiErrorBody {
   code: string;
@@ -62,8 +90,11 @@ export const sessionExpired = ref(false);
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(path, {
-      credentials: 'same-origin',
+    response = await fetch(`${API_ORIGIN}${APP_BASE}${path}`, {
+      // Same-origin (production) keeps the default first-party cookie rules;
+      // an explicit cross-origin API_ORIGIN must ask for cookies explicitly
+      // (`include`), because `same-origin` would silently drop the session.
+      credentials: isCrossOrigin ? 'include' : 'same-origin',
       ...init,
       headers: {
         ...(init.body ? { 'Content-Type': 'application/json' } : {}),

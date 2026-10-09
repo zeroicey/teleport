@@ -3,29 +3,62 @@ import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
 
 /**
- * Two entry points, built into `public/` for the Worker's `[assets]` binding:
+ * Route prefix: the single source of truth for where the app is mounted.
  *
- *   1. `web/index.html`      — the private Vue dashboard (SPA).
+ * This deployment does NOT serve the app at an origin root. The public host
+ * (`api.hcyj.xyz`) is shared with other services and is fronted by Caddy, which
+ * routes everything under `/yeciorez/teleport` to the Go process; the Go
+ * process in turn serves the SPA, the API and the share pages beneath that same
+ * prefix. Setting Vite's `base` to the prefix makes every generated URL —
+ * the hashed bundle references in index.html, the runtime asset imports, and
+ * `import.meta.env.BASE_URL` — agree with that layout automatically, so the
+ * prefix is written down exactly once.
+ *
+ * The route prefix is overridable with `VITE_ROUTE_PREFIX` so the same config
+ * can produce a build for a different mount point without editing code.
+ */
+const ROUTE_PREFIX = (process.env.VITE_ROUTE_PREFIX ?? '/yeciorez/teleport').replace(/\/+$/, '');
+const BASE = `${ROUTE_PREFIX}/`;
+
+/** Two entry points, built straight into the Go embed directory:
+ *
+ *   1. `web/index.html`       — the private Vue dashboard (SPA).
  *   2. `web/src/share/main.ts` — the public share-page bootstrap. Kept as a
- *      *stable* filename (`assets/share.js`) because the Worker hardcodes its
- *      URL when it server-renders the share page. `public/_headers` marks it
- *      `no-cache` so browsers always revalidate and never run stale JS after a
- *      deploy.
+ *      *stable* filename (`assets/share.js`) because the Go backend hardcodes
+ *      that URL when it server-renders the share page. The backend sends
+ *      `Cache-Control: no-cache` for it, so browsers always revalidate and
+ *      never run stale JS after a deploy.
+ *
+ * The output path IS the `//go:embed` target, so there is no copy step to get
+ * wrong and no window where a stale build sits in one directory while the
+ * binary embeds another.
  *
  * Mermaid is not imported statically anywhere; the share bootstrap uses a
  * dynamic `import('mermaid')`, so Vite emits it as lazy chunks that are only
  * fetched when a report actually contains a diagram.
  *
  * Development
- *   `pnpm run dev:web` -> Vite on :5173 with HMR, proxying /api to the Worker.
+ *   `pnpm run dev:web` -> Vite on :5173<prefix>/ with HMR, proxying the API and
+ *   share pages to the local Go backend.
  * Production
- *   `pnpm run build`   -> emits into public/, then `wrangler deploy`.
+ *   `pnpm run build`      -> emits here, then
+ *   `pnpm run backend:build` -> compiles both into one self-contained binary.
  */
 const SHARE_ENTRY_NAME = 'share';
 const SHARE_ENTRY_FILE = 'assets/share.js';
 
+/**
+ * Local Go backend.
+ *
+ * The Go process mounts every route under the prefix, and there is no rewrite
+ * in the proxy below: the URL the browser requests is byte-for-byte the URL the
+ * backend sees, in development and in production alike.
+ */
+const DEV_API_TARGET = 'http://127.0.0.1:8788';
+
 export default defineConfig({
   root: 'web',
+  base: BASE,
   plugins: [vue()],
 
   resolve: {
@@ -35,7 +68,10 @@ export default defineConfig({
   },
 
   build: {
-    outDir: fileURLToPath(new URL('./public', import.meta.url)),
+    // Directly into the //go:embed source directory (see
+    // backend/internal/webui/webui_embed.go). Keeping these in sync by
+    // construction beats a copy step that can silently lag.
+    outDir: fileURLToPath(new URL('./backend/internal/webui/dist', import.meta.url)),
     emptyOutDir: true,
     sourcemap: false,
     assetsDir: 'assets',
@@ -65,9 +101,18 @@ export default defineConfig({
     strictPort: false,
     // Same-origin API calls in dev, so cookies and CORS behave exactly as in
     // production (no cross-origin cookie/timing surprises).
+    //
+    // No `rewrite`: the Go process and the dev server both mount everything
+    // under the prefix, so the browser's URL is passed through unchanged. The
+    // dev server handles the SPA shell and static assets from `base`; only the
+    // API and the server-rendered share pages are forwarded.
     proxy: {
-      '/api': {
-        target: 'http://127.0.0.1:8787',
+      [`${ROUTE_PREFIX}/api`]: {
+        target: DEV_API_TARGET,
+        changeOrigin: false,
+      },
+      [`${ROUTE_PREFIX}/s`]: {
+        target: DEV_API_TARGET,
         changeOrigin: false,
       },
     },

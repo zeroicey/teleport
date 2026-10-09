@@ -46,9 +46,29 @@ export function relativeTime(ms: number): string {
   return `${Math.floor(diff / 86_400_000)} 天前`;
 }
 
-/** Absolute share URL for copying to the clipboard. */
+/**
+ * Absolute share URL for copying to the clipboard.
+ *
+ * The share page is served by the Go backend under the application's route
+ * prefix, so the URL is `<app base>/s/<token>` — NOT `<origin>/s/<token>`.
+ * Using the bare origin here would produce a link that lands on the *other*
+ * service sharing this host. `window.location` already includes the prefix (the
+ * dashboard is served from under it), so stripping the dashboard path off the
+ * current location is both correct and independent of how the app is mounted.
+ *
+ * `VITE_SHARE_BASE` overrides it, for pointing recipients at a different host
+ * than the dashboard is served from. Trailing slashes are trimmed so the
+ * configured base may be written with or without one.
+ */
 export function shareUrl(token: string): string {
-  return `${window.location.origin}/s/${token}`;
+  const configured = (import.meta.env.VITE_SHARE_BASE ?? '').replace(/\/+$/, '');
+  if (configured) return `${configured}/s/${token}`;
+
+  // `BASE_URL` is the route prefix with a trailing slash, e.g.
+  // "/yeciorez/teleport/". Joining it to the current origin yields the public
+  // share URL regardless of which route the dashboard is currently on.
+  const base = import.meta.env.BASE_URL.replace(/\/+$/, '');
+  return `${window.location.origin}${base}/s/${token}`;
 }
 
 export async function copyText(text: string): Promise<boolean> {

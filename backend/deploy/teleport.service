@@ -1,0 +1,57 @@
+[Unit]
+Description=Teleport backend (Go + SQLite)
+Documentation=https://github.com/zeroicey/teleport
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=teleport
+Group=teleport
+WorkingDirectory=/data/services/teleport
+
+# Secrets and configuration. Create this file with mode 0600 and root:root
+# ownership; systemd reads it as root before dropping privileges.
+#
+# NOTE: EnvironmentFile values are taken literally — no shell expansion is
+# performed, so the `$` separators inside ADMIN_PASSWORD_HASH are safe. (A
+# shell `source` of the same file would mangle them; always quote values if you
+# do that by hand.)
+EnvironmentFile=/data/services/teleport/teleport.env
+
+ExecStart=/data/services/teleport/teleport
+Restart=always
+RestartSec=2
+
+# Hardening. The service only needs to read its own directory and listen on a
+# TCP socket, so it is locked down aggressively.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# The SQLite database and its WAL files live here, so this is the one writable
+# path the service gets.
+ReadWritePaths=/data/services/teleport
+
+# Resource limits. The host has 2 vCPU / 3.5 GiB RAM and runs other services;
+# these caps keep a runaway report render from starving them.
+LimitNOFILE=65535
+MemoryMax=512M
+CPUQuota=150%
+
+# Logs go to the journal: journalctl -u teleport -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=teleport
+
+[Install]
+WantedBy=multi-user.target

@@ -12,16 +12,20 @@
  * below means the browser fetches Mermaid's chunk graph only when a diagram is
  * actually present, and Vite emits the rest as separate lazy chunks.
  *
- * Markdown itself is rendered server-side by the Worker (src/render/markdown.ts),
- * so this bundle stays tiny.
+ * Markdown itself is rendered server-side by the Go backend
+ * (backend/internal/markdown/render.go), so this bundle stays tiny.
  */
 
 /**
  * Render every `.mermaid` element in the document.
  *
- * Mermaid is given `securityLevel: 'strict'`, which sandboxes rendered
- * diagrams in an iframe and disables click handlers — important because report
- * content is untrusted input.
+ * Mermaid is given `securityLevel: 'strict'`, which sanitizes diagram source and
+ * output through the DOMPurify copy Mermaid bundles, and disables interactive
+ * click handlers — important because report content is untrusted input.
+ *
+ * Note that `strict` does NOT wrap the diagram in an iframe (only
+ * `securityLevel: 'sandbox'` does), which is what makes it compatible with the
+ * share page's `default-src 'none'` CSP that deliberately has no `frame-src`.
  */
 async function renderDiagrams(): Promise<void> {
   const nodes = Array.from(document.querySelectorAll<HTMLElement>('.mermaid'));

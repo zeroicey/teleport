@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 /**
- * Guard: `schema.sql` and `migrations/0001_init.sql` must not drift.
+ * Guard: `schema.sql` and the migration embedded in the Go backend must not drift.
+ *
+ * The backend embeds its migrations (`internal/store/migrations/*.sql`) into the
+ * compiled binary, so that copy is the one that actually runs. `schema.sql` at
+ * the repo root is the readable snapshot for humans and for running against a
+ * bare `sqlite3` shell. If the two diverge, the snapshot lies about what the
+ * service creates — hence this check.
  *
  * Compares both files with comments/blank lines stripped and whitespace
  * normalized, so headers and comments may differ but the actual DDL may not.
@@ -9,7 +15,7 @@
  */
 import { readFileSync } from 'node:fs';
 
-const MIGRATION = 'migrations/0001_init.sql';
+const MIGRATION = 'backend/internal/store/migrations/0001_init.sql';
 const SNAPSHOT = 'schema.sql';
 
 const normalize = (sql) =>
@@ -21,8 +27,15 @@ const normalize = (sql) =>
     .replace(/\s+/g, ' ')
     .trim();
 
-const migration = normalize(readFileSync(MIGRATION, 'utf8'));
-const snapshot = normalize(readFileSync(SNAPSHOT, 'utf8'));
+let migration;
+let snapshot;
+try {
+  migration = normalize(readFileSync(MIGRATION, 'utf8'));
+  snapshot = normalize(readFileSync(SNAPSHOT, 'utf8'));
+} catch (error) {
+  console.error(`✖ Could not read a schema file: ${error.message}`);
+  process.exit(1);
+}
 
 if (migration !== snapshot) {
   console.error(`✖ Schema drift detected between ${MIGRATION} and ${SNAPSHOT}`);

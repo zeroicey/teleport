@@ -1,10 +1,25 @@
 # Teleport
 
-个人 AI 报告展示与时效分享平台 — 基于 Cloudflare 全家桶（Workers + D1 + Workers Assets），
-无需传统服务器、免备案。
+个人 AI 报告展示与时效分享平台。在终端 / 工作框中完成复杂工作（安全渗透、架构设计、
+开发进度等）后，通过一次 API 调用把报告发布为在线网页，并得到一条**带时效的分享链接**。
 
-在终端 / 工作框中完成复杂工作（安全渗透、架构设计、开发进度等）后，通过一个 API 调用
-把报告发布为在线网页，并得到一条**带时效的分享链接**。
+**当前架构：单二进制（Go 内嵌前端）**
+
+| 层 | 技术 | 部署位置 |
+|---|---|---|
+| 前端 | Vue 3 + Vite（pnpm） | **编译进 Go 二进制**（`go:embed`） |
+| 后端 | Go + SQLite（纯 Go 驱动，无 cgo） | 国内云服务器 hcyj — Caddy 分流至 `/yeciorez/teleport` |
+| 入口 | 单一来源：`https://api.hcyj.xyz/yeciorez/teleport/` | 前端、API、分享页同源同前缀 |
+
+前端与后端**构建为同一个可执行文件**：Vite 产物写进 `backend/internal/webui/dist/`，
+由 `//go:embed` 打进二进制。部署就是上传一个文件、重启服务，服务器上不需要
+Node、不需要 Go、也没有任何需要与二进制同步的静态目录。
+
+> **历史说明**：本项目原先基于 Cloudflare 全家桶（Workers + D1 + Hono）全站部署，
+> 之后改为「前端在 Cloudflare Workers Assets + Worker 反代后端」。**该方案已废弃**，
+> 原因是 Cloudflare 免费版分配的 anycast IPv4 在中国大陆被 TCP 层封锁（详见
+> 「已知陷阱 · 5」），域名解析正常、ping 得通，但 443 端口完全打不开。
+> 现在前端与后端都由国内服务器直接提供。
 
 **核心能力**
 
@@ -12,9 +27,9 @@
 |---|---|
 | 报告发布 | `POST /api/reports` 上报 Markdown，自动生成分享链接 |
 | 时效分享 | 每条链接独立设置有效期（1 小时 ~ 永不过期），可随时禁用 / 吊销 |
-| 内容渲染 | Markdown 服务端渲染 + 代码语法高亮 + Mermaid 图表（客户端懒加载） |
+| 内容渲染 | Markdown **服务端渲染**（Go + goldmark + Chroma）+ Mermaid 客户端懒加载 |
 | 管理面板 | Vue 3 SPA，登录后查看报告、管理分享链接、复制 / 调期 / 禁用 |
-| 安全 | `html:false` 转义原始 HTML、严格 CSP、常量时间鉴权比较、失效链接语义化 404/410 |
+| 安全 | 原始 HTML 不渲染、严格 CSP、常量时间鉴权比较、失效链接语义化 404/410 |
 
 ---
 
@@ -22,100 +37,93 @@
 
 ```
 teleport/
-├── wrangler.toml                 # Worker + D1 + Assets 配置（含 staging/production 环境）
-├── schema.sql                    # D1 完整 schema 快照（可直接 --file 执行）
-├── migrations/
-│   └── 0001_init.sql             # 增量迁移（wrangler d1 migrations apply 使用）
-├── tsconfig.json                 # Worker 侧严格模式 TS 配置
-├── tsconfig.web.json             # 前端（Vue SFC）TS 配置
-├── vite.config.ts                # Vite 构建配置（root=web，输出到 public/）
-├── worker-configuration.d.ts     # 由 `pnpm run cf-typegen` 生成，勿手改
-├── .dev.vars.example             # 本地密钥模板（.dev.vars 已 gitignore）
+├── schema.sql                    # 数据库 schema 快照（可直接喂给 sqlite3）
+├── vite.config.ts                # Vite 构建配置（root=web，输出到 Go embed 目录）
+├── tsconfig.web.json             # 前端（含 Vite 配置）TS 配置
 │
 ├── scripts/
-│   ├── hash-password.mjs         # 生成 ADMIN_PASSWORD_HASH
-│   └── check-schema-sync.mjs     # 校验 schema.sql 与迁移文件未漂移
+│   ├── build.sh                  # 发布构建：前端 + 后端 → 单个自包含二进制
+│   └── check-schema-sync.mjs     # 校验 schema.sql 与 Go 内嵌迁移未漂移
 │
-├── src/                          # ── Cloudflare Worker 后端 ──
-│   ├── index.ts                  # Worker 入口：中间件编排 + 路由挂载 + 资源兜底
-│   ├── types.ts                  # 业务类型（ReportRow / ShareTokenRow / ...）
-│   ├── env.d.ts                  # 合并 secrets 到生成的 Env 接口
-│   │
-│   ├── middleware/
-│   │   └── index.ts              # requestId / CORS / 安全头 / Bearer 鉴权 / Session / 错误映射
-│   │
-│   ├── lib/
-│   │   ├── config.ts             # 绑定、变量与密钥的读取与校验
-│   │   ├── errors.ts             # ApiError + 统一响应封套
-│   │   ├── util.ts               # UUID / 高熵 token / 时间 / 常量时间比较
-│   │   └── validate.ts           # 请求体校验（无外部依赖）
-│   │
-│   ├── render/
-│   │   └── markdown.ts           # Markdown→HTML（markdown-it, html:false）+ 语法高亮
-│   │
-│   ├── services/
-│   │   ├── reports.ts            # reports + share_tokens 的全部 SQL
-│   │   ├── auth.ts               # 会话 Cookie 签名/校验 + Agent Bearer 校验
-│   │   └── password.ts           # PBKDF2 口令哈希与校验
-│   │
-│   └── routes/
-│       ├── reports.ts            # POST /api/reports            (Bearer)
-│       ├── share.ts              # GET  /api/share/:token       (公开)
-│       ├── revoke.ts             # POST /api/share/:token/revoke(Bearer)
-│       ├── admin.ts              # /api/admin/*                 (Session)
-│       └── sharePage.ts          # GET  /s/:token 服务端渲染公开页
+├── backend/                      # ── Go 后端（全部业务逻辑 + 前端托管）──
+│   ├── main.go                   # 启动 / 优雅退出 / hash-password / migrate / version
+│   ├── deploy/
+│   │   ├── teleport.service      # systemd unit（含沙箱加固）
+│   │   └── teleport.env.example  # 生产环境变量模板
+│   └── internal/
+│       ├── config/               # 环境变量读取与校验
+│       ├── httpx/                # 中间件、响应封套、Session 签名、Bearer 鉴权
+│       ├── password/             # PBKDF2-HMAC-SHA256
+│       ├── store/                # SQLite 访问层 + 内嵌迁移
+│       │   └── migrations/       # *.sql，编译进二进制
+│       ├── markdown/             # goldmark + Chroma 渲染
+│       ├── validate/             # 请求体校验（复刻原 JS 语义）
+│       ├── domain/               # 业务类型
+│       ├── views/                # 分享页服务端渲染模板
+│       ├── spa/                  # 静态前端托管（SPA 回退 / 缓存 / 路径穿越防护）
+│       ├── webui/                # //go:embed 前端产物（dist/ 由 Vite 生成）
+│       └── api/                  # 路由挂载
 │
-├── web/                          # ── 前端源码 ──
-│   ├── index.html                # 管理面板 SPA 入口
-│   ├── public/_headers           # Workers Assets 响应头（share.js no-cache）
-│   └── src/
-│       ├── main.ts               # createApp + 路由挂载
-│       ├── App.vue               # 顶栏 / 登录态分流 / 全局 401 处理
-│       ├── api.ts                # 类型化 API 客户端（统一解包响应封套）
-│       ├── format.ts             # 时间 / 过期 / 复制等展示工具
-│       ├── styles.css            # 轻量样式（亮/暗色，无 CSS 框架）
-│       ├── router/index.ts       # /dashboard 路由 + 登录守卫
-│       ├── share/
-│       │   └── main.ts           # 分享页客户端：Mermaid 懒加载 + 过期倒计时
-│       └── views/
-│           ├── LoginView.vue     # 密码登录
-│           ├── ReportsView.vue   # 报告列表 + 客户端搜索
-│           └── ReportDetailView.vue  # 报告详情 + 分享 Token 管理
-│
-└── public/                       # Workers Assets 静态目录（`pnpm run build` 的产物）
-    ├── index.html                # 管理面板 SPA（由 Vite 生成，勿手改）
-    ├── _headers                  # 响应头规则（share.js -> no-cache）
-    └── assets/
-        ├── share.js              # 分享页客户端（固定文件名 + 内容哈希）
-        └── *-[hash].js           # 面板分包与 Mermaid 懒加载分块
+└── web/                          # ── 前端源码 ──
+    ├── index.html                # 管理面板 SPA 入口
+    └── src/
+        ├── main.ts               # createApp + 路由挂载
+        ├── App.vue               # 顶栏 / 登录态分流 / 全局 401 处理
+        ├── api.ts                # 类型化 API 客户端（统一解包响应封套）
+        ├── format.ts             # 时间 / 过期 / 复制等展示工具
+        ├── env.d.ts              # import.meta.env 类型
+        ├── styles.css            # 轻量样式（亮/暗色，无 CSS 框架）
+        ├── router/index.ts       # /dashboard 路由 + 登录守卫
+        ├── share/
+        │   └── main.ts           # 分享页客户端：Mermaid 懒加载 + 过期倒计时
+        └── views/
+            ├── LoginView.vue     # 密码登录
+            ├── ReportsView.vue   # 报告列表 + 客户端搜索
+            └── ReportDetailView.vue  # 报告详情 + 分享 Token 管理
 ```
 
-> `public/` 下的 `index.html` 与 `assets/` 均为 `pnpm run build` 的**生成产物**，请勿手改。
-> `pnpm run deploy` 会先构建再部署，因此无需手动提交产物；若要接入 CI，也可将 `public/` 加入 `.gitignore`。
+> `backend/internal/webui/dist/` 全部内容均为 `pnpm run build` 的**生成产物**，
+> 请勿手改，且已被 gitignore —— 它只是 `//go:embed` 的输入目录，不是部署目标。
 
-### 为什么这样分层
+### 请求路径
 
-| 目录 | 职责 | 约束 |
-|---|---|---|
-| `routes/` | HTTP 语义：解析、状态码、响应 | 不写 SQL |
-| `services/` | 业务逻辑与持久化 | 不感知 `Request`/`Response` |
-| `lib/` | 无状态工具与校验 | 无副作用 |
-| `middleware/` | 横切关注点 | 不包含业务分支 |
+```
+浏览器 ──https──> api.hcyj.xyz/yeciorez/teleport/...
+                        │
+                    Caddy(:443)  handle /yeciorez/teleport*
+                        │         （保留前缀，不 strip）
+                        ▼
+                  Go(:8788, 仅监听 docker 网桥) ─> SQLite
+                        ├─ /api/*        JSON API
+                        ├─ /s/{token}    服务端渲染的分享页
+                        └─ 其余         内嵌的 Vue SPA（客户端路由回退）
+```
 
-好处是后续接入前端框架、替换渲染管线、或增加 KV 缓存时，改动都被限制在单层内。
+**只有一个来源，没有第二个入口。** 前端、API 与分享页同源同前缀，因此：
+
+- 会话 Cookie 是**第一方**的，不受 Safari ITP / Chrome 第三方 Cookie 淘汰影响；
+- 分享页的 `script-src 'self'` 有实际意义（脚本确实来自同一来源）；
+- 不存在「前端在某处、后端在另一处」导致的环境漂移。
+
+> **为什么不再让浏览器直连 Cloudflare**：见「已知陷阱 · 5」。简单说，CF 免费版
+> 分配的那两个 IP 在大陆是断的，而 `api.hcyj.xyz` 是通的。
 
 ---
 
 ## 接口一览
 
+所有路径都以 `/yeciorez/teleport` 为前缀挂在 `api.hcyj.xyz` 上。
+下表中的路径是**相对前缀**的；浏览器与 API 客户端都用同一个前缀访问，
+前端、接口与分享页完全同源。
+
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
-| `POST` | `/api/reports` | `Authorization: Bearer <AGENT_SECRET_KEY>` | AI 上报报告；携带 `autoShareHours` 时同步生成分享链接 |
+| `POST` | `/api/reports` | `Authorization: Bearer <AGENT_SECRET_KEY>` | AI 上报报告；带 `autoShareHours` 时同步生成分享链接 |
 | `GET` | `/api/reports/:id` | Bearer | 读取单篇报告源文 |
 | `GET` | `/api/share/:token` | 公开 | 只读获取报告；失效/过期分别返回 404 / 410 |
 | `POST` | `/api/share/:token/revoke` | Bearer | 手动禁用链接（幂等） |
 | `GET` | `/s/:token` | 公开 | 服务端渲染的分享页面 |
-| `GET` | `/api/health` | 公开 | 健康检查（含 D1 探活） |
+| `GET` | `/api/health` | 公开 | 健康检查 |
 | `POST` | `/api/admin/login` | 口令 | 登录并下发签名 Session Cookie |
 | `POST` | `/api/admin/logout` | 公开 | 清除 Session |
 | `GET` | `/api/admin/session` | Session | 检查会话状态 |
@@ -125,7 +133,7 @@ teleport/
 | `PATCH` | `/api/admin/shares/:token` | Session | 调整过期时间 / 启用禁用 |
 | `DELETE` | `/api/admin/shares/:token` | Session | 吊销链接 |
 
-所有响应统一为：
+所有响应统一封套（与旧版完全一致）：
 
 ```jsonc
 { "ok": true,  "data": { /* ... */ }, "requestId": "..." }
@@ -135,7 +143,7 @@ teleport/
 ### 上报示例
 
 ```bash
-curl -X POST https://reports.example.com/api/reports \
+curl -X POST https://api.hcyj.xyz/yeciorez/teleport/api/reports \
   -H "Authorization: Bearer $AGENT_SECRET_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -158,7 +166,7 @@ curl -X POST https://reports.example.com/api/reports \
     "share": {
       "token": "R1Ku0lg0YNoMXVfJgGuzYA",
       "expires_at": 1791390719094,
-      "url": "https://reports.example.com/s/R1Ku0lg0YNoMXVfJgGuzYA"
+      "url": "https://api.hcyj.xyz/yeciorez/teleport/s/R1Ku0lg0YNoMXVfJgGuzYA"
     }
   }
 }
@@ -195,44 +203,60 @@ curl -X POST https://reports.example.com/api/reports \
 
 一篇报告可以持有**任意多条**互相独立的失效链接。
 
+迁移文件内嵌在 Go 二进制里（`backend/internal/store/migrations/*.sql`），
+启动时自动执行，无需手工建表。`schema.sql` 是给人看 / 给 `sqlite3` 用的快照，
+`pnpm run db:check-schema` 会校验两者未漂移。
+
 ---
 
-## 快速开始
+## 本地开发
 
-> **包管理器：pnpm**（已在 `package.json` 的 `packageManager` 字段锁定 `pnpm@10.33.0`）。
+> **包管理器：pnpm**（`package.json` 的 `packageManager` 锁定 `pnpm@10.33.0`）。
 > 请勿使用 npm / yarn，仓库只保留 `pnpm-lock.yaml` 单一锁文件。
+
+需要两个终端：Go 后端与 Vite 开发服务器。
 
 ```bash
 pnpm install
 
-# 1. 创建 D1 数据库，把输出的 database_id 填进 wrangler.toml
-pnpm exec wrangler d1 create teleport-db
+# ── 终端 1：Go 后端 ─────────────────────────────────────────────
+cd backend
+# 生成面板口令哈希
+go run . hash-password 'your password'
 
-# 2. 本地建表
-pnpm run db:migrate:local
+LISTEN_ADDR=127.0.0.1:8788 \
+  ROUTE_PREFIX=/yeciorez/teleport \
+  PUBLIC_BASE_URL=http://127.0.0.1:5173 \
+  COOKIE_SECURE=false \
+  SESSION_SECRET=dev-session-secret \
+  AGENT_SECRET_KEY=dev-agent-secret \
+  ADMIN_PASSWORD_HASH='<上一步输出的值>' \
+  DB_PATH=./data/teleport.db \
+  go run .
 
-# 3. 配置本地密钥
-cp .dev.vars.example .dev.vars
-pnpm run hash-password 'your password'   # 结果填入 ADMIN_PASSWORD_HASH
-
-# 4. 启动 Worker（http://localhost:8787）
-pnpm run dev
-
-# 5. 可选：启动前端开发服务器（http://127.0.0.1:5173，带 HMR，/api 自动代理到 8787）
-pnpm run dev:web
+# ── 终端 2：前端（HMR） ────────────────────────────────────────
+pnpm run dev:web    # http://127.0.0.1:5173/yeciorez/teleport/
 ```
+
+`vite.config.ts` 把 `<前缀>/api` 与 `<前缀>/s` 代理到 `127.0.0.1:8788`，**且不做 rewrite**：
+浏览器请求的路径与后端看到的路径逐字节相同，dev 与 prod 不会出现
+「本地能跑、线上 404」的偏差。
+
+> 若只想验证后端（不跑前端），可以完全不构建前端：`webui` 在没有
+> `embed_frontend` 构建标签时会报告「无前端」，服务退化为纯 API。
+> 想在没有重新编译的情况下换前端资源，可用 `STATIC_DIR=/path/to/dist` 指向磁盘目录。
 
 ### 关于 pnpm 的两点注意
 
 **1. 构建脚本需要显式放行**（pnpm 10 默认拦截 `postinstall`，是供应链安全特性）。
-本项目已在 `pnpm-workspace.yaml` 的 `onlyBuiltDependencies` 中按**精确包名**放行四个必需的包：
+本项目已在 `pnpm-workspace.yaml` 的 `onlyBuiltDependencies` 中按**精确包名**放行：
 
 | 包 | 为什么必须放行 |
 |---|---|
 | `esbuild` | Vite 依赖的平台二进制 |
-| `workerd` | `wrangler dev` 所需的 Workers 运行时 |
-| `sharp` | miniflare/wrangler 使用的原生图像库 |
-| `blake3-wasm` | miniflare 的构建步骤 |
+
+> 历史上还放行过 `workerd` / `sharp` / `blake3-wasm`（Cloudflare 工具链所需）。
+> 这些依赖已随 Cloudflare 方案一并移除，若清单里仍有它们，可以直接删掉。
 
 若 `pnpm install` 后提示 `Ignored build scripts`，说明放行清单缺失或包名有变，
 用 `pnpm approve-builds` 查看并按需补入 —— **不要**用通配符一次性放行全部。
@@ -242,112 +266,163 @@ pnpm run dev:web
 npm 下可能"碰巧能跑"，pnpm 下会立刻报错。这是**期望行为**，不要用
 `node-linker=hoisted` 去绕过它。
 
-> 日常开发建议同时开两个终端：`pnpm run dev`（Worker + D1）与 `pnpm run dev:web`（Vue HMR）。
-> 只跑 `pnpm run dev` 也可以，此时访问的是 `pnpm run build` 产出的静态面板。
-
-### 部署
-
-> **无头 / 远程主机上的认证**
-> `wrangler login` 会在本机 `http://localhost:8976` 开一个 OAuth 回调服务器，
-> 无头机收不到回调，因此**用不了**。二选一：
->
-> **方式 A — 设备码**（交互式，码只有 5 分钟有效期）
-> ```bash
-> pnpm exec wrangler login --device --browser=false
-> # 然后在任意能上网的浏览器打开提示的 URL 并输入设备码
-> ```
->
-> **方式 B — API Token**（推荐，无需竞速，也适合 CI）
-> 在 https://dash.cloudflare.com/profile/api-tokens 建 token，权限：
-> `Workers Scripts:Edit`、`D1:Edit`、`Workers Routes:Edit`、`Account Settings:Read`。
-> ```bash
-> export CLOUDFLARE_API_TOKEN=...
-> export CLOUDFLARE_ACCOUNT_ID=...
-> ```
-> Wrangler 会自动读取这两个环境变量，之后所有命令都无需登录。
-
-```bash
-# 1. 建生产库（需先把 database_id 填进 [env.production.d1_databases]）
-pnpm exec wrangler d1 create teleport-db-prod
-
-# 2. 建表（--env production 不能漏，否则会打到别的库）
-pnpm exec wrangler d1 migrations apply DB --remote --env production
-
-# 3. 三个密钥，逐个 --env production
-pnpm exec wrangler secret put AGENT_SECRET_KEY    --env production
-pnpm exec wrangler secret put SESSION_SECRET      --env production
-pnpm run hash-password '你的面板密码'              # 复制输出
-pnpm exec wrangler secret put ADMIN_PASSWORD_HASH --env production
-
-# 4. 构建 + 部署
-pnpm run deploy
-
-# 5. 把部署输出的 URL 填回 PUBLIC_BASE_URL，再部署一次
-pnpm run deploy
-```
-
-> **第 5 步为何要部署两次**：`PUBLIC_BASE_URL` 决定 API 返回的分享链接前缀。
-> 首次部署前你不知道真正的 `*.workers.dev` 子域名，只能先占位；
-> 拿到真实地址后填回去重部署，分享链接才是对的。
->
-> **关于域名**：`workers.dev` 子域名免费、免备案，够用就不必买域名。
-> 想挂自定义域名，取消 `[[env.production.routes]]` 注释并把
-> `workers_dev` 改为 `false` —— **两者必须同时改**，否则 Worker 没有任何可访问入口。
+### 命令一览
 
 | 命令 | 作用 |
 |---|---|
-| `pnpm run dev` | Worker 开发服务器（含本地 D1） |
-| `pnpm run dev:web` | Vite 前端开发服务器（HMR + `/api` 代理） |
-| `pnpm run build` | 构建 Vue 面板到 `public/` |
-| `pnpm run deploy` | 构建 + 部署到 production |
-| `pnpm run deploy:staging` | 构建 + 部署到 staging |
-| `pnpm run typecheck` | Worker 类型检查（`tsc --noEmit`） |
-| `pnpm run typecheck:web` | 前端类型检查（`vue-tsc`） |
-| `pnpm run typecheck:all` | 两侧一起检查 |
-| `pnpm run cf-typegen` | 依据 wrangler.toml 重新生成绑定类型 |
-| `pnpm run db:migrate:local` | 本地 D1 迁移 |
-| `pnpm run db:migrate:remote` | 生产 D1 迁移（`--env production`） |
-| `pnpm run db:migrate:staging` | staging D1 迁移 |
-| `pnpm run db:check-schema` | 校验 `schema.sql` 与迁移文件一致 |
-| `pnpm run hash-password` | 生成管理员口令哈希 |
+| `pnpm run dev:web` | Vite 前端开发服务器（HMR + `/api`、`/s` 代理） |
+| `pnpm run build` | 构建 Vue 面板 + 分享页客户端到 `backend/internal/webui/dist/` |
+| `pnpm run build:release` | **发布构建**：前端 + 后端 → 单个自包含二进制到 `bin/` |
+| `pnpm run typecheck` | 前端类型检查（`vue-tsc`） |
+| `pnpm run db:check-schema` | 校验 `schema.sql` 与 Go 内嵌迁移一致 |
+| `pnpm run backend:test` | Go 单元 / 集成测试 |
+| `pnpm run backend:vet` | Go 静态检查 |
+| `pnpm run backend:build` | 同 `build:release`（等价入口，便于记忆） |
+| `pnpm run check` | 以上检查一把梭 |
 
-> 迁移脚本用 **binding 名 `DB`** 而非数据库名，这样 `--env` 会自动解析到该环境
-> 对应的 `database_id`。若写死数据库名，跨环境时容易迁移到错误的库。
+---
+
+## 部署
+
+### 构建：一个文件
+
+```bash
+pnpm run build:release          # → bin/teleport-linux-amd64
+```
+
+它做两件事，顺序不能反：
+
+1. `vite build` → 写进 `backend/internal/webui/dist/`（`//go:embed` 的输入目录）；
+2. `go build -tags embed_frontend` → 把上一步的产物打进二进制。
+
+`embed_frontend` 这个构建标签是关键：没有它，`webui` 走的是「无前端」桩实现，
+于是 `go build` / `go test` / `go vet` 在前端尚未构建的干净仓库里依然可用。
+发布构建显式打开它，二进制里就有了完整前端。
+
+编译完成后会打印版本、体积、SHA256，并自检 `version --frontend`（应为 `embedded`）。
+
+### 后端（Go + SQLite，hcyj）
+
+服务器上没有 Go 工具链，因此**在本地交叉编译**后上传。因为前端已经在二进制里，
+上传的东西只有这一个文件：
+
+```bash
+# 1. 本地编译（纯静态、无 cgo；自动把 git revision 编进二进制）
+pnpm run build:release         # → bin/teleport-linux-amd64
+
+# 2. 服务器准备（首次）
+ssh hcyj
+useradd --system --no-create-home --shell /usr/sbin/nologin teleport
+mkdir -p /data/services/teleport && chown teleport:teleport /data/services/teleport
+
+# 3. 上传二进制与 unit
+scp bin/teleport-linux-amd64 hcyj:/data/services/teleport/teleport.new
+scp backend/deploy/teleport.service hcyj:/etc/systemd/system/teleport.service
+
+# 4. 写环境文件（含密钥，600 root:root）
+scp backend/deploy/teleport.env.example hcyj:/data/services/teleport/teleport.env
+#   编辑填入 AGENT_SECRET_KEY / SESSION_SECRET / ADMIN_PASSWORD_HASH
+#   哈希用：./teleport hash-password '你的密码'
+
+# 5. 原子替换 + 启动
+ssh hcyj 'cd /data/services/teleport && chmod 700 teleport.new && chown teleport:teleport teleport.new \
+          && mv teleport.new teleport && systemctl restart teleport'
+journalctl -u teleport -f
+```
+
+> **升级时用 `mv` 覆盖而不是 `scp` 直接写目标文件**：`scp` 会以截断方式打开
+> 目标文件，若服务此刻正在运行，会短暂看到一个残缺的可执行文件；`mv` 是同目录
+> 内的原子替换，要么是旧的、要么是新的。上传到 `.new` 再 `mv` 才是安全的。
+
+> 想确认线上跑的到底是哪次提交：
+> ```bash
+> ssh hcyj '/data/services/teleport/teleport version'            # git revision
+> ssh hcyj '/data/services/teleport/teleport version --frontend' # embedded / none
+> ```
+> `-dirty` 表示构建时工作区有未提交改动。构建可复现 —— 同一 revision + 同一
+> `-X main.version` 会得到**逐字节相同**的二进制，可用 `sha256sum` 对比本地与线上产物。
+
+服务监听 `172.17.0.1:8788`（docker 网桥网关），**不对公网暴露**，只有 Caddy 能访问。
+数据目录 `/data/services/teleport/`，SQLite 使用 WAL 模式。
+unit 内已启用 `ProtectSystem=strict`、`NoNewPrivileges`、`MemoryDenyWriteExecute` 等沙箱选项，
+并把 `/data/services/teleport` 设为唯一可写路径。
+
+### Caddy 分流（hcyj）
+
+`api.hcyj.xyz` 由 docker 容器 `caddy` 占用 443 端口。项目在自己的路径前缀上分流：
+
+```caddyfile
+handle /yeciorez/teleport* {
+    reverse_proxy 172.17.0.1:8788 {
+        header_up Host {host}
+        header_up X-Real-IP {remote}
+        header_up X-Forwarded-For {remote}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}
+```
+
+三个关键点：
+
+1. **用 `handle` 而不是 `handle_path`** —— 前缀必须**保留**。Go 服务的所有路由都挂在
+   `/yeciorez/teleport` 下（含前端资源与分享页），且分享链接里也写死了该前缀；
+   在此处剥掉会让所有路由 404。
+2. **站点级安全响应头要排除该前缀**（`@notTeleport not path /yeciorez/teleport*`）。
+   后端对公开分享页发的是更严格的策略（`default-src 'none'`、`X-Frame-Options: DENY`），
+   两边同时下发会产生重复且互相冲突的头。
+3. Caddy 按路径**最长匹配**选 `handle`，因此该块优先于兜底块，`api.hcyj.xyz` 原有服务不受影响。
+
+> 该容器原先 `restart=no`，重启机器后整个 `api.hcyj.xyz` 都会消失。
+> 已改为 `docker update --restart unless-stopped caddy`。
+
+### 前端
+
+**前端没有独立部署步骤** —— 它已在后端二进制里。`pnpm run build:release` 之后，
+重启服务即完成前端更新。
+
+> Cloudflare 侧已全部下线：Worker 已删除、`teleport.zeroicey.me` 的 DNS 记录
+> （原先由 `custom_domain = true` 自动创建）也已随 Worker 删除而移除。
+> `wrangler.toml`、`src/index.ts`、`worker-configuration.d.ts` 等文件均已从仓库移除。
+> 仓库里不再有 `wrangler` 依赖，因此也不需要 Cloudflare 凭证。
+>
+> 但**域名本身仍是 Cloudflare 托管的**：`zeroicey.me` 及其它子域的 A 记录依然指向
+> 那批在大陆被封锁的 CF IP，访问状态与本次改动无关，需要另行处理（例如自行
+> 在该账户下把记录改成可用的 IP）。这一点不在本项目范围内。
 
 ---
 
 ## 渲染管线（Markdown + Mermaid）
 
-分享页 `GET /s/:token` 采用**混合渲染**：Markdown 在 Worker 服务端渲染，Mermaid 在客户端懒加载。
-这个划分不是随意选的，而是由体积决定的。
-
-### 为什么这样拆分
+分享页 `GET /s/:token` 采用**混合渲染**：Markdown 与代码高亮在 Go 服务端渲染，
+Mermaid 在客户端懒加载。这个划分由体积决定。
 
 | 环节 | 位置 | 原因 |
 |---|---|---|
-| Markdown → HTML | **Worker 服务端** | markdown-it 仅 ~116 KB；且 `html:false` 让原始 HTML 天然被转义，是整条链路最关键的一道 XSS 防线 |
-| 代码语法高亮 | **Worker 服务端** | 只需精选语言子集（26 种），避免引入全部 190+ 语言 |
-| Mermaid 图表 | **客户端懒加载** | Mermaid 解包后 **121 MB**，打包后仍有 ~5 MB 分块；只在文档真的含图时才 `import()` |
+| Markdown → HTML | **Go 服务端** | goldmark 体积小，且默认不放行原始 HTML，是整条链路最关键的 XSS 防线 |
+| 代码语法高亮 | **Go 服务端** | Chroma 只需精选语言子集，避免引入全部语言定义 |
+| Mermaid 图表 | **客户端懒加载** | Mermaid 打包后仍有数 MB 分块；只在文档真的含图时才 `import()` |
 
-实测产物：`assets/share.js` 仅 **1.3 KB gzip**，Mermaid 拆成独立分块
+实测产物：`assets/share.js` 仅约 **2.4 KB**，Mermaid 拆成独立分块
 （最大 `elk` 455 KB gzip、`cytoscape` 137 KB gzip），纯文字报告完全不加载它们。
 若把 Mermaid 静态引入，**每一篇纯文本报告都会被迫下载约 1 MB**。
 
-### Markdown 渲染（`src/render/markdown.ts`）
+### Markdown 渲染（`backend/internal/markdown/render.go`）
 
-- `MarkdownIt({ html: false })` —— 报告正文里的 `<script>`、`<img onerror>` 一律被转义为文本。
-- 依赖 markdown-it 内置的 `validateLink` 拦截 `javascript:` / `vbscript:` / 危险 `data:` 协议，不自己写过滤器。
-- 外链自动加 `target="_blank" rel="noopener noreferrer nofollow"`，防止 `window.opener` 反向控制。
-- 语法高亮使用 `highlight.js/lib/core` + **精选 26 种语言**（含别名 `ts`/`sh`/`yml`/`ps1` 等）。
-  无语言标记或高亮失败时，**退回转义后的纯文本**，绝不输出原始源码。
+- goldmark 使用默认配置，**不开启 `WithUnsafe`** —— 报告正文里的 `<script>`、
+  `<img onerror>` 一律被替换为 `<!-- raw HTML omitted -->`。
+- 危险链接协议（`javascript:` / `vbscript:` / 危险 `data:`）由 goldmark 内置逻辑拦截。
+- 启用 Table / Strikethrough / Linkify 扩展与自动标题 ID；渲染器覆写通过
+  `renderer.WithNodeRenderers` 注册，**不用 `SetRenderer`**（后者会丢掉扩展注册的渲染器）。
+- 语法高亮使用 Chroma，输出 class 而非内联样式；无语言标记或高亮失败时
+  **退回转义后的纯文本**，绝不输出原始源码。
 
 ### Mermaid 渲染（`web/src/share/main.ts`）
 
 - 仅当页面存在 `.mermaid` 元素时才 `import('mermaid')`。
-- `securityLevel: 'strict'` —— Mermaid 会在 iframe 中沙箱化渲染，并禁用 `click` 指令。
-  报告内容是**不可信输入**，这一项不是可选项。
-- 用 `Promise.allSettled` 逐个渲染：单个图表语法错误不会导致整页白屏，
-  失败的那个会把源码显示出来便于排查。
+- `securityLevel: 'strict'` —— 禁用 `click` 指令与脚本执行。报告内容是**不可信输入**，
+  这一项不是可选项。（注：`strict` 并**不**创建 iframe，只有 `'sandbox'` 才会；
+  因此分享页 CSP 无需 `frame-src`。）
+- 用 `Promise.allSettled` 逐个渲染：单个图表语法错误不会导致整页白屏。
 
 ### 内容安全策略（CSP）
 
@@ -357,16 +432,33 @@ img-src 'self' data:; font-src 'self'; connect-src 'self';
 base-uri 'none'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-requests
 ```
 
-- **`script-src 'self'` 且页面内零内联脚本** —— 因此无需维护 nonce，内容路径上没有任何可执行内联 JS。
+- **`script-src 'self'` 且页面内零内联脚本** —— 无需维护 nonce。
 - 唯一的放宽是 `style-src 'unsafe-inline'`：Mermaid 运行时会把 `<style>` 注入它生成的 SVG。
   这**不能**执行脚本。
 - `img-src 'self' data:` 让报告里的图片只能来自本站或 data URI，无法用作外链追踪像素。
 
-### 缓存策略
+### 安全响应头与缓存策略
 
-`web/public/_headers` 中把 `/assets/share.js` 设为 `no-cache`：它必须用**固定文件名**
-（Worker 服务端渲染时硬编码引用），所以不能靠内容哈希失效，只能每次回源校验。
-其余资源由 Vite 加内容哈希，可长期缓存。
+**安全头**：全部由 Go 进程统一下发（`httpx.SecurityHeaders` 中间件 +
+`views.ContentSecurityPolicy`），不再依赖 Cloudflare 的 `_headers` 文件——
+那份文件是 Workers Assets 专有的，已随方案一起删除。
+
+- 所有响应：`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、
+  `X-Frame-Options: DENY`、`X-Robots-Tag: noindex`
+- 分享页额外带严格 CSP（见上）
+- 静态资源与 API 走同一套中间件，不存在「一种资源有头、另一种没有」的空档
+
+**缓存**：由 `internal/spa` 按文件名形态决定，分两档：
+
+| 路径 | 响应头 | 理由 |
+|---|---|---|
+| `/assets/*` | `public, max-age=31536000, immutable` | Vite 内容哈希命名，同一 URL 的字节**永不改变** |
+| `index.html` | `no-cache` | 稳定文件名但内容随部署变化，必须每次复用校验 |
+| `/assets/share.js` | `no-cache` | 同上：Go 服务端渲染硬编码引用它，只能靠校验失效 |
+
+> `/assets/*` 用 `immutable` 是安全的，因为文件名里有内容哈希；但**前提是
+> `index.html` 与 `share.js` 保持 `no-cache`**——否则部署后客户端会拿着旧外壳
+> 去请求已被删除的哈希包。这两条是一体的，不能只改一半。
 
 ---
 
@@ -374,24 +466,28 @@ base-uri 'none'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-re
 
 ### 技术选型
 
-用 **Vue 3 + Vite 纯 SPA**，而非 Nuxt。原因：面板是私有页面，不需要 SEO / SSR；
-公开分享页已经由 Worker 服务端渲染（这样才能返回真正的 404/410）。
+用 **Vue 3 + Vite 纯 SPA**。面板是私有页面，不需要 SEO / SSR；
+公开分享页已由 Go 服务端渲染（这样才能返回真正的 404/410）。
 引入 SSR 框架只会增加构建复杂度而没有任何收益。
 
-Vite 的 `root` 指向 `web/`，`build.outDir` 直接输出到 `public/`，
-交给 Workers Assets 的 `[assets]` 绑定伺服。产物按路由分包，首屏 gzip 约 37 KB。
+Vite 的 `root` 指向 `web/`，`build.outDir` 直接输出到
+`backend/internal/webui/dist/`——**也就是 `//go:embed` 的输入目录**。
+产物按路由分包。
 
 ### 路由
 
-| 路径 | 视图 | 说明 |
+| 路径（相对前缀） | 视图 | 说明 |
 |---|---|---|
 | `/dashboard` | `LoginView` | 密码登录 |
 | `/dashboard/reports` | `ReportsView` | 报告列表 + 客户端搜索 |
 | `/dashboard/reports/:id` | `ReportDetailView` | 报告详情 + 分享 Token 管理 |
 
-`wrangler.toml` 中 `not_found_handling = "single-page-application"` 保证深链接可刷新。
-为让 `/`、`/dashboard` 与任意深链接都能正确解析，路由使用 `createWebHistory('/')`
-并把 `/dashboard` 写入各 route path（而非作为 history base）。
+路由的 `history` 基址取自 `import.meta.env.BASE_URL`（即 Vite 的 `base`，
+也就是 `/yeciorez/teleport/`），因此地址栏始终保留前缀，
+且 `router.push` 不会导航到应用之外。
+
+深链接可刷新的保证来自 `internal/spa`：任何未匹配到实体文件、且不属于
+`/api/`、`/s/` 的路径都会返回 `index.html`。
 
 ### 功能
 
@@ -404,123 +500,255 @@ Vite 的 `root` 指向 `web/`，`build.outDir` 直接输出到 `public/`，
 ### 前端安全边界
 
 路由守卫（`router.beforeEach`）**只是体验优化**，不是安全措施 ——
-真正的鉴权在服务端 `requireSession`。客户端可以绕过路由守卫，
+真正的鉴权在服务端 Session 校验。客户端可以绕过路由守卫，
 但绕不过 `/api/admin/*` 的 Cookie 校验。
 
 ---
 
 ## 已知陷阱
 
-### PBKDF2 迭代次数上限 100,000（生产专有故障）
+### 1. SQLite 驱动必须显式空导入
 
-Cloudflare Workers 运行时的 `crypto.subtle.deriveBits` **拒绝超过 100,000 次的
-PBKDF2**，抛出：
+`internal/store/store.go` 中的 `_ "modernc.org/sqlite"` 不能删。
+删掉后代码**照样编译、照样通过 vet**，直到运行时才报
+`sql: unknown driver "sqlite"` —— 纯 Go 驱动是靠 `init()` 注册的。
 
-```
-NotSupportedError: Pbkdf2 failed: iteration counts above 100000 are not supported (requested 210000).
-```
+### 2. 系统级 `docker exec` 看不到宿主的 `/tmp`
 
-这个坑特别隐蔽，因为它**只在生产环境复现**：本地 `wrangler dev`（本地 workerd）
-接受更高次数，因此本地登录测试全绿，部署后却返回 500。
+`docker exec caddy caddy validate --config /tmp/Caddyfile.new` 校验的是
+**容器内**的文件。宿主 `/tmp` 与容器 `/tmp` 是两个目录，因此它可能在校验一个
+陈旧副本并报告 "Valid configuration"，而真正要生效的配置根本没被检查过。
+改 Caddyfile 时用 `docker cp` 送进容器，或直接校验 bind-mount 后的路径。
 
-诊断时的三个现象可以作为指纹：
+### 3. `handle_path` 会吃掉路由前缀
 
-| 请求 | 结果 | 原因 |
-|---|---|---|
-| 正确口令 | **500** | PBKDF2 在比对之前抛错 |
-| 错误口令 | **500** | 同上 —— 注意**不是** 401 |
-| 缺少 `password` 字段 | **400** | 参数校验发生在 PBKDF2 之前 |
+见「部署 / Caddy 分流」第 1 条：前缀是路由的一部分，必须用 `handle`。
 
-“错误口令也返回 500”是关键信号：口令正确与否都要先跑 PBKDF2，所以两者表现一致。
-若错误口令返回 401 而正确口令 500，则问题在哈希本身而非迭代次数。
+### 4. 共享主机上的 Cookie 作用域
 
-`verifyPassword()` 现在会显式检查该上限并抛出可读的 500 配置错误，避免再次出现
-难以定位的不透明失败。修改 `DEFAULT_ITERATIONS` 时，务必同步
-`scripts/hash-password.mjs`，并**重新生成 secret**。
+`api.hcyj.xyz` **不是本项目独占的**——它同时承载另一个服务（兜底反代到 :3000）。
+因此会话 Cookie 的 `Path` 必须是应用前缀 `/yeciorez/teleport`，而不是 `/`。
+若用 `/`，浏览器会把我们的会话 Cookie 附加到该主机上**每一个**请求，
+包括访问另一个服务的请求：既是不必要的凭据暴露，也容易在排查时误导人。
+
+代码里 `CookiePath` 默认取 `RoutePrefix`（见 `internal/config/config.go`），
+只有显式设置 `COOKIE_PATH` 才会覆盖。实测 `Set-Cookie` 确实带
+`Path=/yeciorez/teleport`。
+
+### 5. Cloudflare 免费版在中国大陆被 TCP 层封锁（本方案的直接起因）
+
+**这是整个架构改动的根因，也是本项目最重要的一条经验。**
+
+现象：`https://teleport.zeroicey.me/` 在大陆两个观测点（广东电信家宽、hcyj 本身）
+**稳定**打不开；但在境外（Azure 香港）300/300 全通。
+
+排查过程与结论：
+
+| 检查项 | 结果 |
+|---|---|
+| DNS 解析 | **正常**。阿里 223.5.5.5、DNSPod 119.29.29.29、8.8.8.8、1.1.1.1 都返回 `104.21.55.38` / `172.67.144.109` |
+| ICMP ping | **通**。233ms，0% 丢包 |
+| TCP 443 / 80 / 2053 | **全部被阻断**，连续 3 轮稳定 |
+| 同一 SNI、换 CF 边缘 IP | `104.16.0.1`、`104.17.0.1`、`104.18.0.1`、`104.24.0.1`、`104.27.0.1`、`188.114.96.1` 等 → **200** |
+| 同一 SNI、另一些 CF IP | `162.159.0.1`、`108.162.192.1` → 403；`172.65.0.1` → 超时 |
+
+结论：**封锁发生在 IP 层，不是域名层、也不是 SNI 层**。域名、证书、Worker、
+后端全部正常，纯粹是 CF 免费版分配到的**那两个 anycast IPv4** 在大陆被拦。
+DNS 没被污染（那通常是返回假 IP），ICMP 也通，所以不是路由黑洞——是 TCP 层过滤。
+
+**同一次排查还发现**：`zeroicey.me` 与 `gh.zeroicey.me` 解析到**同一对**被封锁的 IP，
+所以用户主站同样在大陆不可达。这个问题比 teleport 本身影响更大，但它不属于本仓库，
+需要单独修（换记录 / 换解析）。
+
+**为什么不用「优选 IP」绕过**：CF 的优选 IP 玩法要求把 DNS 移出 Cloudflare
+（用 CNAME 接入），可一旦 DNS 不托管在 CF，Worker 就不再运行，整个方案失效。
+CF 官方的大陆加速（China Network）需要企业版 + 域名 ICP 备案。
+
+**最终解法**：把前端也交给国内服务器。原本 Worker 的职责只是「反代 `/api`、`/s`
++ 托管静态资源」，而 `api.hcyj.xyz/yeciorez/teleport/api/...` 本来就是公网可达的
+——也就是说 Worker 并没有真正「保护」后端，它只是一跳转发。因此把前端挪到 hcyj
+**不降低任何安全性**，却直接消除了被封锁的那一跳。
+
+> **验证方法论上的教训**：早先曾用 Azure 香港作为观测点，得到 300/300 全通，
+> 于是误判为「本地上游运营商的偶发抖动」。**境外观测点无法检测大陆封锁。**
+> 判断大陆可达性必须用大陆观测点，且要多点交叉验证。
+
+### 6. Vite 的 `base` 必须跟着部署前缀走
+
+应用挂在 `/yeciorez/teleport/` 而不是域名根路径下，如果 Vite 用默认的 `base: '/'`，
+`index.html` 会引用 `/assets/index-xxx.js`——这个路径在共享主机上会打到**别的服务**，
+或者在当前服务上 404。
+
+`vite.config.ts` 里 `base` 由 `ROUTE_PREFIX` 统一推导，构建产物引用的是
+`/yeciorez/teleport/assets/...`。同时 `web/src/api.ts` 的前缀取自
+`import.meta.env.BASE_URL`（也就是同一个 `base`），`web/src/router/index.ts` 的
+`createWebHistory` 也用 `BASE_URL`。**前缀只写一处**，三者不可能漂移。
+
+> 排查手法：构建后直接看 `backend/internal/webui/dist/index.html`，
+> 里面**不应**出现任何 `src="/assets/...` 这种根绝对路径。
+
+### 7. 未知 `/api/*` 路径必须仍是 JSON
+
+当前端 SPA 接管了前缀根路径的兜底（返回 `index.html`）之后，一个未知的
+`/api/nope` 会**匹配到 SPA 兜底**，于是 XHR 客户端收到一个 HTML 页面。
+这比看起来更糟：客户端对 HTML 执行 `response.json()` 会抛解析错误，
+报出来的是「服务器返回了非预期的响应」，而不是真实的 404。
+
+解法是给 `p+"/api/"` 与 `p+"/s/"` 各注册一个更具体的兜底（`net/http` 会优先
+匹配更长的模式）。`TestUnknownRouteWithSPAStaysJSON` 就是这条的回归测试，
+把两个兜底删掉后它会失败。
 
 ---
 
 ## 安全设计要点
 
-- **Agent 鉴权**：`POST /api/reports` 与所有写操作要求 Bearer Token，比较使用常量时间函数。
-  该中间件挂在**路由器级别**（`reports.use('*', ...)`），因此新增路由默认受保护而非默认公开。
+- **Agent 鉴权**：`POST /api/reports` 与所有写操作要求 Bearer Token，
+  比较使用 `subtle.ConstantTimeCompare` 常量时间函数。
 - **失效链接语义**：未知 token 与被吊销 token 同样返回 **404**，避免通过状态码区分
-  “从未存在”与“已被撤销”；仅**已过期**返回 **410**。分享页同样服务端返回 404/410，
+  "从未存在"与"已被撤销"；仅**已过期**返回 **410**。分享页同样服务端返回 404/410，
   而不是先给 200 再由前端报错。
 - **分享页面不缓存**：`Cache-Control: no-store`，防止已吊销链接残留在中间缓存。
-- **XSS**：Markdown 渲染前不内联原始 HTML；`format: 'html'` 目前**关闭**
-  （`HTML_MOUNT_ENABLED = false`）。将来开启必须先接入 DOMPurify + 严格 CSP。
-  页面内嵌 JSON 已转义 `<`，避免 `</script>` 逃逸。
+  另加 `X-Robots-Tag: noindex` 与 `X-Frame-Options: DENY`。
+- **静态资源缓存分层**：`/assets/*` 由 Vite 内容哈希命名，发
+  `immutable` + 一年；`index.html` 与 `share.js` 是稳定文件名，发 `no-cache`，
+  保证部署后立刻生效、不会把客户端钉在旧构建上。
+- **路径穿越防护**：SPA 处理器用 `path.Clean` 折叠 `..`，并且 `fs.FS` 自身
+  也会拒绝跳出根目录；测试里覆盖了 `../`、`%2e%2e`、`....//` 等写法。
+- **XSS**：Markdown 渲染时**不**放行原始 HTML；`format: 'html'` 目前**关闭**
+  （`HTMLMountEnabled = false`）。将来开启必须先接入净化库 + 严格 CSP。
 - **管理面板**：HttpOnly + Secure + SameSite=Lax 的签名 Cookie（HMAC-SHA256），
-  口令使用 PBKDF2-HMAC-SHA256。迭代次数上限 **100,000** —— 这是 Cloudflare
-  运行时的硬限制，超过会抛 `NotSupportedError`（见下方「已知陷阱」）。
-  也可用 Cloudflare Access 前置，此时接受 `Cf-Access-Authenticated-User-Email` 头。
-- **安全响应头**：`nosniff`、`X-Frame-Options: DENY`、`no-referrer`、`noindex`。
-- **CORS**：仅回显 `PUBLIC_BASE_URL` 配置的源，绝不反射任意 Origin。
+  口令使用 PBKDF2-HMAC-SHA256（默认 600,000 次迭代，本地计算无运行时上限，
+  校验时兼容旧的低迭代次数哈希）。也可用 Cloudflare Access 前置，
+  此时接受 `Cf-Access-Authenticated-User-Email` 头。
+- **Cookie 作用域**：`Path` 默认为应用前缀，避免在共享主机上外溢（见陷阱 4）。
+- **CORS**：仅回显配置的来源，绝不反射任意 Origin。本部署是同源的，
+  CORS 只对故意的跨源客户端生效。
+- **服务加固**：systemd 沙箱选项 + 只监听 docker 网桥 + 独立系统用户。
+
+### 密钥轮换
+
+三个密钥都在 hcyj 的 `/data/services/teleport/teleport.env`（600 root:root）。
+改完 **必须重启**（`EnvironmentFile` 只在进程启动时读取）：
+
+```bash
+ssh hcyj
+vim /data/services/teleport/teleport.env    # 改对应那一行
+systemctl restart teleport && systemctl is-active teleport
+```
+
+| 密钥 | 轮换影响 |
+|---|---|
+| `ADMIN_PASSWORD_HASH` | 旧口令立即失效。用 `./teleport hash-password '新口令'` 生成新值。**本次部署的口令是随机生成的，请首次登录后更换。** |
+| `AGENT_SECRET_KEY` | 所有上报端（AI agent）需同步更新，否则 401。 |
+| `SESSION_SECRET` | 所有已登录面板会话立即失效（签名密钥变了），需重新登录。 |
+
+> 值里若含 `$`，在 systemd 的 `EnvironmentFile` 与 Go 的 `.env` 解析器中都按**字面量**处理，
+> 无需转义；但**不要**用 `set -a; . teleport.env` 这种方式读它 —— shell 会展开 `$`，
+> 导致哈希被破坏（本项目部署时踩过）。
 
 ---
 
 ## 后续路线
 
-1. **HTML 安全渲染**：DOMPurify + nonce CSP 后开启 `format: 'html'`。
-2. **运维**：为 `share_tokens` 增加定时清理（Cron Triggers + `purgeExpiredTokens`）。
+1. **HTML 安全渲染**：接入净化库 + nonce CSP 后开启 `format: 'html'`。
+2. **运维**：给 `share_tokens` 的过期清理加定时任务（当前已有 `CleanupExpired` 逻辑，
+   尚未挂调度）。
 3. **面板增强**：报告删除、分页、按分类筛选服务端化、新建报告入口。
 4. **渲染增强**：代码块复制按钮、Mermaid 图表导出 SVG/PNG、目录（TOC）锚点。
-5. **可选**：KV 缓存热点分享页、R2 存放附件、自定义域名。
+5. **备份**：SQLite 定期快照（当前无自动备份）。
 
 ---
 
 ## 已验证行为
 
-### 生产环境（已实际部署并验证）
+### 生产环境（2026-10-10 实测）
 
-部署地址：`https://teleport.zeroicey-hp.workers.dev`
+链路：`https://api.hcyj.xyz/yeciorez/teleport/...` → Caddy → Go(:8788，内嵌前端) → SQLite
 
-由于开发主机位于中国大陆网络，`*.workers.dev` 整个域名不可达（DNS 污染 + SNI 重置），
-因此**无法从部署机上直接验证线上服务**。改用 Cron Trigger + Service Binding 在
-Cloudflare 网络内部发起探测，结果写入 D1 再通过 API 读回，实测结论：
+**可达性（本次架构改动的验收重点）**
+
+| 观测点 | 结果 |
+|---|---|
+| 广东佛山电信家宽（`121.9.113.18`） | `GET /` → **200**，DNS 1.7ms / connect 18ms / TLS 36ms / 总 **48ms** |
+| 广东佛山电信家宽 `GET /api/health` | **200**（44ms） |
+| hcyj 本机（同机房公网出口） | `GET /` → **200**，`GET /api/health` → **200** |
+| 旧入口 `https://teleport.zeroicey.me` | 已下线（Worker 删除、DNS 记录移除） |
+
+对比改造前：同一台服务器上的 `api.hcyj.xyz/yeciorez/teleport/api/health` 本来就通，
+只有 CF 前置的域名不通——这正是把前端挪过来的依据。
+
+**功能与响应头**
 
 | 探测 | 结果 |
 |---|---|
-| `GET /api/health` | 200，`database: "ok"`（D1 连通正常） |
-| `POST /api/reports` 无令牌 | 401 `unauthorized` |
+| `GET /` | 200（SPA 外壳，`text/html`，`Cache-Control: no-cache`） |
+| `GET /dashboard/reports` | 200（SPA 深链接回退，硬刷新后仍正常） |
+| `GET /assets/index-*.js` | 200（`Cache-Control: public, max-age=31536000, immutable`） |
+| `GET /assets/share.js` | 200（`Cache-Control: no-cache`） |
+| `GET /assets/不存在.js` | 404（**不回退**成 HTML，避免误导性的 MIME 报错） |
+| `GET /api/health` | 200 `{"status":"ok","environment":"production"}` |
 | `POST /api/reports` 带令牌 | 201，返回分享链接 |
+| `POST /api/reports` 无令牌 | 401 |
 | `GET /api/share/:token` | 200，内容完整回读 |
 | `GET /s/:token` | 200，服务端渲染 |
+| 分享页响应头 | `Content-Security-Policy: default-src 'none'...`、`Cache-Control: no-store`、`X-Robots-Tag: noindex`、`X-Frame-Options: DENY` |
 | `GET /s/未知token` | 404 |
-| `GET /dashboard` | 200，SPA 外壳 |
-| 渲染检查 | Mermaid 节点存在 ✓ 语法高亮生效 ✓ `<script>` 已转义 ✓ 无原始脚本泄漏 ✓ |
-| 1 MiB 大报告 | 上报 201、渲染 200（未触发 CPU 1102） |
-| 超过 `MAX_CONTENT_BYTES` | 413 `payload_too_large`，在渲染前拦截 |
-| `POST /api/admin/login` 正确口令 | 200，返回会话 Cookie |
-| `POST /api/admin/login` 错误口令 | 401 `Invalid credentials` |
-| `POST /api/admin/login` 缺少字段 | 400 `bad_request` |
+| `GET /s/已吊销token` | 404（与未知一致，不泄漏状态） |
+| `GET /s/已过期token` | 410（JSON 与页面均 410） |
+| 非法 token 形状（过短） | 404 |
+| 空 `title` | 400 `` `title` must be between 1 and 300 characters `` |
+| 非法 `category` | 400 `` `category` must match /^[a-z0-9][a-z0-9_-]{0,31}$/ `` |
+| 超过 `MAX_CONTENT_BYTES` | 413 |
+| 未知 `/api/*` 路径 | JSON 封套 404（**即使 SPA 已接管前缀根**） |
+| `POST /api/admin/login` 正确口令 | 200 + `Set-Cookie`（`HttpOnly; Secure; SameSite=Lax; Max-Age=43200`） |
+| `POST /api/admin/login` 错误口令 | 401 |
+| `GET /api/admin/reports` 无 Cookie | 401 |
+| 分享 Token 新建 / 调整 / 禁用 / 恢复 / 删除 | 全部生效，`expiresInHours: 0` → `expires_at: 0`（永不过期） |
+| 接口字段形状 | `ReportDetail`（含 `content` + `share_tokens`）与 `ShareToken`（变更接口含 `url`）均与前端类型定义一致 |
 
-> 面板登录曾在生产环境返回 500，根因是 PBKDF2 迭代次数超过 Cloudflare 的
-> 100,000 上限（本地 `wrangler dev` 不复现）。详见「已知陷阱」。
+**真实浏览器验证**（Playwright + Chromium，从大陆家宽直连，2026-10-10）：
 
-> 若在无头机上部署，注意 `wrangler login` 的 OAuth 回调固定指向 `localhost:8976`，
-> 远端收不到；请用 `--device` 设备码或 `CLOUDFLARE_API_TOKEN`。
->
-> 另有两个易踩的坑：**同一 zone 内的 Worker 之间不能用 `fetch()` 互调**（报 error 1042），
-> 必须用 Service Binding；`wrangler d1 create` 建议的 binding 名是自动派生的，
-> 但本项目代码读的是 `env.DB`，必须写回 `DB`。
+管理面板（19/19 通过）：
 
-### 后端（`wrangler dev` + 真实 D1 实例）
+| 检查 | 结果 |
+|---|---|
+| SPA 外壳加载 | URL 保留前缀 `/yeciorez/teleport/dashboard`，`#app` 挂载成功 |
+| 未登录跳转 | 自动进入登录路由 |
+| 错误口令 | 由真实 401 驱动，界面显示「密码错误」 |
+| 正确口令 | 进入 `/dashboard/reports`，报告列表可见 |
+| 会话 Cookie | `Path=/yeciorez/teleport`（**限定应用前缀**）、`HttpOnly`、`Secure`、`SameSite=Lax` |
+| 硬刷新深链接 | 仍处于登录态，报告列表正常 |
+| 报告详情 | 进入 `/dashboard/reports/<uuid>`，分享链接含完整前缀 |
+| 控制台错误 / 失败请求 | 均为 0 |
 
-- `schema.sql` 可独立在 `sqlite3` 执行；`wrangler d1 migrations apply --local` 成功应用 13 条语句（删库重跑亦通过）。
-- 上报 → 自动生成分享链接 → 公开读取 → 计数递增的完整链路。
-- 鉴权：缺失 / 错误 / 非 Bearer 令牌均返回 401；正确令牌返回 201。
-- 吊销：未鉴权 401；已吊销与未知 token 均返回 404；重复吊销幂等返回 200。
-- 过期：`expires_at` 置为过去后，`/api/share` 与 `/s/:token` 均返回 410。
-- 管理面板：错误口令 401、伪造 Cookie 401、正确登录可列出报告、登出清除 Cookie。
-- 分享 Token 管理：新建 / 调整过期 / 禁用 / 恢复 / 删除全部生效。
-- 静态资源：`/`、`/dashboard` 与 SPA 深链接返回 200；`/api/*` 未匹配路径返回 JSON 404 而非 SPA HTML。
-- CORS：仅回显配置的源，`Origin: https://evil.example` 不返回 ACAO 头。
-- `pnpm run typecheck`（Worker）与 `pnpm run typecheck:web`（Vue）均无错误；`pnpm run db:check-schema` 通过。
-- `pnpm install --frozen-lockfile` 在干净目录可复现安装，并构建成功。
+分享页（10/10 通过）：
 
-### 前端
+| 检查 | 结果 |
+|---|---|
+| HTTP 200 | 未登录可访问 |
+| CSP | `default-src 'none'; ...` 生效，**无 CSP 违规** |
+| 缓存 | `Cache-Control: no-store, must-revalidate` |
+| 反索引 | `X-Robots-Tag: noindex, nofollow, noarchive` |
+| Markdown 服务端渲染 | `<h1>` 存在 |
+| Mermaid | 由内嵌 bundle 渲染出 `<svg>`（1 个） |
+| 脚本同源 | `share.js` 的 src 为 `/yeciorez/teleport/assets/share.js`，满足 `script-src 'self'` |
+| 控制台错误 | 0 |
 
-构建与类型检查已通过（`pnpm run build`、`pnpm run typecheck:web`）。
-界面交互请按「快速开始」启动后自行点击验证 —— 本项目不包含自动化 UI 测试。
+### 测试覆盖
+
+Go 侧单元 / 集成测试（`pnpm run backend:test`，全部通过，含 `-race`）：
+
+| 包 | 覆盖内容 |
+|---|---|
+| `internal/markdown` | XSS / 原始 HTML / 危险 URL / 扩展渲染 / 代码块 / Mermaid / 转义 / 并发 |
+| `internal/store` | 迁移幂等、创建与过期语义、解析状态、吊销、PATCH、计数与删除、列表筛选、`json_valid` 约束、`updated_at` 触发器、清理、外键级联、并发写 |
+| `internal/httpx` | 响应封套、错误隐藏、Bearer 变体、Session 往返 / 篡改 / 过期、Cookie 属性、严格 CORS、panic 恢复、请求 ID、真实 IP |
+| `internal/validate` | 默认值、空串视作缺省、`autoShareHours: 0` 有效、全部拒绝分支、边界值、UTF-16 emoji 计数、JS `trim()` 语义、请求体解析 |
+| `internal/spa` | 构建目录校验、SPA 深链接回退、哈希资源 `immutable`、缺失资源硬 404、`/api`「/`s` 不回退成 HTML、**路径穿越**（`../`、`%2e%2e`、`....//`）、非读方法 405、空前缀挂载 |
+| `internal/api` | 健康检查、鉴权、主流程、校验矩阵、体积上限、公开读取与计数、404/410、分享页渲染与 CSP、面板登录登出、前缀挂载断言、CORS 预检、未知路由（**含 SPA 接管根路径后仍返回 JSON 的回归测试**） |
+
+前端：`pnpm run typecheck`、`pnpm run build`、`pnpm run db:check-schema` 均通过。
+
+> `TestUnknownRouteWithSPAStaysJSON` 是刻意设计的回归测试：把
+> `mux.Handle(p+"/api/", root)` 与 `p+"/s/"` 两行删掉，它会**立刻失败**，
+> 因为未知 API 路径会退化成 SPA 的 HTML 404。
