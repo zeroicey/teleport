@@ -72,7 +72,7 @@ run_worker_first = ["/api/*", "/s/*"]
 [[d1_databases]]
 binding = "DB"                       # -> env.DB in the Worker
 database_name = "teleport-db"
-database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
+database_id = "ad803822-04ba-4615-b27f-ae0d6d55bcd1"
 migrations_dir = "migrations"        # `wrangler d1 migrations apply` reads here
 
 # ---------------------------------------------------------------------------
@@ -132,6 +132,10 @@ migrations_dir = "migrations"
 [env.production]
 name = "teleport"
 workers_dev = true
+# Preview URLs create a public <version>.<worker>.<subdomain>.workers.dev alias
+# for every version. This app serves time-limited share links, so extra
+# unauthenticated aliases are unwanted surface. Disable them.
+preview_urls = false
 
 [env.production.vars]
 ENVIRONMENT = "production"
@@ -139,19 +143,24 @@ ENVIRONMENT = "production"
 # POST /api/reports and the dashboard points somewhere unreachable.
 # First deploy: you will not know the subdomain yet. Deploy once, copy the
 # printed URL here, then re-deploy.
-PUBLIC_BASE_URL = "https://teleport.<your-subdomain>.workers.dev"
+PUBLIC_BASE_URL = "https://teleport.zeroicey-hp.workers.dev"
 DEFAULT_SHARE_HOURS = "168"
-# Ceiling for report size. Server-side Markdown rendering costs roughly
-# 1 ms CPU per 10 KB of text, and the Workers FREE plan allows only 10 ms CPU
-# per request — so anything approaching this value can be rejected with
-# error 1102 unless MAX_CONTENT_BYTES is lowered (~256 KB is safe) or the
-# account is on Workers Paid (30 s CPU).
+# Ceiling for report size, in BYTES of the `content` field. Note CJK text is
+# ~3 bytes per character, so 1 MiB is roughly 350k Chinese characters.
+#
+# This also bounds CPU: Markdown is rendered server-side on every share view.
+# Measured on the production Worker, a 1016 KB ASCII report still rendered
+# successfully (HTTP 200), so 1 MiB is safe here. If you ever raise this
+# substantially, re-check for `error 1102` (exceededCpu) — the Workers Free
+# plan nominally allows only 10 ms CPU per request, while Paid allows 30 s.
 MAX_CONTENT_BYTES = "1048576"
 
 [[env.production.d1_databases]]
+# Binding name MUST stay `DB` — src/ reads `env.DB`. `wrangler d1 create`
+# suggests a name derived from the database name; do not accept that here.
 binding = "DB"
 database_name = "teleport-db-prod"
-database_id = "REPLACE_WITH_YOUR_PROD_D1_DATABASE_ID"
+database_id = "ad803822-04ba-4615-b27f-ae0d6d55bcd1"
 migrations_dir = "migrations"
 
 # To use a custom domain instead of workers.dev, uncomment BOTH lines below and

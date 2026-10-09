@@ -440,6 +440,34 @@ Vite 的 `root` 指向 `web/`，`build.outDir` 直接输出到 `public/`，
 
 ## 已验证行为
 
+### 生产环境（已实际部署并验证）
+
+部署地址：`https://teleport.zeroicey-hp.workers.dev`
+
+由于开发主机位于中国大陆网络，`*.workers.dev` 整个域名不可达（DNS 污染 + SNI 重置），
+因此**无法从部署机上直接验证线上服务**。改用 Cron Trigger + Service Binding 在
+Cloudflare 网络内部发起探测，结果写入 D1 再通过 API 读回，实测结论：
+
+| 探测 | 结果 |
+|---|---|
+| `GET /api/health` | 200，`database: "ok"`（D1 连通正常） |
+| `POST /api/reports` 无令牌 | 401 `unauthorized` |
+| `POST /api/reports` 带令牌 | 201，返回分享链接 |
+| `GET /api/share/:token` | 200，内容完整回读 |
+| `GET /s/:token` | 200，服务端渲染 |
+| `GET /s/未知token` | 404 |
+| `GET /dashboard` | 200，SPA 外壳 |
+| 渲染检查 | Mermaid 节点存在 ✓ 语法高亮生效 ✓ `<script>` 已转义 ✓ 无原始脚本泄漏 ✓ |
+| 1 MiB 大报告 | 上报 201、渲染 200（未触发 CPU 1102） |
+| 超过 `MAX_CONTENT_BYTES` | 413 `payload_too_large`，在渲染前拦截 |
+
+> 若在无头机上部署，注意 `wrangler login` 的 OAuth 回调固定指向 `localhost:8976`，
+> 远端收不到；请用 `--device` 设备码或 `CLOUDFLARE_API_TOKEN`。
+>
+> 另有两个易踩的坑：**同一 zone 内的 Worker 之间不能用 `fetch()` 互调**（报 error 1042），
+> 必须用 Service Binding；`wrangler d1 create` 建议的 binding 名是自动派生的，
+> 但本项目代码读的是 `env.DB`，必须写回 `DB`。
+
 ### 后端（`wrangler dev` + 真实 D1 实例）
 
 - `schema.sql` 可独立在 `sqlite3` 执行；`wrangler d1 migrations apply --local` 成功应用 13 条语句（删库重跑亦通过）。
