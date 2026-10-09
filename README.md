@@ -409,6 +409,37 @@ Vite 的 `root` 指向 `web/`，`build.outDir` 直接输出到 `public/`，
 
 ---
 
+## 已知陷阱
+
+### PBKDF2 迭代次数上限 100,000（生产专有故障）
+
+Cloudflare Workers 运行时的 `crypto.subtle.deriveBits` **拒绝超过 100,000 次的
+PBKDF2**，抛出：
+
+```
+NotSupportedError: Pbkdf2 failed: iteration counts above 100000 are not supported (requested 210000).
+```
+
+这个坑特别隐蔽，因为它**只在生产环境复现**：本地 `wrangler dev`（本地 workerd）
+接受更高次数，因此本地登录测试全绿，部署后却返回 500。
+
+诊断时的三个现象可以作为指纹：
+
+| 请求 | 结果 | 原因 |
+|---|---|---|
+| 正确口令 | **500** | PBKDF2 在比对之前抛错 |
+| 错误口令 | **500** | 同上 —— 注意**不是** 401 |
+| 缺少 `password` 字段 | **400** | 参数校验发生在 PBKDF2 之前 |
+
+“错误口令也返回 500”是关键信号：口令正确与否都要先跑 PBKDF2，所以两者表现一致。
+若错误口令返回 401 而正确口令 500，则问题在哈希本身而非迭代次数。
+
+`verifyPassword()` 现在会显式检查该上限并抛出可读的 500 配置错误，避免再次出现
+难以定位的不透明失败。修改 `DEFAULT_ITERATIONS` 时，务必同步
+`scripts/hash-password.mjs`，并**重新生成 secret**。
+
+---
+
 ## 安全设计要点
 
 - **Agent 鉴权**：`POST /api/reports` 与所有写操作要求 Bearer Token，比较使用常量时间函数。
@@ -421,8 +452,9 @@ Vite 的 `root` 指向 `web/`，`build.outDir` 直接输出到 `public/`，
   （`HTML_MOUNT_ENABLED = false`）。将来开启必须先接入 DOMPurify + 严格 CSP。
   页面内嵌 JSON 已转义 `<`，避免 `</script>` 逃逸。
 - **管理面板**：HttpOnly + Secure + SameSite=Lax 的签名 Cookie（HMAC-SHA256），
-  口令使用 PBKDF2-HMAC-SHA256（210,000 次迭代）。也可用 Cloudflare Access 前置，
-  此时接受 `Cf-Access-Authenticated-User-Email` 头。
+  口令使用 PBKDF2-HMAC-SHA256。迭代次数上限 **100,000** —— 这是 Cloudflare
+  运行时的硬限制，超过会抛 `NotSupportedError`（见下方「已知陷阱」）。
+  也可用 Cloudflare Access 前置，此时接受 `Cf-Access-Authenticated-User-Email` 头。
 - **安全响应头**：`nosniff`、`X-Frame-Options: DENY`、`no-referrer`、`noindex`。
 - **CORS**：仅回显 `PUBLIC_BASE_URL` 配置的源，绝不反射任意 Origin。
 
@@ -460,6 +492,12 @@ Cloudflare 网络内部发起探测，结果写入 D1 再通过 API 读回，实
 | 渲染检查 | Mermaid 节点存在 ✓ 语法高亮生效 ✓ `<script>` 已转义 ✓ 无原始脚本泄漏 ✓ |
 | 1 MiB 大报告 | 上报 201、渲染 200（未触发 CPU 1102） |
 | 超过 `MAX_CONTENT_BYTES` | 413 `payload_too_large`，在渲染前拦截 |
+| `POST /api/admin/login` 正确口令 | 200，返回会话 Cookie |
+| `POST /api/admin/login` 错误口令 | 401 `Invalid credentials` |
+| `POST /api/admin/login` 缺少字段 | 400 `bad_request` |
+
+> 面板登录曾在生产环境返回 500，根因是 PBKDF2 迭代次数超过 Cloudflare 的
+> 100,000 上限（本地 `wrangler dev` 不复现）。详见「已知陷阱」。
 
 > 若在无头机上部署，注意 `wrangler login` 的 OAuth 回调固定指向 `localhost:8976`，
 > 远端收不到；请用 `--device` 设备码或 `CLOUDFLARE_API_TOKEN`。

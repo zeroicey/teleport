@@ -12,7 +12,23 @@ import { ApiError } from '../lib/errors';
 
 const ALGORITHM = 'PBKDF2';
 const HASH = 'SHA-256';
-export const DEFAULT_ITERATIONS = 210_000;
+
+/**
+ * PBKDF2 iteration count.
+ *
+ * HARD CEILING: Cloudflare's Workers runtime rejects PBKDF2 with more than
+ * 100,000 iterations — `crypto.subtle.deriveBits` throws `NotSupportedError`
+ * ("Pbkdf2 failed: iteration counts above 100000 are not supported").
+ *
+ * This is a production-only failure: `wrangler dev` (a local workerd) accepts
+ * a higher count, so an over-limit value passes every local test and then
+ * returns 500 on the live deployment. Earlier revisions used 210,000, which is
+ * a reasonable OWASP-style figure but simply cannot run on Workers.
+ *
+ * Keep this at or below 100_000, and keep scripts/hash-password.mjs in sync —
+ * a mismatch here is what breaks dashboard login.
+ */
+export const DEFAULT_ITERATIONS = 100_000;
 const KEY_BITS = 256;
 const SALT_BYTES = 16;
 
@@ -30,6 +46,13 @@ export async function hashPassword(
     base64UrlEncode(new Uint8Array(key)),
   ].join('$');
 }
+
+/**
+ * Cloudflare refuses PBKDF2 above this many iterations, so anything higher is
+ * a configuration bug rather than a password mismatch. Detect it explicitly
+ * instead of letting an opaque 500 escape.
+ */
+const MAX_WORKERS_ITERATIONS = 100_000;
 
 /**
  * Verify a password against a stored hash.
@@ -53,6 +76,17 @@ export async function verifyPassword(
 
   const iterations = Number.parseInt(iterationsPart, 10);
   if (!Number.isFinite(iterations) || iterations <= 0) return false;
+
+  // Fail loudly and specifically: a hash generated with a higher count works in
+  // `wrangler dev` but throws in production, which is otherwise very hard to
+  // diagnose (it surfaces as an indistinguishable HTTP 500).
+  if (iterations > MAX_WORKERS_ITERATIONS) {
+    throw ApiError.internal(
+      `Server misconfiguration: ADMIN_PASSWORD_HASH uses ${iterations} PBKDF2 ` +
+        `iterations, but the Workers runtime supports at most ${MAX_WORKERS_ITERATIONS}. ` +
+        `Regenerate it with scripts/hash-password.mjs.`,
+    );
+  }
 
   let salt: Uint8Array;
   let expected: Uint8Array;

@@ -21,6 +21,7 @@
     "db:migrate:remote": "wrangler d1 migrations apply DB --remote --env production",
     "db:migrate:staging": "wrangler d1 migrations apply DB --remote --env staging",
     "db:check-schema": "node scripts/check-schema-sync.mjs",
+    "check:password-params": "node scripts/check-password-params.mjs",
     "hash-password": "node scripts/hash-password.mjs"
   },
   "dependencies": {

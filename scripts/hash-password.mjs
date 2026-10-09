@@ -7,11 +7,17 @@
  *   npx wrangler secret put ADMIN_PASSWORD_HASH   # then paste the output
  *
  * Must stay byte-compatible with src/services/password.ts
- * (PBKDF2-HMAC-SHA256, 210000 iterations, 16-byte salt, 256-bit key).
+ * (PBKDF2-HMAC-SHA256, 100000 iterations, 16-byte salt, 256-bit key).
+ *
+ * The iteration count is capped at 100,000 because Cloudflare's Workers runtime
+ * rejects anything higher with `NotSupportedError`. Note that `wrangler dev`
+ * does NOT enforce this, so a larger value passes local testing and then fails
+ * only in production. Keep this in sync with DEFAULT_ITERATIONS in
+ * src/services/password.ts.
  */
 import { webcrypto as crypto } from 'node:crypto';
 
-const ITERATIONS = 210_000;
+const ITERATIONS = 100_000;
 const KEY_BITS = 256;
 const SALT_BYTES = 16;
 
