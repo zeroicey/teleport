@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -69,8 +70,14 @@ func claimHeaders(secret string) map[string]string {
 // applyForKey submits a public application and returns its id and claim secret.
 func applyForKey(t *testing.T, h http.Handler, label string) (id, secret string) {
 	t.Helper()
-	rec := do(t, h, http.MethodPost, testPrefix+"/api/agent-keys/applications",
-		`{"label":"`+label+`","purpose":"unit test","requestedHours":24}`, nil)
+	return applyForKeyBody(t, h, `{"label":"`+label+`","purpose":"unit test","requestedHours":24}`)
+}
+
+// applyForKeyBody is applyForKey with a caller-supplied body, for tests that need
+// to control requestedHours (or its absence).
+func applyForKeyBody(t *testing.T, h http.Handler, body string) (id, secret string) {
+	t.Helper()
+	rec := do(t, h, http.MethodPost, testPrefix+"/api/agent-keys/applications", body, nil)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("apply: status = %d, want 201: %s", rec.Code, rec.Body.String())
 	}
@@ -1272,4 +1279,387 @@ func TestRenewalClaimSecretIsDerivedNotStored(t *testing.T) {
 	if other := s.renewalClaimSecret("renewal-a", "key-2"); other == a {
 		t.Error("renewal secret does not depend on the key id")
 	}
+}
+
+// TestApproveExpiredApplicationIs410 locks the audit finding: an application
+// that aged out while still `pending` was answered with "already_decided", a
+// decision nobody made, while the agent polling the same row was told 410 gone.
+func TestApproveExpiredApplicationIs410(t *testing.T) {
+	h, _ := testServerWith(t, func(cfg *config.Config) { cfg.KeyApplicationTTL = -time.Second })
+	cookie := map[string]string{"Cookie": login(t, h)}
+
+	for _, action := range []string{"approve", "reject"} {
+		t.Run(action, func(t *testing.T) {
+			id, _ := applyForKey(t, h, "aged-out-"+action)
+			rec := do(t, h, http.MethodPost,
+				testPrefix+"/api/admin/key-applications/"+id+"/"+action, `{}`, cookie)
+			if rec.Code != http.StatusGone {
+				t.Fatalf("status = %d, want 410 (expired, not decided): %s", rec.Code, rec.Body.String())
+			}
+			if _, _, code := decodeEnvelope(t, rec); code != "gone" {
+				t.Errorf("error code = %q, want gone", code)
+			}
+		})
+	}
+
+	t.Run("a real second decision is still 409", func(t *testing.T) {
+		// Same server, but an application approved while still fresh.
+		fresh, _ := testServer(t)
+		freshCookie := map[string]string{"Cookie": login(t, fresh)}
+		id, _ := applyForKey(t, fresh, "decided-twice")
+		approveApplication(t, fresh, freshCookie, id, `{}`)
+
+		rec := do(t, fresh, http.MethodPost,
+			testPrefix+"/api/admin/key-applications/"+id+"/approve", `{}`, freshCookie)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409: %s", rec.Code, rec.Body.String())
+		}
+		if _, _, code := decodeEnvelope(t, rec); code != "already_decided" {
+			t.Errorf("error code = %q, want already_decided", code)
+		}
+	})
+}
+
+// TestApproveDefaultsToServerLifetime is the audit's most serious api finding:
+// an unauthenticated applicant could set requestedHours=0, and an admin who left
+// expiresInHours empty inherited it, minting a key that never expires.
+func TestApproveDefaultsToServerLifetime(t *testing.T) {
+	h, _ := testServer(t)
+	cookie := map[string]string{"Cookie": login(t, h)}
+
+	claim := func(t *testing.T, id, secret string) map[string]any {
+		t.Helper()
+		rec := do(t, h, http.MethodGet,
+			testPrefix+"/api/agent-keys/applications/"+id, "", claimHeaders(secret))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("claim: status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		_, data, _ := decodeEnvelope(t, rec)
+		key, _ := data["key"].(map[string]any)
+		if key == nil {
+			t.Fatalf("claim: no key in %s", rec.Body.String())
+		}
+		return key
+	}
+
+	t.Run("requestedHours 0 does not become forever", func(t *testing.T) {
+		id, secret := applyForKeyBody(t, h, `{"label":"zero-hours","requestedHours":0}`)
+		data := approveApplication(t, h, cookie, id, `{}`)
+		if got, _ := data["approved_hours"].(float64); got != defaultApprovedKeyHours {
+			t.Errorf("approved_hours = %v, want the server default %d", data["approved_hours"], defaultApprovedKeyHours)
+		}
+
+		key := claim(t, id, secret)
+		expiresAt, _ := key["expires_at"].(float64)
+		if expiresAt <= 0 {
+			t.Fatalf("expires_at = %v: the approved key never expires", key["expires_at"])
+		}
+		remaining := time.Duration(expiresAt-float64(time.Now().UnixMilli())) * time.Millisecond
+		if remaining < 23*time.Hour || remaining > 25*time.Hour {
+			t.Errorf("key lifetime = %v, want ~24h", remaining)
+		}
+	})
+
+	t.Run("a large request is not inherited either", func(t *testing.T) {
+		id, _ := applyForKeyBody(t, h, `{"label":"greedy","requestedHours":720}`)
+		data := approveApplication(t, h, cookie, id, `{}`)
+		if got, _ := data["approved_hours"].(float64); got != defaultApprovedKeyHours {
+			t.Errorf("approved_hours = %v, want %d (requestedHours is a suggestion)",
+				data["approved_hours"], defaultApprovedKeyHours)
+		}
+	})
+
+	t.Run("explicit 0 still means never", func(t *testing.T) {
+		id, secret := applyForKeyBody(t, h, `{"label":"forever","requestedHours":24}`)
+		data := approveApplication(t, h, cookie, id, `{"expiresInHours":0}`)
+		if got, _ := data["approved_hours"].(float64); got != 0 {
+			t.Errorf("approved_hours = %v, want 0 (explicit)", data["approved_hours"])
+		}
+		if key := claim(t, id, secret); key["expires_at"] != float64(0) {
+			t.Errorf("expires_at = %v, want 0 for an explicitly permanent key", key["expires_at"])
+		}
+	})
+}
+
+// TestHourFieldsAreRangeChecked locks the audit finding that 1e300 hours
+// round-tripped 200 while writing a negative expires_at: float64->int64
+// saturation, i.e. the API reported success for a value it could not store.
+func TestHourFieldsAreRangeChecked(t *testing.T) {
+	h, _ := testServer(t)
+	cookie := map[string]string{"Cookie": login(t, h)}
+	_, keyID := mintKey(t, h, cookie, "range-agent")
+	appID, _ := applyForKey(t, h, "range-app")
+
+	overLimit := strconv.Itoa(maxKeyLifetimeHours + 1)
+
+	cases := []struct {
+		name, method, path, body string
+	}{
+		{"patch 1e300", http.MethodPatch, "/api/admin/keys/" + keyID, `{"expiresInHours":1e300}`},
+		{"patch 1e999", http.MethodPatch, "/api/admin/keys/" + keyID, `{"expiresInHours":1e999}`},
+		{"patch negative", http.MethodPatch, "/api/admin/keys/" + keyID, `{"expiresInHours":-1}`},
+		{"patch NaN", http.MethodPatch, "/api/admin/keys/" + keyID, `{"expiresInHours":"NaN"}`},
+		{"patch Infinity", http.MethodPatch, "/api/admin/keys/" + keyID, `{"expiresInHours":"Infinity"}`},
+		{"patch over 100 years", http.MethodPatch, "/api/admin/keys/" + keyID, `{"expiresInHours":` + overLimit + `}`},
+		{"create 1e300", http.MethodPost, "/api/admin/keys", `{"name":"x","expiresInHours":1e300}`},
+		{"apply requestedHours 1e300", http.MethodPost, "/api/agent-keys/applications", `{"label":"x","requestedHours":1e300}`},
+		{"approve 1e300", http.MethodPost, "/api/admin/key-applications/" + appID + "/approve", `{"expiresInHours":1e300}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := do(t, h, tc.method, testPrefix+tc.path, tc.body, cookie)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+			}
+			if _, _, code := decodeEnvelope(t, rec); code != "bad_request" {
+				t.Errorf("error code = %q, want bad_request", code)
+			}
+		})
+	}
+
+	t.Run("the limit itself is accepted", func(t *testing.T) {
+		rec := do(t, h, http.MethodPatch, testPrefix+"/api/admin/keys/"+keyID,
+			`{"expiresInHours":`+strconv.Itoa(maxKeyLifetimeHours)+`}`, cookie)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 at the boundary: %s", rec.Code, rec.Body.String())
+		}
+		_, data, _ := decodeEnvelope(t, rec)
+		if expiresAt, _ := data["expires_at"].(float64); expiresAt <= float64(time.Now().UnixMilli()) {
+			t.Errorf("expires_at = %v, want a future timestamp", data["expires_at"])
+		}
+	})
+}
+
+// TestKeyMeHidesAdminNote locks the audit finding that /me handed the key holder
+// the administrator's internal annotation.
+func TestKeyMeHidesAdminNote(t *testing.T) {
+	h, _ := testServer(t)
+	cookie := map[string]string{"Cookie": login(t, h)}
+
+	rec := do(t, h, http.MethodPost, testPrefix+"/api/admin/keys",
+		`{"name":"noted-agent","expiresInHours":1,"note":"internal-admin-note-42"}`, cookie)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	_, created, _ := decodeEnvelope(t, rec)
+	token, _ := created["token"].(string)
+	key, _ := created["key"].(map[string]any)
+	id, _ := key["id"].(string)
+
+	rec = do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/me", "", bearerHeaders(token))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/me: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	_, me, _ := decodeEnvelope(t, rec)
+	if note, ok := me["note"]; ok {
+		t.Errorf("/me leaked the admin note: %v", note)
+	}
+	if _, ok := me["revoked_at"]; ok {
+		t.Error("/me exposes revoked_at, which a live key can never observe")
+	}
+	if _, ok := me["token_hash"]; ok {
+		t.Error("/me exposes token_hash")
+	}
+	for _, field := range []string{"id", "name", "token_prefix", "created_at", "expires_at", "last_used_at", "request_count"} {
+		if _, ok := me[field]; !ok {
+			t.Errorf("/me is missing %q", field)
+		}
+	}
+
+	t.Run("the dashboard still sees the note", func(t *testing.T) {
+		rows := decodeArray(t, do(t, h, http.MethodGet, testPrefix+"/api/admin/keys", "", cookie))
+		for _, row := range rows {
+			if row["id"] == id {
+				if row["note"] != "internal-admin-note-42" {
+					t.Errorf("admin note = %v, want internal-admin-note-42", row["note"])
+				}
+				return
+			}
+		}
+		t.Fatalf("key %s not in the admin list", id)
+	})
+}
+
+// TestRenewalApprovalNeverGrantsPermanentFromZeroRequest closes the same
+// privilege path on the renewal endpoint: an absent expiresInHours still honours
+// the requested amount (documented contract), but a request of 0 must not be the
+// way a key becomes permanent through an empty approval.
+func TestRenewalApprovalNeverGrantsPermanentFromZeroRequest(t *testing.T) {
+	h, _ := testServer(t)
+	cookie := map[string]string{"Cookie": login(t, h)}
+
+	mint := func(t *testing.T, name string, hours int) (token, id string) {
+		t.Helper()
+		rec := do(t, h, http.MethodPost, testPrefix+"/api/admin/keys",
+			`{"name":"`+name+`","expiresInHours":`+strconv.Itoa(hours)+`}`, cookie)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("mint %s: status = %d, want 201: %s", name, rec.Code, rec.Body.String())
+		}
+		_, data, _ := decodeEnvelope(t, rec)
+		token, _ = data["token"].(string)
+		key, _ := data["key"].(map[string]any)
+		id, _ = key["id"].(string)
+		if token == "" || id == "" {
+			t.Fatalf("mint %s: missing token/id", name)
+		}
+		return token, id
+	}
+
+	fileRenewal := func(t *testing.T, token string, requestedHours int) string {
+		t.Helper()
+		rec := do(t, h, http.MethodPost, testPrefix+"/api/agent-keys/renewals",
+			`{"requestedHours":`+strconv.Itoa(requestedHours)+`}`, bearerHeaders(token))
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("file renewal: status = %d, want 201: %s", rec.Code, rec.Body.String())
+		}
+		_, data, _ := decodeEnvelope(t, rec)
+		id, _ := data["id"].(string)
+		if id == "" {
+			t.Fatalf("file renewal: missing id: %s", rec.Body.String())
+		}
+		return id
+	}
+
+	approve := func(t *testing.T, renewalID string) map[string]any {
+		t.Helper()
+		rec := do(t, h, http.MethodPost, testPrefix+"/api/admin/key-renewals/"+renewalID+"/approve",
+			`{}`, cookie)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("approve: status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		_, data, _ := decodeEnvelope(t, rec)
+		return data
+	}
+
+	t.Run("a zero request cannot turn a finite key permanent", func(t *testing.T) {
+		token, _ := mint(t, "finite-zero", 24)
+
+		data := approve(t, fileRenewal(t, token, 0))
+		granted, _ := data["granted_expires_at"].(float64)
+		if granted <= float64(time.Now().UnixMilli()) {
+			t.Fatalf("granted_expires_at = %v: a zero request made the key permanent", data["granted_expires_at"])
+		}
+		// base = max(expires_at, now) = now+24h, plus the server default 24h.
+		remaining := time.Duration(granted-float64(time.Now().UnixMilli())) * time.Millisecond
+		if remaining < 46*time.Hour || remaining > 50*time.Hour {
+			t.Errorf("granted lifetime = %v, want ~48h (24h left + the 24h default)", remaining)
+		}
+
+		rec := do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/me", "", bearerHeaders(token))
+		_, me, _ := decodeEnvelope(t, rec)
+		if expiresAt, _ := me["expires_at"].(float64); expiresAt <= 0 {
+			t.Errorf("key expires_at = %v, want finite", me["expires_at"])
+		}
+	})
+
+	t.Run("an already-permanent key is not downgraded", func(t *testing.T) {
+		// Not the escalation this change closes: the key was made permanent by an
+		// admin at mint time, and the store never shortens a key's life. The
+		// applicant's zero request grants nothing here — the privilege already
+		// existed, and it is preserved rather than re-derived from the request.
+		token, _ := mint(t, "permanent-zero", 0)
+
+		rec := do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/me", "", bearerHeaders(token))
+		_, me, _ := decodeEnvelope(t, rec)
+		if me["expires_at"] != float64(0) {
+			t.Fatalf("precondition: expires_at = %v, want 0", me["expires_at"])
+		}
+
+		data := approve(t, fileRenewal(t, token, 0))
+		if got, _ := data["granted_expires_at"].(float64); got != 0 {
+			t.Errorf("granted_expires_at = %v, want 0 (a renewal never shortens a key)", data["granted_expires_at"])
+		}
+	})
+
+	t.Run("an admin who explicitly asks for 0 still grants permanence", func(t *testing.T) {
+		token, _ := mint(t, "explicit-permanent", 24)
+		renewalID := fileRenewal(t, token, 0)
+
+		rec := do(t, h, http.MethodPost, testPrefix+"/api/admin/key-renewals/"+renewalID+"/approve",
+			`{"expiresInHours":0}`, cookie)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("approve: status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		_, data, _ := decodeEnvelope(t, rec)
+		if got, _ := data["granted_expires_at"].(float64); got != 0 {
+			t.Errorf("granted_expires_at = %v, want 0 when the human typed it", data["granted_expires_at"])
+		}
+	})
+
+	t.Run("the documented inheritance still works", func(t *testing.T) {
+		token, _ := mint(t, "inherits-168", 24)
+		data := approve(t, fileRenewal(t, token, 168))
+
+		granted, _ := data["granted_expires_at"].(float64)
+		// base = max(expires_at, now) = now+24h, plus the requested 168h.
+		remaining := time.Duration(granted-float64(time.Now().UnixMilli())) * time.Millisecond
+		if remaining < 190*time.Hour || remaining > 194*time.Hour {
+			t.Errorf("granted lifetime = %v, want ~192h (24h key + the requested 168h)", remaining)
+		}
+		if got, _ := data["requested_hours"].(float64); got != 168 {
+			t.Errorf("requested_hours = %v, want 168 echoed back", data["requested_hours"])
+		}
+	})
+}
+
+// TestStringFieldsRejectInvisibleAndControl locks the audit finding that a label
+// of NUL or a bare zero-width space was accepted, producing a row that an
+// operator cannot read in the approval queue.
+func TestStringFieldsRejectInvisibleAndControl(t *testing.T) {
+	// This test posts many applications; the limiter is not what it is testing.
+	h, _ := testServerWith(t, func(cfg *config.Config) { cfg.KeyApplyPerHour = 100 })
+	cookie := map[string]string{"Cookie": login(t, h)}
+	_, keyID := mintKey(t, h, cookie, "field-agent")
+	appID, _ := applyForKey(t, h, "field-app")
+
+	cases := []struct {
+		name, method, path, body string
+	}{
+		{"label NUL", http.MethodPost, "/api/agent-keys/applications", `{"label":"a\u0000b"}`},
+		{"label ZWSP only", http.MethodPost, "/api/agent-keys/applications", `{"label":"\u200b"}`},
+		{"label blank", http.MethodPost, "/api/agent-keys/applications", `{"label":"   "}`},
+		{"label newline", http.MethodPost, "/api/agent-keys/applications", `{"label":"a\nb"}`},
+		{"label bidi override", http.MethodPost, "/api/agent-keys/applications", `{"label":"a\u202eb"}`},
+		{"purpose NUL", http.MethodPost, "/api/agent-keys/applications", `{"label":"ok","purpose":"a\u0000b"}`},
+		{"purpose ZWSP", http.MethodPost, "/api/agent-keys/applications", `{"label":"ok","purpose":"\u200b"}`},
+		{"name NUL on create", http.MethodPost, "/api/admin/keys", `{"name":"a\u0000b","expiresInHours":1}`},
+		{"name ZWSP on create", http.MethodPost, "/api/admin/keys", `{"name":"\u200b","expiresInHours":1}`},
+		{"note NUL on create", http.MethodPost, "/api/admin/keys", `{"name":"ok","expiresInHours":1,"note":"x\u0000y"}`},
+		{"note ZWSP on create", http.MethodPost, "/api/admin/keys", `{"name":"ok","expiresInHours":1,"note":"\u200b"}`},
+		{"name NUL on patch", http.MethodPatch, "/api/admin/keys/" + keyID, `{"name":"a\u0000b"}`},
+		{"name ZWSP on patch", http.MethodPatch, "/api/admin/keys/" + keyID, `{"name":"\u200b"}`},
+		{"note NUL on patch", http.MethodPatch, "/api/admin/keys/" + keyID, `{"note":"x\u0000y"}`},
+		{"approve name ZWSP", http.MethodPost, "/api/admin/key-applications/" + appID + "/approve", `{"name":"\u200b"}`},
+		{"approve note NUL", http.MethodPost, "/api/admin/key-applications/" + appID + "/approve", `{"note":"a\u0000b"}`},
+		{"reject reason NUL", http.MethodPost, "/api/admin/key-applications/" + appID + "/reject", `{"reason":"a\u0000b"}`},
+		{"reject reason ZWSP", http.MethodPost, "/api/admin/key-applications/" + appID + "/reject", `{"reason":"\u200b"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := do(t, h, tc.method, testPrefix+tc.path, tc.body, cookie)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+			}
+			if _, _, code := decodeEnvelope(t, rec); code != "bad_request" {
+				t.Errorf("error code = %q, want bad_request", code)
+			}
+		})
+	}
+
+	// Prose is allowed to wrap: only the invisible/control rule applies there.
+	t.Run("multi-line note is still accepted", func(t *testing.T) {
+		rec := do(t, h, http.MethodPost, testPrefix+"/api/admin/keys",
+			`{"name":"multiline","expiresInHours":1,"note":"line one\nline two"}`, cookie)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("a label with an accent is still accepted", func(t *testing.T) {
+		rec := do(t, h, http.MethodPost, testPrefix+"/api/agent-keys/applications",
+			`{"label":"构建代理 — build agent"}`, nil)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
+		}
+	})
 }

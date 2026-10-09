@@ -1,12 +1,15 @@
 package httpx
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -101,6 +104,224 @@ func TestWriteErrorHidesInternals(t *testing.T) {
 type errSentinel struct{}
 
 func (errSentinel) Error() string { return "database exploded at /var/lib/secret.db" }
+
+// captureLogs redirects the default slog logger into a buffer for one test and
+// restores it afterwards, so assertions can be made on what an operator would
+// actually find in the log.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return &buf
+}
+
+// TestWriteErrorLogsServerFaults is the diagnosability test: a 5xx must leave
+// its cause and the request id in the log, exactly once, a 4xx must leave
+// nothing at error level, and neither may put the cause in the response body.
+func TestWriteErrorLogsServerFaults(t *testing.T) {
+	const cause = "database is locked (5) (SQLITE_BUSY)"
+	const reqID = "test-request-id"
+
+	// serveFn runs an arbitrary handler behind RequestID, so the choke point can
+	// be exercised through WriteError, bare Fail, or anything else.
+	serveFn := func(handler func(w http.ResponseWriter, r *http.Request)) (*httptest.ResponseRecorder, string) {
+		h := RequestID(http.HandlerFunc(handler))
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "/x", nil)
+		r.Header.Set("Cf-Ray", reqID)
+		h.ServeHTTP(rec, r)
+		return rec, rec.Header().Get("X-Request-Id")
+	}
+	serve := func(err error) (*httptest.ResponseRecorder, string) {
+		return serveFn(func(w http.ResponseWriter, r *http.Request) { WriteError(w, r, err) })
+	}
+	// oneLogLine asserts the property that matters operationally: one failure,
+	// one line — never zero, never two.
+	oneLogLine := func(t *testing.T, logged string) {
+		t.Helper()
+		if n := strings.Count(logged, "request failed"); n != 1 {
+			t.Errorf("log lines = %d, want exactly 1: %s", n, logged)
+		}
+	}
+
+	t.Run("5xx logs the cause with the request id", func(t *testing.T) {
+		buf := captureLogs(t)
+		rec, echoed := serve(Internal("Failed to create report").WithCause(errors.New(cause)))
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", rec.Code)
+		}
+		if strings.Contains(rec.Body.String(), cause) {
+			t.Errorf("cause leaked into the response body: %s", rec.Body.String())
+		}
+		if echoed != reqID {
+			t.Fatalf("response request id = %q, want %q", echoed, reqID)
+		}
+
+		logged := buf.String()
+		oneLogLine(t, logged)
+		if !strings.Contains(logged, cause) {
+			t.Errorf("cause missing from the log: %s", logged)
+		}
+		if !strings.Contains(logged, "requestId="+reqID) {
+			t.Errorf("requestId missing from the log: %s", logged)
+		}
+		if !strings.Contains(logged, "status=500") {
+			t.Errorf("status missing from the log: %s", logged)
+		}
+		if !strings.Contains(logged, "code=internal_error") {
+			t.Errorf("code missing from the log: %s", logged)
+		}
+		if strings.Contains(logged, "panic=true") {
+			t.Errorf("an ordinary 500 was flagged as a panic: %s", logged)
+		}
+	})
+
+	t.Run("5xx without a cause still logs", func(t *testing.T) {
+		buf := captureLogs(t)
+		rec, _ := serve(Internal("Failed to create report"))
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", rec.Code)
+		}
+		logged := buf.String()
+		oneLogLine(t, logged)
+		if strings.Contains(logged, "cause=") {
+			t.Errorf("a causeless error logged a cause attribute: %s", logged)
+		}
+	})
+
+	// The reason the logging lives in Fail: a direct 5xx that never touches
+	// WriteError — the health probe's 503 is exactly this shape — must not be
+	// silent.
+	t.Run("bare Fail 5xx logs exactly one line", func(t *testing.T) {
+		buf := captureLogs(t)
+		rec, _ := serveFn(func(w http.ResponseWriter, r *http.Request) {
+			Fail(w, r, http.StatusServiceUnavailable, "unavailable", "Database unavailable", nil)
+		})
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", rec.Code)
+		}
+		logged := buf.String()
+		oneLogLine(t, logged)
+		if !strings.Contains(logged, "status=503") {
+			t.Errorf("status missing from the log: %s", logged)
+		}
+		if !strings.Contains(logged, "code=unavailable") {
+			t.Errorf("code missing from the log: %s", logged)
+		}
+		if !strings.Contains(logged, "requestId="+reqID) {
+			t.Errorf("requestId missing from the log: %s", logged)
+		}
+		if strings.Contains(logged, "panic=true") {
+			t.Errorf("a bare 503 was flagged as a panic: %s", logged)
+		}
+	})
+
+	t.Run("bare Fail 4xx is not logged", func(t *testing.T) {
+		buf := captureLogs(t)
+		rec, _ := serveFn(func(w http.ResponseWriter, r *http.Request) {
+			Fail(w, r, http.StatusNotFound, "not_found", "Not found", nil)
+		})
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("status = %d, want 404", rec.Code)
+		}
+		if logged := buf.String(); logged != "" {
+			t.Errorf("a client error was logged: %s", logged)
+		}
+	})
+
+	t.Run("4xx is not logged", func(t *testing.T) {
+		buf := captureLogs(t)
+		for _, err := range []error{
+			NotFound("Report not found"),
+			Unauthorized("Dashboard session required"),
+			BadRequest("Request body is required", nil),
+			Gone("This share link has expired"),
+		} {
+			rec, _ := serve(err)
+			if rec.Code < 400 || rec.Code >= 500 {
+				t.Fatalf("status = %d, want a 4xx", rec.Code)
+			}
+		}
+		if logged := buf.String(); logged != "" {
+			t.Errorf("client errors were logged at error level: %s", logged)
+		}
+	})
+
+	t.Run("4xx with a cause is still not logged", func(t *testing.T) {
+		buf := captureLogs(t)
+		rec, _ := serve(BadRequest("bad request", nil).WithCause(errors.New(cause)))
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", rec.Code)
+		}
+		if logged := buf.String(); logged != "" {
+			t.Errorf("a client error cause was logged: %s", logged)
+		}
+	})
+
+	t.Run("unstructured 500 logs once and hides the detail", func(t *testing.T) {
+		buf := captureLogs(t)
+		rec, _ := serve(errSentinel{})
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500", rec.Code)
+		}
+		if strings.Contains(rec.Body.String(), "database exploded") {
+			t.Errorf("internal detail leaked into the response: %s", rec.Body.String())
+		}
+		logged := buf.String()
+		oneLogLine(t, logged)
+		if !strings.Contains(logged, "database exploded") {
+			t.Errorf("unstructured cause missing from the log: %s", logged)
+		}
+	})
+}
+
+// TestRecoverLogsThePanicOnce pins that a panic is one 500 and therefore one log
+// line, carrying the panic value as the cause rather than as a second record,
+// and flagged with a stable panic=true field.
+func TestRecoverLogsThePanicOnce(t *testing.T) {
+	buf := captureLogs(t)
+
+	h := RequestID(Recover(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		panic("boom at /var/lib/secret.db")
+	})))
+	rec := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/x", nil)
+	r.Header.Set("Cf-Ray", "trace-0001")
+	h.ServeHTTP(rec, r)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "internal_error") {
+		t.Errorf("expected an error envelope, got %s", rec.Body.String())
+	}
+	// Assert on the whole body, not just the absence of a cause field: a panic
+	// value can carry internal detail (here a file path), so the text must be
+	// absent outright.
+	body := rec.Body.String()
+	for _, leaked := range []string{"boom", "secret.db", "panic"} {
+		if strings.Contains(body, leaked) {
+			t.Errorf("panic value leaked into the response (%q): %s", leaked, body)
+		}
+	}
+
+	logged := buf.String()
+	if n := strings.Count(logged, "request failed"); n != 1 {
+		t.Errorf("log lines = %d, want exactly 1: %s", n, logged)
+	}
+	if !strings.Contains(logged, "panic=true") {
+		t.Errorf("stable panic marker missing from the log: %s", logged)
+	}
+	if !strings.Contains(logged, "boom at /var/lib/secret.db") {
+		t.Errorf("panic value missing from the log: %s", logged)
+	}
+	if !strings.Contains(logged, "requestId=trace-0001") {
+		t.Errorf("requestId missing from the log: %s", logged)
+	}
+}
 
 // stubResolver is an in-memory KeyResolver that records the digests it was
 // asked about, so tests can assert on the two-path contract.

@@ -37,11 +37,29 @@ var migrationFS embed.FS
 //     ON DELETE CASCADE.
 //   - synchronous=NORMAL: the durable-enough default for WAL; a full fsync per
 //     commit would dominate write latency on a small VPS.
+//   - _txlock=immediate: take the write lock when the transaction BEGINS rather
+//     than on its first write. Every transaction in this package is a write
+//     (see the note below), and a DEFERRED transaction that reads before it
+//     writes must upgrade its snapshot — an upgrade SQLite refuses outright with
+//     SQLITE_BUSY_SNAPSHOT (517) when another writer committed in between.
+//     busy_timeout does NOT cover that case, because it is not a lock wait: the
+//     snapshot is simply stale and must be restarted. Measured before this
+//     change, with 24 goroutines all passing the pending cap so that each one
+//     reached its INSERT: 226 of 360 attempts failed (139x "database is locked
+//     (5)", 87x "(517)") — a public, unauthenticated endpoint returning 500s.
+//     Taking the lock up front turns that into an ordinary wait.
+//
+// _txlock=immediate applies to every Begin in this package, so it is only safe
+// while that stays true. Every current caller writes: CreateReport,
+// CreateApplication, ClaimApplication, CreateManualKey, CreateRenewal,
+// DecideRenewal and Migrate. If a read-only transaction is ever added, it does
+// not need one — plain db.Query reads run in autocommit and are unaffected — but
+// wrapping it in a Begin would serialise it behind writers for no reason.
 func Open(path string) (*sql.DB, error) {
 	if path != ":memory:" && !strings.HasPrefix(path, "file:") {
 		path = "file:" + path
 	}
-	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)&_txlock=immediate"
 
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

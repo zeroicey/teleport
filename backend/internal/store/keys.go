@@ -260,11 +260,17 @@ func (s *Store) ClaimApplication(id, claimSecret string, kDerive []byte, maxActi
 	}
 	defer tx.Rollback()
 
+	// decided_at is the HUMAN's decision time and must survive the claim.
+	// Overwriting it with the claim time destroyed the only record of when an
+	// operator approved the request, and left the row contradicting the value the
+	// API had just returned. Nothing is lost by not storing a separate claim
+	// time: the key inserted below is stamped with nowMS, and issued_key_id links
+	// to it, so the claim time is exactly agent_keys.created_at.
 	res, err := tx.Exec(
 		`UPDATE key_applications
-		    SET status = 'claimed', decided_at = ?
+		    SET status = 'claimed'
 		  WHERE id = ? AND status = 'approved' AND claim_deadline > ?`,
-		nowMS, id, nowMS)
+		id, nowMS)
 	if err != nil {
 		return nil, "", fmt.Errorf("claim application: %w", err)
 	}
@@ -755,7 +761,7 @@ func (s *Store) DecideRenewal(id string, approve bool, hours float64, nowMS int6
 			if currentExpiry > base {
 				base = currentExpiry
 			}
-			granted = base + int64(math.Round(hours*3_600_000))
+			granted = base + hoursToMS(hours)
 		}
 
 		if _, err := tx.Exec(
@@ -820,9 +826,29 @@ func (s *Store) ShareTokenOwner(token string) (owner string, active bool, found 
 
 // expiryFrom converts an hours offset into an absolute epoch-millisecond
 // expiry, where a non-positive value means "never expires".
+// maxExpiryHours bounds any requested lifetime at 100 years. It exists so that
+// hoursToMS can never overflow: a float64 above the int64 range (1e300, say)
+// converts to an implementation-defined value, and on amd64 that value is
+// negative — a request for a very long life would silently produce an
+// expires_at in 1970, i.e. a key that is born expired. Clamping keeps the
+// failure mode "absurdly long, but valid and positive" instead of "garbage".
+//
+// The API layer rejects out-of-range input with 400 before it reaches here; this
+// is the invariant that holds even if a future caller forgets.
+const maxExpiryHours = 100 * 365 * 24
+
+// hoursToMS converts a requested lifetime to milliseconds, clamped to
+// maxExpiryHours so the result is always non-negative and cannot overflow.
+func hoursToMS(hours float64) int64 {
+	if hours > maxExpiryHours {
+		hours = maxExpiryHours
+	}
+	return int64(math.Round(hours * 3_600_000))
+}
+
 func expiryFrom(hours float64, nowMS int64) int64 {
 	if math.IsNaN(hours) || math.IsInf(hours, 0) || hours <= 0 {
 		return 0
 	}
-	return nowMS + int64(math.Round(hours*3_600_000))
+	return nowMS + hoursToMS(hours)
 }

@@ -201,7 +201,7 @@ agent **不再向人类索取密钥**：自己提交申请 → 人类在面板�
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/api/agent-keys/me` | 自身状态：`{id, name, token_prefix, created_at, expires_at, revoked_at, last_used_at, request_count, note, root}`；`expires_at = 0` = 永不过期（**无界，不是"已过期"**），`root` 对普通密钥恒为 `false` |
-| `POST` | `/api/agent-keys/renewals` | 体 `{requestedHours?}`；**201** 返回 `{id, key_id, status:"pending", requested_hours, created_at, claim_secret}`。**续期需人类批准**；批准后在现有到期时间上**叠加**批准时长：`granted = max(当前 expires_at, now) + 批准时长` —— **只延长、绝不缩短**，`0` 保持 `0`（因此提前续期不损失剩余时间）；已有 pending 时返回 **409 `renewal_exists`** |
+| `POST` | `/api/agent-keys/renewals` | 体 `{requestedHours?}`；**201** 返回 `{id, key_id, status:"pending", requested_hours, created_at, claim_secret}`。**续期需人类批准**；批准后在现有到期时间上**叠加**批准时长：`granted = max(当前 expires_at, now) + 批准时长` —— **只延长、绝不缩短**，`0` 保持 `0`（因此提前续期不损失剩余时间）；已有 pending 时返回 **409 `renewal_exists`**。批准只看「提交时刻」与「是否被撤销」：**过期前**提交的续期获批后会把已过期的密钥**恢复可用**；密钥**一旦过期**就无法再新提交续期（Bearer 401）；**已撤销**的密钥永不被复活（批准 → **404**） |
 
 **面板（Session Cookie）**
 

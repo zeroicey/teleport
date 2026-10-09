@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -156,13 +157,31 @@ func RequestID(next http.Handler) http.Handler {
 	})
 }
 
+// panicError carries a recovered panic value into the 5xx log line.
+//
+// The log line is shared with every other server fault (one failure, one line),
+// so a panic needs a way to stand out that does not depend on the wording of
+// the cause string. Matching alerting on the "panic: " prefix would break
+// silently the day someone rewords the wrapper; logServerFault turns this type
+// into a stable `panic=true` field instead. The value itself still reaches the
+// log through Error(), and never reaches the client.
+type panicError struct{ value any }
+
+func (e panicError) Error() string { return fmt.Sprintf("panic: %v", e.value) }
+
 // Recover turns a panic into a 500 instead of killing the connection.
+//
+// The panic value travels as the cause into fail, which logs the 5xx: one line,
+// not two. Logging "panic recovered" separately and then letting Fail log the
+// same event would double every panic in the log, and an operator counting two
+// lines reads two incidents. panicError keeps the distinction without the
+// second line.
 func Recover(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
-				slog.Error("panic recovered", "requestId", RequestIDFrom(r.Context()), "panic", rec)
-				Fail(w, r, http.StatusInternalServerError, "internal_error", "Internal server error", nil)
+				fail(w, r, http.StatusInternalServerError, "internal_error",
+					"Internal server error", nil, panicError{value: rec})
 			}
 		}()
 		next.ServeHTTP(w, r)
@@ -447,7 +466,15 @@ func mustParsePrefixes(cidrs ...string) []netip.Prefix {
 	return out
 }
 
-// LogError logs an error together with the request correlation id.
+// LogError logs an error together with the request correlation id. It is a
+// general-purpose helper for a handler that wants to record a failure of its own
+// — a background job, a best-effort cleanup, an operation that does not produce
+// a response.
+//
+// It is NOT how a 5xx response is logged: that happens in fail, the single choke
+// point every 5xx passes through, so a server fault gets exactly one line.
+// Calling this in addition, from a handler that also writes a 5xx, produces the
+// duplicate line that arrangement exists to prevent.
 func LogError(r *http.Request, msg string, err error) {
 	slog.Error(msg, "requestId", RequestIDFrom(r.Context()), "path", r.URL.Path, "error", err)
 }

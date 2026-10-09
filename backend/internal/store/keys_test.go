@@ -2,6 +2,8 @@ package store
 
 import (
 	"errors"
+	"math"
+	"strings"
 	"sync"
 	"testing"
 
@@ -830,4 +832,167 @@ func TestRenewalOnlyExtends(t *testing.T) {
 			t.Errorf("key expires_at = %d, want 0", after.ExpiresAt)
 		}
 	})
+}
+
+// TestConcurrentWritesDoNotSurfaceSQLiteBusy is the guard for a bug that a
+// weaker version of TestConcurrentApplicationsRespectPendingCap could not see.
+//
+// With a small pending cap, most concurrent applicants are rejected at the
+// SELECT COUNT step and never reach their INSERT — so they never perform the
+// read→write snapshot upgrade that SQLite can refuse with SQLITE_BUSY_SNAPSHOT
+// (517). A cap large enough that every goroutine reaches the write is what
+// exposes it, and that is exactly the configuration an attacker would use.
+//
+// Measured before _txlock=immediate: 226 of 360 attempts failed (139x
+// "database is locked (5)", 87x "(517)"). busy_timeout does not help, because a
+// stale snapshot is not a lock wait. This test would have caught it.
+func TestConcurrentWritesDoNotSurfaceSQLiteBusy(t *testing.T) {
+	const (
+		goroutines = 24
+		rounds     = 10
+	)
+	for round := 0; round < rounds; round++ {
+		s := newTestStore(t)
+
+		var mu sync.Mutex
+		problems := []string{}
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := 0; i < goroutines; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				// A cap far above the contender count, so every goroutine gets
+				// past the count and into the insert.
+				if _, err := s.CreateApplication(ApplicationInput{Label: "x"}, 1000, NowMS()); err != nil {
+					mu.Lock()
+					problems = append(problems, err.Error())
+					mu.Unlock()
+				}
+			}()
+		}
+		close(start)
+		wg.Wait()
+
+		if len(problems) > 0 {
+			t.Fatalf("round %d: %d/%d concurrent applications failed: %v",
+				round, len(problems), goroutines, problems[:min(len(problems), 3)])
+		}
+		if n := countApplications(t, s); n != goroutines {
+			t.Fatalf("round %d: %d applications stored, want %d", round, n, goroutines)
+		}
+	}
+}
+
+// TestConcurrentWritesNeverLeakSQLiteText asserts the raw driver text never
+// reaches a caller: a BUSY that still slipped through (a writer holding the lock
+// longer than busy_timeout) must be a typed error a handler can map to 503, not
+// an opaque string that becomes a 500.
+func TestConcurrentWritesNeverLeakSQLiteText(t *testing.T) {
+	s := newTestStore(t)
+	for i := 0; i < 200; i++ {
+		if _, err := s.CreateApplication(ApplicationInput{Label: "x"}, 1000, NowMS()); err != nil {
+			if strings.Contains(err.Error(), "SQLITE_BUSY") ||
+				strings.Contains(err.Error(), "database is locked") {
+				t.Fatalf("raw sqlite text leaked to caller: %v", err)
+			}
+		}
+	}
+}
+
+func countApplications(t *testing.T, s *Store) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM key_applications`).Scan(&n); err != nil {
+		t.Fatalf("count applications: %v", err)
+	}
+	return n
+}
+
+// TestClaimPreservesDecidedAt pins the human decision time.
+//
+// ClaimApplication used to write decided_at = now alongside status='claimed',
+// which destroyed the only record of when an operator approved the request and
+// left the row disagreeing with the value the API had just returned (measured
+// 2012ms apart in the audit). The claim time is not lost by fixing this: the key
+// inserted in the same transaction is stamped with the claim time and
+// issued_key_id links to it.
+func TestClaimPreservesDecidedAt(t *testing.T) {
+	s := newTestStore(t)
+	now := NowMS()
+
+	app, claimSecret := apply(t, s, "a", now)
+
+	decidedAt := now + 1000
+	if err := s.DecideApplication(app.ID, true, "agent", 24, "", now+30*60*1000, decidedAt); err != nil {
+		t.Fatal(err)
+	}
+
+	claimedAt := now + 60_000
+	key, _, err := s.ClaimApplication(app.ID, claimSecret, testKDerive(), 10, claimedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var storedDecided int64
+	var keyID string
+	if err := s.db.QueryRow(
+		`SELECT decided_at, issued_key_id FROM key_applications WHERE id = ?`, app.ID,
+	).Scan(&storedDecided, &keyID); err != nil {
+		t.Fatal(err)
+	}
+	if storedDecided != decidedAt {
+		t.Errorf("decided_at = %d, want %d (the human's decision time, not the claim time)", storedDecided, decidedAt)
+	}
+
+	// The claim time must still be recoverable — from the key it created.
+	var keyCreatedAt int64
+	if err := s.db.QueryRow(`SELECT created_at FROM agent_keys WHERE id = ?`, key.ID).Scan(&keyCreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if keyCreatedAt != claimedAt {
+		t.Errorf("key created_at = %d, want %d", keyCreatedAt, claimedAt)
+	}
+	if keyID != key.ID {
+		t.Errorf("issued_key_id = %q, want %q", keyID, key.ID)
+	}
+}
+
+// TestExpiryFromClampsAbsurdInput pins the invariant that a requested lifetime
+// can never produce a negative or zero expires_at.
+//
+// A float64 far above the int64 range converts to an implementation-defined
+// value; on amd64 that is negative, so 1e300 used to yield an expires_at in 1970
+// — a key born expired, silently accepted with HTTP 200.
+func TestExpiryFromClampsAbsurdInput(t *testing.T) {
+	now := NowMS()
+	const years100 = int64(100*365*24) * 3_600_000
+
+	cases := []struct {
+		name  string
+		hours float64
+		want  func(int64) bool
+		desc  string
+	}{
+		{"1e300 clamps to the ceiling", 1e300, func(g int64) bool { return g == now+years100 }, "now + 100y"},
+		{"max float clamps", math.MaxFloat64, func(g int64) bool { return g == now+years100 }, "now + 100y"},
+		{"just under the ceiling", 876_000, func(g int64) bool { return g == now+years100 }, "now + 100y"},
+		{"ordinary value is exact", 24, func(g int64) bool { return g == now+24*3_600_000 }, "now + 24h"},
+		{"+Inf is never-expires", math.Inf(1), func(g int64) bool { return g == 0 }, "0"},
+		{"NaN is never-expires", math.NaN(), func(g int64) bool { return g == 0 }, "0"},
+		{"negative is never-expires", -1, func(g int64) bool { return g == 0 }, "0"},
+		{"zero is never-expires", 0, func(g int64) bool { return g == 0 }, "0"},
+		{"tiny positive still expires soon", 1e-300, func(g int64) bool { return g == now }, "now"},
+	}
+	for _, tc := range cases {
+		got := expiryFrom(tc.hours, now)
+		if got < 0 {
+			t.Errorf("%s: expiryFrom(%v) = %d — negative, the bug this guards", tc.name, tc.hours, got)
+			continue
+		}
+		if !tc.want(got) {
+			t.Errorf("%s: expiryFrom(%v) = %d, want %s", tc.name, tc.hours, got, tc.desc)
+		}
+	}
 }

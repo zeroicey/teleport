@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/zeroicey/teleport/backend/internal/agentkey"
 	"github.com/zeroicey/teleport/backend/internal/domain"
@@ -34,6 +35,25 @@ const renewalClaimLabel = "teleport/agent-key/renewal-claim/v1"
 // if the auth middleware was bypassed, which would be a wiring bug — the message
 // must still be the same one so no response distinguishes the failure reasons.
 const agentAuthFailed = "Invalid agent credentials"
+
+// defaultApprovedKeyHours is the lifetime a human grants when they approve an
+// application without naming one.
+//
+// It is deliberately NOT the applicant's requestedHours. That field arrives over
+// the unauthenticated application endpoint, so inheriting it would let a caller
+// choose the lifetime of the credential a human is about to issue — and
+// requestedHours=0 ("unspecified") would silently mean "never expires". Absent
+// means this default; 0 means never only when the admin types it explicitly.
+//
+// It is also deliberately not DefaultShareHours: share-link TTL and credential
+// lifetime are different policies, and coupling them would make a change to one
+// silently rewrite the other.
+const defaultApprovedKeyHours = 24
+
+// maxKeyLifetimeHours caps every hour count the API accepts (100 years). The
+// point is to keep hours*3_600_000 inside int64 so a lifetime can never saturate
+// into a negative timestamp.
+const maxKeyLifetimeHours = 100 * 365 * 24
 
 // keyResolver adapts the store to httpx.KeyResolver.
 //
@@ -118,14 +138,14 @@ func (s *Server) handleCreateKeyApplication(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	label, err := requireString(body["label"], "label", 1, 100)
+	label, err := requireVisibleString(body["label"], "label", 1, 100)
 	if err != nil {
 		httpx.WriteError(w, r, err)
 		return
 	}
 	purpose := ""
 	if v, ok := body["purpose"]; ok && v != nil {
-		if purpose, err = requireString(v, "purpose", 0, 500); err != nil {
+		if purpose, err = requireVisibleText(v, "purpose", 0, 500); err != nil {
 			httpx.WriteError(w, r, err)
 			return
 		}
@@ -289,12 +309,23 @@ func (s *Server) renewalClaimSecret(renewalID, keyID string) string {
 // agent-owned
 // ---------------------------------------------------------------------------
 
-// keyMeResponse embeds AgentKey rather than re-listing its fields, so the
-// response can never drift from the type — and so TokenHash, whose tag is
-// json:"-", cannot be hand-copied into the payload by mistake.
+// keyMeResponse is the agent's view of its own credential.
+//
+// It is an explicit projection rather than an embedded AgentKey: `note` is the
+// administrator's internal annotation ("who this key was issued to and why") and
+// must not be handed to the key holder, and `revoked_at` cannot be non-zero on a
+// request that authenticated (the resolver refuses revoked keys), so exposing it
+// would only invite a caller to infer state it can never observe. Spelling the
+// fields out makes the exclusion visible instead of relying on a future tag.
 type keyMeResponse struct {
-	domain.AgentKey
-	Root bool `json:"root"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	TokenPrefix  string `json:"token_prefix"`
+	CreatedAt    int64  `json:"created_at"`
+	ExpiresAt    int64  `json:"expires_at"` // 0 = never expires
+	LastUsedAt   int64  `json:"last_used_at"`
+	RequestCount int64  `json:"request_count"`
+	Root         bool   `json:"root"`
 }
 
 // handleKeyMe reports the caller's own credential. Root has no key row, so it
@@ -307,8 +338,8 @@ func (s *Server) handleKeyMe(w http.ResponseWriter, r *http.Request) {
 	}
 	if principal.Root {
 		httpx.OK(w, r, keyMeResponse{
-			AgentKey: domain.AgentKey{Name: "root (break-glass)"},
-			Root:     true,
+			Name: "root (break-glass)",
+			Root: true,
 		})
 		return
 	}
@@ -323,7 +354,15 @@ func (s *Server) handleKeyMe(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, httpx.NotFound("Key not found"))
 		return
 	}
-	httpx.OK(w, r, keyMeResponse{AgentKey: *key})
+	httpx.OK(w, r, keyMeResponse{
+		ID:           key.ID,
+		Name:         key.Name,
+		TokenPrefix:  key.TokenPrefix,
+		CreatedAt:    key.CreatedAt,
+		ExpiresAt:    key.ExpiresAt,
+		LastUsedAt:   key.LastUsedAt,
+		RequestCount: key.RequestCount,
+	})
 }
 
 // handleCreateRenewal lets a key ask for more time. It stays pending until a
@@ -408,21 +447,24 @@ func (s *Server) handleAdminApproveKeyApplication(w http.ResponseWriter, r *http
 
 	name := ""
 	if v, ok := body["name"]; ok && v != nil {
-		if name, err = requireString(v, "name", 1, 100); err != nil {
+		if name, err = requireVisibleString(v, "name", 1, 100); err != nil {
 			httpx.WriteError(w, r, err)
 			return
 		}
 	}
 	note := ""
 	if v, ok := body["note"]; ok && v != nil {
-		if note, err = requireString(v, "note", 0, 500); err != nil {
+		if note, err = requireVisibleText(v, "note", 0, 500); err != nil {
 			httpx.WriteError(w, r, err)
 			return
 		}
 	}
 
-	// Absent `expiresInHours` means "honour what the agent asked for"; an
-	// explicit 0 means "never expires". The two must not collapse into one.
+	// Absent `expiresInHours` means the server default; an explicit 0 means
+	// "never expires". The two must not collapse into one — and the default must
+	// not be the applicant's requestedHours, which arrives unauthenticated and
+	// would let a caller pick the lifetime of the credential (with 0 meaning
+	// "forever") simply by leaving the admin's field empty.
 	var hours float64
 	if v, ok := body["expiresInHours"]; ok && v != nil {
 		if hours, err = nonNegativeHours(v, "expiresInHours"); err != nil {
@@ -430,23 +472,14 @@ func (s *Server) handleAdminApproveKeyApplication(w http.ResponseWriter, r *http
 			return
 		}
 	} else {
-		app, err := s.store.GetApplication(id)
-		if err != nil {
-			httpx.WriteError(w, r, httpx.Internal("Failed to load key application").WithCause(err))
-			return
-		}
-		if app == nil {
-			httpx.WriteError(w, r, httpx.NotFound("Key application not found"))
-			return
-		}
-		hours = app.RequestedHours
+		hours = defaultApprovedKeyHours
 	}
 
 	nowMS := store.NowMS()
 	s.expireApplications(nowMS)
 	deadline := nowMS + s.cfg.KeyClaimWindow.Milliseconds()
 	if err := s.store.DecideApplication(id, true, name, hours, note, deadline, nowMS); err != nil {
-		writeKeyLifecycleError(w, r, err)
+		s.writeDecisionError(w, r, id, err)
 		return
 	}
 	s.writeApplicationResult(w, r, id)
@@ -462,7 +495,7 @@ func (s *Server) handleAdminRejectKeyApplication(w http.ResponseWriter, r *http.
 	}
 	reason := ""
 	if v, ok := body["reason"]; ok && v != nil {
-		if reason, err = requireString(v, "reason", 0, 500); err != nil {
+		if reason, err = requireVisibleText(v, "reason", 0, 500); err != nil {
 			httpx.WriteError(w, r, err)
 			return
 		}
@@ -471,7 +504,7 @@ func (s *Server) handleAdminRejectKeyApplication(w http.ResponseWriter, r *http.
 	nowMS := store.NowMS()
 	s.expireApplications(nowMS)
 	if err := s.store.DecideApplication(id, false, "", 0, reason, 0, nowMS); err != nil {
-		writeKeyLifecycleError(w, r, err)
+		s.writeDecisionError(w, r, id, err)
 		return
 	}
 	s.writeApplicationResult(w, r, id)
@@ -501,7 +534,7 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, err)
 		return
 	}
-	name, err := requireString(body["name"], "name", 1, 100)
+	name, err := requireVisibleString(body["name"], "name", 1, 100)
 	if err != nil {
 		httpx.WriteError(w, r, err)
 		return
@@ -513,7 +546,7 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 	}
 	note := ""
 	if v, ok := body["note"]; ok && v != nil {
-		if note, err = requireString(v, "note", 0, 500); err != nil {
+		if note, err = requireVisibleText(v, "note", 0, 500); err != nil {
 			httpx.WriteError(w, r, err)
 			return
 		}
@@ -539,7 +572,7 @@ func (s *Server) handleAdminPatchKey(w http.ResponseWriter, r *http.Request) {
 
 	patch := store.KeyPatch{}
 	if v, ok := body["name"]; ok && v != nil {
-		name, err := requireString(v, "name", 1, 100)
+		name, err := requireVisibleString(v, "name", 1, 100)
 		if err != nil {
 			httpx.WriteError(w, r, err)
 			return
@@ -566,7 +599,7 @@ func (s *Server) handleAdminPatchKey(w http.ResponseWriter, r *http.Request) {
 		patch.Revoked = &revoked
 	}
 	if v, ok := body["note"]; ok && v != nil {
-		note, err := requireString(v, "note", 0, 500)
+		note, err := requireVisibleText(v, "note", 0, 500)
 		if err != nil {
 			httpx.WriteError(w, r, err)
 			return
@@ -643,7 +676,18 @@ func (s *Server) handleAdminApproveRenewal(w http.ResponseWriter, r *http.Reques
 			httpx.WriteError(w, r, httpx.NotFound("Renewal not found"))
 			return
 		}
-		hours = renewal.RequestedHours
+		// Documented contract: an absent expiresInHours honours the requested
+		// amount. But 0 on a renewal means "never expires", which is the highest
+		// privilege the system can grant, and it must not be reachable by a
+		// requester-supplied field passing through an empty approval — so a
+		// non-positive request falls back to the server default instead.
+		// Requesters never send 0 on purpose (the dashboard maps 0 to 24h), so
+		// this only closes the bare-API path.
+		if renewal.RequestedHours > 0 {
+			hours = renewal.RequestedHours
+		} else {
+			hours = defaultApprovedKeyHours
+		}
 	}
 
 	if _, err := s.store.DecideRenewal(id, true, hours, store.NowMS()); err != nil {
@@ -738,6 +782,28 @@ func (s *Server) writeRenewalResult(w http.ResponseWriter, r *http.Request, id s
 	httpx.OK(w, r, renewal)
 }
 
+// writeDecisionError maps a failed approve/reject.
+//
+// A decision that matched no row is usually "already decided", but it is also
+// exactly what an expired row produces once the sweep has run: the row is no
+// longer pending, yet nobody ever decided anything. Answering "already decided"
+// there is misleading — the agent polling the same application is told 410 gone
+// — so the row is re-read and the two cases are separated.
+func (s *Server) writeDecisionError(w http.ResponseWriter, r *http.Request, id string, err error) {
+	if errors.Is(err, store.ErrApplicationDecided) {
+		app, readErr := s.store.GetApplication(id)
+		if readErr != nil {
+			httpx.WriteError(w, r, httpx.Internal("Failed to load key application").WithCause(readErr))
+			return
+		}
+		if app != nil && app.Status == domain.ApplicationExpired {
+			httpx.WriteError(w, r, httpx.Gone("This key application has expired"))
+			return
+		}
+	}
+	writeKeyLifecycleError(w, r, err)
+}
+
 // writeKeyLifecycleError maps store sentinels onto the frozen status codes.
 //
 // The distinctions matter to the caller: 404 is "you may not see this" (absent
@@ -828,11 +894,22 @@ func readOptionalHours(body map[string]any, field string) (float64, error) {
 }
 
 // nonNegativeHours applies the same JS Number() coercion the rest of the API
-// uses, and rejects negative values rather than silently clamping them.
+// uses, and rejects values outside the range a key lifetime can meaningfully
+// take rather than silently clamping them.
+//
+// The upper bound exists because float64 -> int64 conversion saturates: a body
+// of {"expiresInHours":1e300} used to round-trip 200 with a negative expires_at
+// written to the database, i.e. the API claimed success while storing a value
+// outside the contract. NaN and ±Inf never get this far — jsNumber rejects them.
 func nonNegativeHours(v any, field string) (float64, error) {
 	hours, ok := jsNumber(v)
 	if !ok || hours < 0 {
 		return 0, httpx.BadRequest("`"+field+"` must be a non-negative number",
+			map[string]any{"field": field})
+	}
+	if hours > maxKeyLifetimeHours {
+		return 0, httpx.BadRequest(
+			"`"+field+"` must be at most "+strconv.Itoa(maxKeyLifetimeHours)+" hours (100 years)",
 			map[string]any{"field": field})
 	}
 	return hours, nil
@@ -843,4 +920,58 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max]
+}
+
+// requireVisibleString validates a single-line, human-facing identifier
+// (label, name): length bounds as usual, plus no control characters and no
+// invisible formatting characters, and at least one visible character when a
+// minimum length is required.
+//
+// The invisible-character rule matters because these values are shown to a
+// human. A label of "\u200b" renders as nothing at all, and NUL truncates
+// display in some tooling while still being stored; either lets a caller put a
+// row in the approval queue that an operator cannot actually read.
+func requireVisibleString(value any, field string, min, max int) (string, error) {
+	return requireVisible(value, field, min, max, false)
+}
+
+// requireVisibleText is the multi-line variant for prose fields (purpose, note,
+// reason): tabs and newlines are legitimate there, every other control
+// character and every invisible formatting character is not.
+func requireVisibleText(value any, field string, min, max int) (string, error) {
+	return requireVisible(value, field, min, max, true)
+}
+
+func requireVisible(value any, field string, min, max int, multiline bool) (string, error) {
+	s, err := requireString(value, field, min, max)
+	if err != nil {
+		return "", err
+	}
+
+	visible := 0
+	for _, r := range s {
+		switch {
+		case r == '\t' || r == '\n' || r == '\r':
+			if !multiline {
+				return "", httpx.BadRequest("`"+field+"` must be a single line",
+					map[string]any{"field": field})
+			}
+		case unicode.IsControl(r):
+			// Covers NUL and the rest of Cc.
+			return "", httpx.BadRequest("`"+field+"` must not contain control characters",
+				map[string]any{"field": field})
+		case unicode.Is(unicode.Cf, r):
+			// Zero-width spaces/joiners, BOM, soft hyphen and the bidi overrides:
+			// invisible, and the bidi ones can reorder what a reader sees.
+			return "", httpx.BadRequest("`"+field+"` must not contain invisible formatting characters",
+				map[string]any{"field": field})
+		case !unicode.IsSpace(r):
+			visible++
+		}
+	}
+	if min > 0 && visible == 0 {
+		return "", httpx.BadRequest("`"+field+"` must contain at least one visible character",
+			map[string]any{"field": field})
+	}
+	return s, nil
 }
