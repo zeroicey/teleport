@@ -2,6 +2,35 @@
 
 **Status:** ✅ 已完成并上线 · **Updated:** 2026-10-10
 
+## 2026-10-10 追加③：密钥过期后的身份连续性 —— **已实现（未部署）**
+
+用户裁决（见 `decisions/2026-10-10-agent-key-identity-across-expiry.md`，已 ACCEPTED）：
+
+> 行，那就按你推荐的 A 方案做……1. 可以给过期的宽限续签，期限是 90 天。
+> 2. 如果再过 90 天，就由我们手动去审批这个 Agent 密钥。4. 如果不批准的话，就保持死亡状态。
+
+| 交付 | 位置 |
+| --- | --- |
+| `KEY_RENEWAL_GRACE`（默认 `2160h`，`0` 关闭） | `config`（新增 `envDurationAllowZero`，因为 0 在这里有意义） |
+| `ResolveAgentKeyWithinGrace`；`ResolveAgentKey` 退化为 `grace=0` | `store/keys.go` |
+| `RequireAgentAllowExpired`（**仅**续期一条路由） | `httpx/auth.go` + `api/router.go` |
+| 过期可见性头 `X-Teleport-Key-Expires-At` / `-Expired` | `httpx/auth.go` |
+| `GET /api/reports`（列自己发的，root 见全部） | `api/router.go` + `store/queries.go` |
+| 面板列表补 `owner_key_id` + `owner_name`（含前端「发布者」列） | `api/router.go` + `ReportsView.vue` |
+| 密钥面板标注「仍可申请续期」 | `KeyManagementView.vue` |
+| `/ai.md`、`/llms.txt`、`README.md` 同步新语义 | 三处 |
+
+**设计要点：默认严格，例外选择性开启。** 漏维护的后果是「续期用不了」（可见 401），
+而不是「过期密钥全权可用」（静默越权）。撤销优先于宽限；被拒请求不携带任何寿命头。
+
+**验证**：`pnpm run check` / `backend:vet` / `go test -race` 全绿；
+7 条新测试**逐条反证**过（详见 `pitfalls/cases/2026-10-10-renewal-unreachable-after-expiry.md`）；
+并用真实二进制实测：过期后只有续期返回 201（其余 5 个端点 401）、批准后同 token 同 key id
+恢复且**过期前发的报告仍可读**、超出 90 天彻底死亡、已撤销即使在宽限期内也 401、
+owner 隔离（A 看不到 B 的、也看不到 root 的）。
+
+**待办**：与「追加②」的修复一起部署（线上仍是旧二进制）。
+
 ## 2026-10-10 追加②：审计发现的四条已**全部修复**（未部署）
 
 `pnpm run check` + `pnpm run backend:vet` + `go test ./... -race -count=1` 全绿。
