@@ -827,7 +827,7 @@ systemctl restart teleport && systemctl is-active teleport
 | `GET /` | 200（SPA 外壳，`text/html`，`Cache-Control: no-cache`） |
 | `GET /dashboard/reports` | 200（SPA 深链接回退，硬刷新后仍正常） |
 | `GET /assets/index-*.js` | 200（`Cache-Control: public, max-age=31536000, immutable`） |
-| `GET /assets/share.js` | 200（`Cache-Control: no-cache`）—— ⚠️ **2026-10-10 复核时线上实际下发的是 `immutable`**：这一行当时是**错的**，代码已修（见「缓存」节），需重新部署后此行为才成立 |
+| `GET /assets/share.js` | 200（`Cache-Control: no-cache`）—— 2026-10-11 部署后**实测确认**；此前（`1c5ab91`）线上下发的是 `immutable`，这一行曾一度是错的 |
 | `GET /assets/不存在.js` | 404（**不回退**成 HTML，避免误导性的 MIME 报错） |
 | `GET /api/health` | 200 `{"status":"ok","environment":"production"}` |
 | `POST /api/reports` 带令牌 | 201，返回分享链接 |

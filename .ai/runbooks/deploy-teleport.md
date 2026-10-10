@@ -1,6 +1,6 @@
 # 部署 Teleport 到 hcyj
 
-**Applies to:** 生产（hcyj / `api.hcyj.xyz`） · **Owner:** lead · **Last verified:** 2026-10-10
+**Applies to:** 生产（hcyj / `api.hcyj.xyz`） · **Owner:** lead · **Last verified:** 2026-10-11
 
 ## When to use this
 
@@ -84,6 +84,39 @@ ssh hcyj 'systemctl is-active teleport && systemctl is-enabled teleport'
 curl -sI https://api.hcyj.xyz/yeciorez/teleport/api/health   # 200
 curl -s  https://api.hcyj.xyz/yeciorez/teleport/api/health
 ```
+
+### 4.1 缓存头（`spa.go` 改过就必须查这三条）
+
+```bash
+P=https://api.hcyj.xyz/yeciorez/teleport
+curl -sI $P/assets/share.js | grep -i cache-control   # no-cache（不是 immutable）
+curl -sI $P/ | grep -i cache-control                  # no-cache
+H=$(curl -s $P/ | grep -o 'assets/index-[^"]*\.js' | head -1)
+curl -sI $P/$H | grep -i cache-control                # public, max-age=31536000, immutable
+```
+
+`share.js` 是 `/assets/` 下**唯一**的非哈希名（`vite.config.ts` 的 `entryFileNames`
+把它固定住，因为 Go 硬编码引用它）。判定必须看**名字形态**而不是目录 ——
+给错方向会静默地让回访浏览器用一年旧副本。见
+`.ai/pitfalls/cases/2026-10-10-share-js-cached-immutable-for-a-year.md`。
+
+### 4.2 数据库备份（**部署前必做**）
+
+```bash
+# 该服务器没有 sqlite3 CLI，用 python3 的 sqlite3 模块
+ssh hcyj 'systemctl stop teleport && cd /data/services/teleport \
+  && cp -a teleport.db teleport.db.bak-$(date +%Y%m%d-%H%M%S)'
+# 必须**停服后**再拷：WAL 模式下热拷 .db 可能拿到不一致的快照
+ssh hcyj 'python3 -c "
+import sqlite3
+c=sqlite3.connect(\"/data/services/teleport/teleport.db\")
+print(c.execute(\"PRAGMA integrity_check\").fetchone()[0])
+print(c.execute(\"SELECT COUNT(*) FROM reports\").fetchone()[0])
+"'
+```
+
+备份完再 `mv` 换二进制并 `systemctl start`，停机窗口约 2 秒。
+**回滚材料不止二进制，还有数据库** —— 单二进制的唯一状态就是这个文件。
 
 **不要只看 `systemctl is-active`。** 用真实 HTTP 请求验收，且必须从**大陆观测点**发 ——
 境外观测点无法检测大陆封锁（`.ai/pitfalls/cases/cloudflare-free-ip-blocked-in-mainland.md`）。

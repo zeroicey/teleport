@@ -1,8 +1,8 @@
 # Current task
 
-**Status:** ✅ 已完成并上线 · **Updated:** 2026-10-10
+**Status:** ✅ 全部已部署上线 · **Updated:** 2026-10-11 · **线上版本:** `711f194`
 
-## 2026-10-10 追加③：密钥过期后的身份连续性 —— **已实现（未部署）**
+## 2026-10-10 追加③：密钥过期后的身份连续性 —— **已实现并部署（`711f194`）**
 
 用户裁决（见 `decisions/2026-10-10-agent-key-identity-across-expiry.md`，已 ACCEPTED）：
 
@@ -29,9 +29,13 @@
 恢复且**过期前发的报告仍可读**、超出 90 天彻底死亡、已撤销即使在宽限期内也 401、
 owner 隔离（A 看不到 B 的、也看不到 root 的）。
 
-**待办**：与「追加②」的修复一起部署（线上仍是旧二进制）。
+**已随同部署**（`711f194`）。上线后用**默认配置**（`teleport.env` 里没有 `KEY_RENEWAL_GRACE`，
+即走 2160h 默认值）实测：过期后只有续期返回 **201**，`/me`、`GET/POST /api/reports` 全 **401**，
+被拒请求泄漏 `X-Teleport-Key-Expired` 计数为 **0**，续期响应 `key_expired: true`。
+测试用的那把密钥已精确恢复（`expires_at=1794234390015`、`revoked_at=0`），
+测试产生的 pending 续期单已删除，`PRAGMA integrity_check` = ok。
 
-## 2026-10-10 追加②：审计发现的四条已**全部修复**（未部署）
+## 2026-10-10 追加②：审计发现的四条已**全部修复并部署**（`711f194`）
 
 `pnpm run check` + `pnpm run backend:vet` + `go test ./... -race -count=1` 全绿。
 
@@ -47,8 +51,9 @@ owner 隔离（A 看不到 B 的、也看不到 root 的）。
 > 目录级判断，规则丢了、陷阱重踩。已记
 > `pitfalls/cases/2026-10-10-share-js-cached-immutable-for-a-year.md`。
 >
-> **待办**：① 的修复只在源码里，**线上仍是旧二进制**（`1c5ab91`）。需要
-> `pnpm run build:release` + 上传重启后才生效 —— 部署前先问人类。
+> **已于 2026-10-11 部署**（`711f194`，sha256 `df92af2e…`）。线上实测：
+> `/assets/share.js` → `no-cache`（此前是 `immutable`，线上缺陷已消除）、
+> 哈希资源仍 `immutable`、`/llms.txt` 的 "ask the user" 计数为 0。
 
 ## 2026-10-10 追加①：一次外部审计 + 发布了一份项目全景报告
 
@@ -131,3 +136,23 @@ owner 隔离（A 看不到 B 的、也看不到 root 的）。
 ## Next action
 
 无阻塞。若要继续：轮换 admin 口令 → 给登录端点加限流 → 面板加批量拒绝。
+
+## 2026-10-11 部署记录
+
+| 项 | 值 |
+| --- | --- |
+| 提交 | `711f194`（`main` 已推送 origin，`b9f93d7..711f194`） |
+| 二进制 sha256 | `df92af2e45646b3cd4c977b3c4dd1eb9688fd561f366be73d51b33e40a2dcc12` |
+| 上一版（回滚用） | `/data/services/teleport/teleport.prev-20261011-002450` |
+| 数据库备份 | `/data/services/teleport/teleport.db.bak-20261011-002450`（integrity ok） |
+| 本次无 schema 迁移 | 回滚只需换回二进制 |
+
+**注意「线上 version ≠ main HEAD」是正常的**：部署后若再提交只改文档/记忆库的 commit，
+二进制不必重发，`/data/services/teleport/teleport version` 就会停在构建时的那个提交。
+判断"线上是不是最新的"要看**行为**（`pnpm run check` + 4.1 的缓存头）而不是 commit 号。
+**但只要改了 Go 或 `web/src/`，就必须重新 `build:release` 并部署** —— 前端产物是
+`//go:embed` 进二进制的，不部署等于没改。
+
+停机窗口约 2 秒（停服 → 一致性拷贝 db → `mv` 换二进制 → 启动）。
+**先停服再拷 db**：WAL 模式下热拷 `.db` 可能拿到不一致快照（该机无 sqlite3 CLI，用 python3）。
+已把这两条写进 `runbooks/deploy-teleport.md`（4.1 缓存头 / 4.2 数据库备份）。
