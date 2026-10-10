@@ -34,6 +34,15 @@ const indexFile = "index.html"
 // assetsDir is the directory Vite writes content-hashed files into.
 const assetsDir = "assets"
 
+// stableAssetFiles names the non-hashed files under assetsDir, for the test
+// that pins this list to the filename the build and the share page agree on.
+// It is documentation and an assertion target, not the cache decision itself —
+// isContentHashed keys on the name's shape, so a name missing from here is
+// uncached rather than incorrectly immortalised.
+var stableAssetFiles = map[string]struct{}{
+	assetsDir + "/share.js": {},
+}
+
 // Handler serves a Vite build at `prefix`.
 //
 // Routing rules, in order:
@@ -107,9 +116,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// itself too, so the control is layered.
 	rel = strings.TrimPrefix(path.Clean("/"+rel), "/")
 
-	// 1. Hashed assets: exact matches only.
+	// 1. Assets: exact matches only, so a miss stays a hard 404 instead of
+	// falling back to the shell (HTML for a missing script turns a clear 404
+	// into a confusing MIME-type error).
 	if rel == assetsDir || strings.HasPrefix(rel, assetsDir+"/") {
-		if h.serveFile(w, r, rel, true) {
+		if h.serveFile(w, r, rel, isContentHashed(rel)) {
 			return
 		}
 		http.NotFound(w, r)
@@ -131,6 +142,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.serveIndex(w, r)
 }
 
+// isContentHashed reports whether a build-relative path names a file whose URL
+// is versioned by its own filename, making `immutable` safe.
+//
+// The default is "not safe": only names matching Vite's `[name]-[hash].js`
+// shape earn the year-long cache. Everything else under assets/ — including
+// `assets/share.js` and any future non-hashed asset — revalidates.
+//
+// This direction matters. The earlier version asked "is it under assets/?" and
+// answered yes for the whole directory, which silently gave `immutable` to a
+// stable name. Whitelisting the shape means a new stable file is uncached by
+// default, and the failure mode of forgetting to update anything is a cheap
+// revalidation rather than a year of stale bytes.
+func isContentHashed(rel string) bool {
+	if !strings.HasPrefix(rel, assetsDir+"/") {
+		return false
+	}
+	name := strings.TrimPrefix(rel, assetsDir+"/")
+	// Vite emits `[name]-[hash].js`; the hash is base64url-ish and the stem may
+	// itself contain hyphens, so anchor on the last hyphen before the extension.
+	dot := strings.LastIndex(name, ".")
+	if dot <= 0 {
+		return false
+	}
+	stem := name[:dot]
+	if strings.ContainsAny(stem, "/") {
+		return false
+	}
+	return strings.Contains(stem, "-")
+}
+
 // serveFile writes the named file, reporting whether it existed.
 func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, name string, immutable bool) bool {
 	info, err := fs.Stat(h.fsys, name)
@@ -144,9 +185,9 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, name string,
 	}
 	defer f.Close()
 
-	// Vite content-hashes filenames under /assets/, so a given URL's bytes can
-	// never change: cache it for a year. index.html and other stable names get
-	// revalidated instead, so a deploy is picked up immediately.
+	// A content-hashed URL's bytes can never change, so it is cached for a
+	// year. Stable names (index.html, assets/share.js) revalidate instead, so a
+	// deploy is picked up immediately.
 	//
 	// Deployments swap the whole binary, so the "changed bytes at a stable URL"
 	// window is the same one a no-cache header exists to cover.
