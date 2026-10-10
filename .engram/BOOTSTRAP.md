@@ -17,7 +17,7 @@ detector does not know your conventions. Correct anything that does not match th
 - Project name: `teleport`
 - Root: `/data/dev/teleport`
 - Detected stack: `node`, `node >=20.0.0`, `typescript`, `vue`, `vite`
-- Top-level directories: `backend/`, `bin/`, `public/`, `scripts/`, `web/`
+- Top-level directories: `backend/`, `bin/`, `scripts/`, `web/`, `.ai/`
 - npm scripts: `build`, `build:release`, `dev`, `dev:web`, `typecheck`, `backend:build`, `backend:hash-password`, `backend:test`, `backend:vet`, `check`, `db:check-schema`
 - Git repository: yes
 - No AI rule file exists yet: create them.

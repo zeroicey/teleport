@@ -2,6 +2,38 @@
 
 **Status:** ✅ 已完成并上线 · **Updated:** 2026-10-10
 
+## 2026-10-10 追加②：审计发现的四条已**全部修复**（未部署）
+
+`pnpm run check` + `pnpm run backend:vet` + `go test ./... -race -count=1` 全绿。
+
+| # | 问题 | 修复 | 守卫 |
+| --- | --- | --- | --- |
+| ① | `/assets/share.js` 被下发 `immutable`（应为 `no-cache`），回访浏览器最长一年用旧副本 | `spa.go` 新增 `isContentHashed()` + `stableAssetFiles` 例外表，按**名字**而非目录判定 | `TestServesStableAssetUncached` + `TestStableAssetListMatchesBuild`；已**反证**（改回旧行为即红） |
+| ② | `/llms.txt` 教 agent「向用户索要密钥」 | `aidoc/html.go` 的 `LLMSTxt()` 改为指向自助申请端点 | `TestLLMSTxtDoesNotSendAgentsToTheUserForAKey` + 端点断言 |
+| ③ | `views.ContentSecurityPolicy` 死代码，真实 CSP 内联在 `router.go` | `router.go` 改为引用该常量（补 `views` import） | `router_test.go` 断言响应头**全串等于**常量 |
+| ④ | 仓库根 `public/` 是 CF 拓扑遗留（gitignore、无引用） | 已删除；其 `_headers` 里那条**正确的**缓存规则注释已抄进踩坑记录 | `README.md`「缓存」节改写为按名字分类 |
+
+> ① 的关键线索在 `public/_headers` 里：CF 时代**明确写过** `/assets/share.js` 必须
+> `no-cache` 并且警告「不要 optimize 成 immutable」。迁移到 Go 托管时被重新实现成
+> 目录级判断，规则丢了、陷阱重踩。已记
+> `pitfalls/cases/2026-10-10-share-js-cached-immutable-for-a-year.md`。
+>
+> **待办**：① 的修复只在源码里，**线上仍是旧二进制**（`1c5ab91`）。需要
+> `pnpm run build:release` + 上传重启后才生效 —— 部署前先问人类。
+
+## 2026-10-10 追加①：一次外部审计 + 发布了一份项目全景报告
+
+应项目所有者要求，从**线上平台自身**审计并发布了一份《Teleport 项目全景报告》
+（架构 / 功能 / 运作与使用）。发布走的是**自助密钥全流程**（申请 → 人类面板批准 →
+轮询领取 → `POST /api/reports`），即对 `decisions/2026-10-10-agent-self-service-keys.md`
+的一次真实端到端演练。
+
+- 报告分享链接（`expires_at = 0`，永不过期）：`/s/Du01mf3JsO9utq69xtKcBw`（**v2，含修复**；
+  v1 `/s/jOrlqf4gcF7lDUDrkUjxmg` 已撤销 —— 它的附录 B 把四条写成「未修」，与代码矛盾）
+- 发布用密钥：`dsh-lead-auditor`（30 天，非 root）
+- **本轮发现 1 处线上缺陷 + 3 处轻微漂移**，详见报告附录 B。**四条均已在同一轮修复**，
+  修复清单与守卫见上面的「追加②」；线上二进制尚未更新。
+
 ## Goal
 
 **Agent 自助申请密钥**：agent 自己申请 → 人类在网页批准 → 颁发**有时效 / 可续期 /

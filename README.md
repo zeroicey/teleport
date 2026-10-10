@@ -569,17 +569,24 @@ base-uri 'none'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-re
 - 分享页额外带严格 CSP（见上）
 - 静态资源与 API 走同一套中间件，不存在「一种资源有头、另一种没有」的空档
 
-**缓存**：由 `internal/spa` 按文件名形态决定，分两档：
+**缓存**：由 `internal/spa` 按**文件名形态**决定，分两档：
 
 | 路径 | 响应头 | 理由 |
 |---|---|---|
-| `/assets/*` | `public, max-age=31536000, immutable` | Vite 内容哈希命名，同一 URL 的字节**永不改变** |
+| `/assets/<name>-<hash>.js` | `public, max-age=31536000, immutable` | Vite 内容哈希命名，同一 URL 的字节**永不改变** |
+| `/assets/share.js` | `no-cache` | **例外**：`vite.config.ts` 把它固定成稳定路径（Go 硬编码引用），字节随部署变化 |
 | `index.html` | `no-cache` | 稳定文件名但内容随部署变化，必须每次复用校验 |
-| `/assets/share.js` | `no-cache` | 同上：Go 服务端渲染硬编码引用它，只能靠校验失效 |
+| 其它实体文件 | `no-cache` | 同上 |
 
 > `/assets/*` 用 `immutable` 是安全的，因为文件名里有内容哈希；但**前提是
 > `index.html` 与 `share.js` 保持 `no-cache`**——否则部署后客户端会拿着旧外壳
 > 去请求已被删除的哈希包。这两条是一体的，不能只改一半。
+>
+> ⚠️ **`share.js` 是 `/assets/` 下唯一的非哈希名**，因此判定必须看**名字**而不是目录：
+> 曾经把整个 `/assets/` 当作 `immutable`，导致回访浏览器最长一年执行旧的分享页 JS，
+> 且不报任何错。见 `.ai/pitfalls/cases/2026-10-10-share-js-cached-immutable-for-a-year.md`。
+> 例外清单在 `spa.go` 的 `stableAssetFiles`，由
+> `TestServesStableAssetUncached` 与 `TestStableAssetListMatchesBuild` 守着。
 
 ---
 
@@ -809,7 +816,7 @@ systemctl restart teleport && systemctl is-active teleport
 | `GET /` | 200（SPA 外壳，`text/html`，`Cache-Control: no-cache`） |
 | `GET /dashboard/reports` | 200（SPA 深链接回退，硬刷新后仍正常） |
 | `GET /assets/index-*.js` | 200（`Cache-Control: public, max-age=31536000, immutable`） |
-| `GET /assets/share.js` | 200（`Cache-Control: no-cache`） |
+| `GET /assets/share.js` | 200（`Cache-Control: no-cache`）—— ⚠️ **2026-10-10 复核时线上实际下发的是 `immutable`**：这一行当时是**错的**，代码已修（见「缓存」节），需重新部署后此行为才成立 |
 | `GET /assets/不存在.js` | 404（**不回退**成 HTML，避免误导性的 MIME 报错） |
 | `GET /api/health` | 200 `{"status":"ok","environment":"production"}` |
 | `POST /api/reports` 带令牌 | 201，返回分享链接 |
