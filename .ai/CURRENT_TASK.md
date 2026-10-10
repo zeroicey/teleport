@@ -1,226 +1,132 @@
 # Current task
 
-**Status:** ✅ 全部已部署上线 · **Updated:** 2026-10-11 · **线上版本:** `f609f8a`
+**Status:** ✅ 无未完成的改动 · 工作区干净 · **线上 `f609f8a`** · **Updated:** 2026-10-11
+**下一步：** 做 **HTML 渲染** —— 但**先问用户一句**澄清（见下）
 
-## 2026-10-11 追加④：报告的更新与删除 —— **已实现并部署（`f609f8a`）**
+> 本文件是**当前状态**，不是流水账。每一轮的完整叙事在
+> `.ai/sessions/*-handoff.md` 与 `.ai/decisions/`、`.ai/pitfalls/` 里。
 
-用户原话：「继续做报告更新删除这些操作吧」。
-裁决记录：`decisions/2026-10-11-report-update-and-delete.md`（含 D1–D6 与三条我自行拍板的设计）。
+---
 
-**关键认识：这不是新设计，是把 schema 里已经写下的意图接通。**
-- `reports.updated_at` + `trg_reports_touch_updated_at`（注释原文
-  "keep reports.updated_at honest without trusting the caller"）——
-  在一个"报告不可变"的模型里，这个列和这条触发器毫无意义。分享页也**早就**
-  渲染了「更新 / Updated」字段（只是它一直恒等于创建时间）。→ 更新本就是**原地**的。
-- `share_tokens.report_id ... ON DELETE CASCADE` —— 删报告就该连带删链接。
+## 下一步（唯一一件）
 
-| 交付 | 位置 |
-| --- | --- |
-| `PATCH`/`DELETE /api/reports/{id}`（agent，归属限定） | `api/router.go` |
-| `PATCH`/`DELETE /api/admin/reports/{id}`（面板 god-view） | 同上，共用 `applyReportPatch`/`applyReportDelete` |
-| `UpdateReport`（COALESCE 局部更新）/ `DeleteReport`（级联） | `store/queries.go` |
-| `domain.ReportPatch` + `Provided()` | `domain/types.go` |
-| `ParseUpdateReportInput`：未知字段 400 / 空 patch 400 | `validate/validate.go` |
-| 面板：编辑卡片 + 删除二次确认（点名链接会全失效） | `ReportDetailView.vue` |
-| 列表「已更新」标记 | `ReportsView.vue` + `api.ts` |
-| `/ai.md`、`/llms.txt`、`README.md` | 三处 |
+用户已定：「下一部分我们做 HTML 渲染」。开工前**必须先澄清指哪一件事**，
+两条路成本差一个量级：
 
-**设计要点（默认严格）**：未知字段 **400** 而不是静默忽略 —— 否则
-`{"Content": "..."}`（大写 C，最可能的笔误）会返回 200 而正文一个字没改，
-调用方会把假结论告诉用户。空 patch 也是 400（否则 `updated_at` 前移，
-分享页显示一次并不存在的更新）。`owner_key_id` **不可更新**（归属是安全边界）。
+| | A. 渲染 `format: "html"` 的报告 | B. 渲染增强（正文加 TOC/复制/打印） |
+| --- | --- | --- |
+| 主要成本 | 净化器 + nonce CSP，**与仓库硬约定冲突** | 纯前端 + CSS，无安全面变化 |
+| 建议 | 单独决策，先做 B | ✅ |
 
-**验证**：`pnpm run check` / `backend:vet` / `go test -race` 全绿；
-6 条守卫**逐条反证**过；真实二进制实测：同毫秒连续 4 次更新严格递增、
-同一条分享链接立刻展示新正文（且旧正文消失）、非归属者 PATCH/DELETE 双 404
-且内容未被改动、未知字段 400（`details.updatable` 列出白名单）、
-删除后 2 条 token → 0 且全库零孤儿、旧链接/读/改/再删/面板读全部 404。
+**要问的那句话**：「你要的是『能直接上报 HTML 并由分享页渲染』，
+还是『给现在的报告页加目录/复制按钮/打印样式』？」
 
-⚠️ **反证过程中发现并修掉一个真 bug**：`updated_at` 曾会**倒退到创建时间之前**
-（最多 999ms）。原因：`updated_at` 写成朴素 `now`，当它与已存值**同毫秒相等**时，
-`trg_reports_touch_updated_at` 的 `WHEN NEW.updated_at = OLD.updated_at` 成立，
-触发器用 `strftime('%s','now')*1000`（**截断到整秒**）覆盖，值可能落到创建之前。
-改为 `updated_at = MAX(?, updated_at + 1)`：严格递增 → 触发器永不触发，
-且时钟回拨也不会倒退。**它能藏住，是因为我原测试里有一句 `time.Sleep(3ms)`
-恰好排除了同毫秒这一被测条件**。详见
-`pitfalls/cases/2026-10-11-update-delete-and-the-dead-cascade.md`。
+完整调研（含 9 条已核实事实、起手命令、验收方式）见
+**`.ai/sessions/2026-10-11-report-update-delete-to-html-rendering-handoff.md`**。
 
-### 部署记录（2026-10-11，第二次）
+**最重要的前置发现**：`markdown/render.go:89` 已有 `parser.WithAutoHeadingID()`，
+但**对中文标题基本没用** —— 实测纯中文标题产出 `id="heading"` / `id="heading-N"`
+（序号随全文标题数漂移），线上真实报告产出 `id="0-"`、`id="21-"`、`id="teleport-"`。
+**做 TOC 必须自己生成稳定 slug，不能依赖 goldmark 默认 id。**
+
+---
+
+## 线上状态
 
 | 项 | 值 |
 | --- | --- |
-| 提交 | `f609f8a`（`main` 已推送 origin） |
+| 版本 | `f609f8a`（`frontend: embedded`） |
 | 二进制 sha256 | `092d871545726b09c171f36b46271e092c7dc35575939c50d96b078c2e263fde` |
-| 上一版（回滚用） | `teleport.prev-20261011-010239` |
-| 数据库备份 | `teleport.db.bak-20261011-010239`（integrity ok，3 reports / 4 tokens / 1 key） |
-| 无 schema 迁移 | 回滚只需换回二进制 |
+| 回滚二进制 | `/data/services/teleport/teleport.prev-20261011-010239` |
+| 数据库备份 | `/data/services/teleport/teleport.db.bak-20261011-010239` |
+| 库内容 | 3 reports / 4 share_tokens / 1 agent_key，`integrity_check` = ok |
 
-**线上实测**（用真实密钥，测完已把数据恢复原状）：
+部署流程见 `.ai/runbooks/deploy-teleport.md`（含 4.1 缓存头三连查、4.2 **停服后**再拷数据库）。
+**注意「线上 version ≠ main HEAD」是正常的**：部署后只改文档/记忆库的提交不必重发二进制；
+但只要改了 Go 或 `web/src/`，**必须** `pnpm run build:release` 并重新部署（前端 `//go:embed` 进二进制）。
 
-- 原地更新：连续 3 次 PATCH，`updated_at` 每次都严格大于 `created_at`；
-  **同一条分享链接立刻展示新正文且旧正文消失**（200，不是 404，也不是新链接）。
-- 严格校验：未知字段 `Content` → 400 且 `details.updatable` 列出白名单；
-  `owner_key_id` → 400；空 patch → 400；错动词 PUT → 404；
-  **被拒后正文一字未改**。
-- 归属隔离：动 root 发布的报告（`owner_key_id=''`）→ PATCH/DELETE 双 404，
-  报告仍在且标题未变。
-- 删除级联：删除前 `reports=1 / share_tokens=1` → 删除后**两者都是 0**，
-  全库**零孤儿 token**；旧链接、读、改、再删全部 404；列表回到 2 篇。
-- 部署前后数据库计数完全一致（3 / 4 / 1），`integrity_check` = ok，日志 0 条 error。
-- 线上产物确认含新 UI：`ReportDetailView-2GGomxV1.js`（视图是懒加载 chunk，
-  不在入口 `index-*.js` 里 —— 查产物时别只看入口）。
+---
 
-## 2026-10-10 追加③：密钥过期后的身份连续性 —— **已实现并部署（`711f194`）**
+## 已交付（全部已部署并线上实测）
 
-用户裁决（见 `decisions/2026-10-10-agent-key-identity-across-expiry.md`，已 ACCEPTED）：
+| 轮次 | 内容 | 提交 |
+| --- | --- | --- |
+| 追加① | `/assets/share.js` 缓存按**文件名形态**判定（原被下发 `immutable`，回访浏览器最长一年用旧副本） | `e5bca8e` |
+| 追加② | `/llms.txt` 改指自助申请端点；CSP 常量去重 | `dbdc434` |
+| 追加② | 记忆库 + README 同步，删除 CF 遗留 `public/` | `b509960` |
+| 追加③ | **密钥过期后 90 天宽限续签**：过期密钥**只能**调续期端点；续期不换 `key_id` 故归属连续；`GET /api/reports` 列出自己的报告；过期可见性响应头 | `0c33125` `711f194` |
+| 追加④ | **报告原地更新与删除**：`PATCH`/`DELETE /api/reports/{id}`（agent 归属限定）与 `/api/admin/reports/{id}`（面板）；未知字段/空 patch 一律 400 | `1917768` `f609f8a` |
 
-> 行，那就按你推荐的 A 方案做……1. 可以给过期的宽限续签，期限是 90 天。
-> 2. 如果再过 90 天，就由我们手动去审批这个 Agent 密钥。4. 如果不批准的话，就保持死亡状态。
-
-| 交付 | 位置 |
-| --- | --- |
-| `KEY_RENEWAL_GRACE`（默认 `2160h`，`0` 关闭） | `config`（新增 `envDurationAllowZero`，因为 0 在这里有意义） |
-| `ResolveAgentKeyWithinGrace`；`ResolveAgentKey` 退化为 `grace=0` | `store/keys.go` |
-| `RequireAgentAllowExpired`（**仅**续期一条路由） | `httpx/auth.go` + `api/router.go` |
-| 过期可见性头 `X-Teleport-Key-Expires-At` / `-Expired` | `httpx/auth.go` |
-| `GET /api/reports`（列自己发的，root 见全部） | `api/router.go` + `store/queries.go` |
-| 面板列表补 `owner_key_id` + `owner_name`（含前端「发布者」列） | `api/router.go` + `ReportsView.vue` |
-| 密钥面板标注「仍可申请续期」 | `KeyManagementView.vue` |
-| `/ai.md`、`/llms.txt`、`README.md` 同步新语义 | 三处 |
-
-**设计要点：默认严格，例外选择性开启。** 漏维护的后果是「续期用不了」（可见 401），
-而不是「过期密钥全权可用」（静默越权）。撤销优先于宽限；被拒请求不携带任何寿命头。
-
-**验证**：`pnpm run check` / `backend:vet` / `go test -race` 全绿；
-7 条新测试**逐条反证**过（详见 `pitfalls/cases/2026-10-10-renewal-unreachable-after-expiry.md`）；
-并用真实二进制实测：过期后只有续期返回 201（其余 5 个端点 401）、批准后同 token 同 key id
-恢复且**过期前发的报告仍可读**、超出 90 天彻底死亡、已撤销即使在宽限期内也 401、
-owner 隔离（A 看不到 B 的、也看不到 root 的）。
-
-**已随同部署**（`711f194`）。上线后用**默认配置**（`teleport.env` 里没有 `KEY_RENEWAL_GRACE`，
-即走 2160h 默认值）实测：过期后只有续期返回 **201**，`/me`、`GET/POST /api/reports` 全 **401**，
-被拒请求泄漏 `X-Teleport-Key-Expired` 计数为 **0**，续期响应 `key_expired: true`。
-测试用的那把密钥已精确恢复（`expires_at=1794234390015`、`revoked_at=0`），
-测试产生的 pending 续期单已删除，`PRAGMA integrity_check` = ok。
-
-## 2026-10-10 追加②：审计发现的四条已**全部修复并部署**（`711f194`）
-
-`pnpm run check` + `pnpm run backend:vet` + `go test ./... -race -count=1` 全绿。
+**审计四条**（追加②，全部已部署，守卫名在代码里）：
 
 | # | 问题 | 修复 | 守卫 |
 | --- | --- | --- | --- |
-| ① | `/assets/share.js` 被下发 `immutable`（应为 `no-cache`），回访浏览器最长一年用旧副本 | `spa.go` 新增 `isContentHashed()` + `stableAssetFiles` 例外表，按**名字**而非目录判定 | `TestServesStableAssetUncached` + `TestStableAssetListMatchesBuild`；已**反证**（改回旧行为即红） |
-| ② | `/llms.txt` 教 agent「向用户索要密钥」 | `aidoc/html.go` 的 `LLMSTxt()` 改为指向自助申请端点 | `TestLLMSTxtDoesNotSendAgentsToTheUserForAKey` + 端点断言 |
-| ③ | `views.ContentSecurityPolicy` 死代码，真实 CSP 内联在 `router.go` | `router.go` 改为引用该常量（补 `views` import） | `router_test.go` 断言响应头**全串等于**常量 |
-| ④ | 仓库根 `public/` 是 CF 拓扑遗留（gitignore、无引用） | 已删除；其 `_headers` 里那条**正确的**缓存规则注释已抄进踩坑记录 | `README.md`「缓存」节改写为按名字分类 |
+| ① | `/assets/share.js` 被下发 `immutable`，回访浏览器最长一年用旧副本 | `spa.go` 新增 `isContentHashed()`，按**名字形态**而非目录判定；`stableAssetFiles` 退化为断言目标 | `TestServesStableAssetUncached`、`TestStableAssetListMatchesBuild` |
+| ② | `/llms.txt` 教 agent「向用户索要密钥」 | `aidoc/html.go` 的 `LLMSTxt()` 改指自助申请端点 | `TestLLMSTxtDoesNotSendAgentsToTheUserForAKey` |
+| ③ | `views.ContentSecurityPolicy` 是死代码，真实 CSP 内联在 `router.go` | `router.go` 改为引用该常量 | `router_test.go` 断言响应头**全串等于**常量 |
+| ④ | 仓库根 `public/` 是 CF 拓扑遗留（无引用） | 已删除 | `README.md`「缓存」节改写为按名字分类 |
 
-> ① 的关键线索在 `public/_headers` 里：CF 时代**明确写过** `/assets/share.js` 必须
-> `no-cache` 并且警告「不要 optimize 成 immutable」。迁移到 Go 托管时被重新实现成
-> 目录级判断，规则丢了、陷阱重踩。已记
-> `pitfalls/cases/2026-10-10-share-js-cached-immutable-for-a-year.md`。
->
-> **已于 2026-10-11 部署**（`711f194`，sha256 `df92af2e…`）。线上实测：
-> `/assets/share.js` → `no-cache`（此前是 `immutable`，线上缺陷已消除）、
-> 哈希资源仍 `immutable`、`/llms.txt` 的 "ask the user" 计数为 0。
+关键决策：`decisions/2026-10-10-agent-key-identity-across-expiry.md`、
+`decisions/2026-10-11-report-update-and-delete.md`。
+踩坑记录：`pitfalls/cases/2026-10-10-renewal-unreachable-after-expiry.md`、
+`pitfalls/cases/2026-10-11-update-delete-and-the-dead-cascade.md`、
+`pitfalls/cases/2026-10-10-share-js-cached-immutable-for-a-year.md`。
 
-## 2026-10-10 追加①：一次外部审计 + 发布了一份项目全景报告
+---
 
-应项目所有者要求，从**线上平台自身**审计并发布了一份《Teleport 项目全景报告》
-（架构 / 功能 / 运作与使用）。发布走的是**自助密钥全流程**（申请 → 人类面板批准 →
-轮询领取 → `POST /api/reports`），即对 `decisions/2026-10-10-agent-self-service-keys.md`
-的一次真实端到端演练。
+## 未做（按价值排序，都还没开工）
 
-- 报告分享链接（`expires_at = 0`，永不过期）：`/s/Du01mf3JsO9utq69xtKcBw`（**v2，含修复**；
-  v1 `/s/jOrlqf4gcF7lDUDrkUjxmg` 已撤销 —— 它的附录 B 把四条写成「未修」，与代码矛盾）
-- 发布用密钥：`dsh-lead-auditor`（30 天，非 root）
-- **本轮发现 1 处线上缺陷 + 3 处轻微漂移**，详见报告附录 B。**四条均已在同一轮修复**，
-  修复清单与守卫见上面的「追加②」；线上二进制尚未更新。
+1. **HTML 渲染** —— 见上，下一轮主题
+2. **轮换 admin 口令**：线上仍是部署时生成的随机值，从未轮换过（运维动作，不是代码）
+3. **密码保护分享链接**（链接语义要定：验证失败是 404 还是 401，未裁决）
+4. **面板批量拒绝**密钥申请（`KEY_MAX_PENDING=50` 是唯一兜底，
+   50 个申请即可堵住公开入口最长 24h；续期端点无独立限流，批量拒绝是缓解手段）
+5. **登录限流**：`POST /api/admin/login` 无限流，PBKDF2 600000 轮在 2 vCPU 上是 CPU 耗尽面
+6. **SQLite 定时备份**（目前只有部署前的手工备份）；`CleanupExpired` 未排期
+7. **`SESSION_SECRET` 轮换与 agent 密钥的耦合**（轮换是否会让所有密钥失效？**未验证**）
 
-## Goal
+**需要向使用者交代的契约行为**：具名密钥**读不到**迁移前 root 发布的报告
+（`owner_key_id=''`，只有 root 与面板可见）。这是默认拒绝的正确方向，不是 bug。
 
-**Agent 自助申请密钥**：agent 自己申请 → 人类在网页批准 → 颁发**有时效 / 可续期 /
-可不过期**的密钥，配一个统一管理面板。用户四条绑定裁决（见
-`decisions/2026-10-10-agent-self-service-keys.md`）：只存哈希（实为**派生**，明文从不落盘）、
-续期也要人类批准、申请入口完全开放 + 限流、作用域为**归属模型**。
+---
 
-## 已上线
+## 长期约束（改动前必须知道）
 
-线上 `1c5ab91`（2026-10-10 03:52），`api.hcyj.xyz/yeciorez/teleport`，迁移 `0002` 已应用。
-三个提交都已推送，工作区干净。
-
-- `8bdc231` 特性 + 修两个生产可利用的认证绕过
-- `063c5e6` 修独立审计发现的 8 处缺陷
-- `1c5ab91` 修限流桶键塌缩（部署验收时抓到，审计未覆盖）
-
-**大陆观测点验证**：hcyj 本机（阿里云广州 8.148.233.134）、`bjbuwe`（广东电信
-121.9.113.26）、`koma`（腾讯云 124.221.144.97）—— 旧页面/分享页/`/ai.md` 全 200、
-`/api/nope` 仍 JSON 404、伪造 `Cf-Access-…` 头 401、三个 IP **各自分桶**且
-`requester_ip` 记录真实 IP。
-
-## 关键设计（勿改）
-
+- **原始 HTML 不渲染**：goldmark 不加 `WithUnsafe`，`views.HTMLMountEnabled` 保持 `false`。
+  开启前必须先上净化器 + nonce CSP。**有一条既存绊线**：
+  `aidoc/aidoc_test.go:135` 断言 guide 的说法与 flag 一致，开启时必须在同一次改动里改 guide。
+- **`pnpm` only**；前缀只写一处（`ROUTE_PREFIX`）；Caddy 必须用 `handle` 不是 `handle_path`。
+- **时间一律 epoch 毫秒**，`expires_at = 0` = 永不过期。
+- **链接语义不许改**：未知 token 与已吊销都 **404**，仅过期 **410**。
+- **响应封套不许改**：`{ok,data,requestId}`；请求体 camelCase、响应 snake_case
+  （**这是最常见的 agent 错误**，所以 `PATCH` 对未知字段直接 400）。
+- **归属是安全边界**：非归属者的读/改/删/撤销都是 **404 而不是 403**，
+  且判定必须发生在**任何写入之前**。`owner_key_id` 永远不可更新。
+- **默认严格，例外选择性开启**：漏维护时应落在「功能不可用」（可见的 401/400），
+  绝不落在「权限静默放宽」。
+- **限流桶键必须用 `httpx.ClientIP`，绝不用 `RealIP`**（`RealIP` 可被请求头伪造）。
 - **密钥是派生的，不是暂存的**：`token = base64url(HMAC(K_derive, "teleport/agent-key/v1|appID|claimSecret"))`，
-  `K_derive = HMAC(SessionSecret, "teleport/derive/agent-key/v1")`。服务端只存 `sha256(token)`。
-  因为推导需要 `claimSecret`，**密钥在「领取」时才存在** —— 批准只停放 `approved_*` 元数据。
-  **一把密钥的寿命从 agent 拿到它开始，不是从人类点批准开始。**
-- **归属即权限**：`reports.owner_key_id`；非归属的读/撤销一律 **404**（不是 403）。
-  `AGENT_SECRET_KEY` 降级为 root/应急，其报告 `owner_key_id=''`。
+  `K_derive = HMAC(SessionSecret, "teleport/derive/agent-key/v1")`，服务端只存 `sha256(token)`。
+  推导需要 `claimSecret`，所以**密钥在「领取」时才存在** ——
+  **一把密钥的寿命从 agent 拿到它开始，不是从人类点批准开始**。
 - **续期只延长、绝不缩短**：`max(当前到期, now) + 批准时长`；`expires_at=0`（无界）保持 0。
-- **「永不过期」只能由人类显式给出**：批准端字段缺省 → 24h；显式 `0` 才是永久。
-- **限流桶键必须用 `httpx.ClientIP`**，绝不用 `RealIP`。
-- 时间一律 epoch **毫秒**；`expires_at=0` 表示无界（**不是"1970 年就过期了"**）。
-- 请求体 **camelCase**，响应字段 **snake_case**。
+  **「永不过期」只能由人类显式给出**：批准端字段缺省 → 24h；显式 `0` 才是永久。
+- 密钥永不入库；`git commit`/`push`/部署前先问人类（本会话已获授权，继续沿用）。
+- 不要提交 `bin/`、`backend/data/`、`backend/internal/webui/dist/`。
 
-## 上线后仍未处理（建议按序）
+## 验收要点
 
-1. **轮换 admin 口令**（仍是部署时的随机值）。
-2. **面板缺批量拒绝**：`KEY_MAX_PENDING=50` 是唯一兜底，50 个申请即可堵住公开入口最长 24h。
-3. **`POST /api/admin/login` 无限流**：PBKDF2 600000 轮在 2 vCPU 上是 CPU 耗尽面。
-4. 具名密钥**读不到迁移前 root 发布的报告**（`owner_key_id=''`）：契约默认行为，需向使用者交代。
-5. `CleanupExpired` 未排期；无删除报告 API；无 SQLite 自动备份。
-6. 已判定**接受**的：`requestId` 反射客户端头（有意，已净化+限长）、
-   `TrustCFAccess` 用包级变量而非 `atomic.Bool`（无运行期写入路径，改 atomic 反而暗示可变）、
-   root 密钥长度时序（实测 z=+0.30 低于噪声）。
+- **必须从大陆观测点验证**：境外观测点无法检测大陆封锁。
+  已知可用观测点：hcyj 本机（阿里云广州 `8.148.233.134`）、
+  `bjbuwe`（广东电信 `121.9.113.26`）、`koma`（腾讯云 `124.221.144.97`）——
+  三者在 `.ai/pitfalls/cases/2026-10-10-rate-limit-collapsed-to-one-bucket.md` 里有完整记录。
+- **涉及前端改动时必须用真实 Chromium 打开分享页核对**（类型检查通过 ≠ 界面能看）。
 
-## Pitfall reminders（本轮新增 3 条，都值得复读）
+## 反复踩到的坑（详见 `.ai/pitfalls/cases/`）
 
-- **`2026-10-10-trusted-request-header-grants-authority.md`** — 同一类错误出现两次：
-  `Cf-Access-…` 头 = 无条件管理员；`RealIP` 被当安全边界。含**元教训**：
-  写安全**理由**前先打开那个组件的配置文件（我曾把 Caddy 的**覆盖**写成"追加"）。
-- **`2026-10-10-rate-limit-collapsed-to-one-bucket.md`** — 模拟外部组件时用了它**不会产生**的
-  格式（Caddy `{remote}` 是 `host:port`，测试却用裸 IP）。反直觉后果：**跳过不可解析项**
-  一旦丢掉真实条目，遍历会继续向左并**采信攻击者伪造的值** → 同一 bug 同时表现为
-  过度限制**与**可绕过。另含：`sed -i` 换 inode 会**静默**弄断 docker 单文件 bind mount。
-- **`2026-10-10-leak-assertion-matches-own-fixture.md`** — 「输出不含 X」的断言被自己的
-  测试夹具打红；更危险的是**假绿**。
-- **`2026-10-10-schema-guard-hardcoded-single-migration.md`** — 用硬编码数量表达"全部"的守卫。
-- **太弱的并发测试会掩盖竞态**：`maxPending` 太小 → 多数 goroutine 在 COUNT 就退出，
-  从不尝试写升级 → `BUSY_SNAPSHOT` 测不出来。要构造"全部走到写路径"的配置。
-- **契约示例字段名属于规范**：响应示例写成 camelCase、实现返回 snake_case → 文档让 agent 静默失败。
-- 其余：`public-doc-disclosed-secret-file-path`、`spa-fallback-swallows-api-404`、
-  `env-file-dollar-expansion`、`goldmark-setrenderer-drops-extensions`。
-- **`.ai/` 是共享可写面**：写前先读。
-
-## Next action
-
-无阻塞。若要继续：轮换 admin 口令 → 给登录端点加限流 → 面板加批量拒绝。
-
-## 2026-10-11 部署记录
-
-| 项 | 值 |
-| --- | --- |
-| 提交 | `711f194`（`main` 已推送 origin，`b9f93d7..711f194`） |
-| 二进制 sha256 | `df92af2e45646b3cd4c977b3c4dd1eb9688fd561f366be73d51b33e40a2dcc12` |
-| 上一版（回滚用） | `/data/services/teleport/teleport.prev-20261011-002450` |
-| 数据库备份 | `/data/services/teleport/teleport.db.bak-20261011-002450`（integrity ok） |
-| 本次无 schema 迁移 | 回滚只需换回二进制 |
-
-**注意「线上 version ≠ main HEAD」是正常的**：部署后若再提交只改文档/记忆库的 commit，
-二进制不必重发，`/data/services/teleport/teleport version` 就会停在构建时的那个提交。
-判断"线上是不是最新的"要看**行为**（`pnpm run check` + 4.1 的缓存头）而不是 commit 号。
-**但只要改了 Go 或 `web/src/`，就必须重新 `build:release` 并部署** —— 前端产物是
-`//go:embed` 进二进制的，不部署等于没改。
-
-停机窗口约 2 秒（停服 → 一致性拷贝 db → `mv` 换二进制 → 启动）。
-**先停服再拷 db**：WAL 模式下热拷 `.db` 可能拿到不一致快照（该机无 sqlite3 CLI，用 python3）。
-已把这两条写进 `runbooks/deploy-teleport.md`（4.1 缓存头 / 4.2 数据库备份）。
+- **「代码写了」≠「代码生效了」**：触发器可能永不触发、外键可能从未强制、
+  测试可能被无关规则挡住。这三件事都不报错，只让行为与声明悄悄分叉。
+  每加一条声明式机制都要有**直接读底层状态**的守卫。
+- **为了让断言稳定而加的 `time.Sleep`，常常是在移除被测条件**（曾因此漏掉一个真 bug）。
+- **否定型断言必须排除「因为别的原因也返回同样的码」**（曾写出一个空测试）。
+- **查前端产物别只看入口 chunk**：面板视图是懒加载的独立 chunk。
