@@ -72,7 +72,7 @@ export TELEPORT_BASE='{{APP_BASE}}'
 | 形式 | 一个不透明的字符串（服务端保证 256 位熵） |
 | 获取方式 | **自助申请**：`POST /api/agent-keys/applications` → 轮询 → 一次性领取 `key.token` |
 | 传递方式 | 通过 `Authorization: Bearer <AGENT_KEY>` 请求头发送 |
-| 适用接口 | `POST /api/reports` · `GET /api/reports/{id}` · `POST /api/share/{token}/revoke` · `GET /api/agent-keys/me` · `POST /api/agent-keys/renewals` |
+| 适用接口 | `POST /api/reports` · `GET /api/reports`（列自己的）· `GET /api/reports/{id}` · `POST /api/share/{token}/revoke` · `GET /api/agent-keys/me` · `POST /api/agent-keys/renewals` |
 | 不适用 | `/api/admin/*`（那是浏览器会话 Cookie 的地盘） |
 
 ### 2.1 端点一览
@@ -84,8 +84,9 @@ export TELEPORT_BASE='{{APP_BASE}}'
 | 1 | `POST` | `{P}/api/agent-keys/applications` | 无（公开，限流） | 提交密钥申请，成功 `201` |
 | 2 | `GET` | `{P}/api/agent-keys/applications/{id}` | 头 `X-Teleport-Claim: <claim_secret>` | 轮询状态；批准后**一次性**领取 `key.token` |
 | 3 | `GET` | `{P}/api/agent-keys/me` | `Authorization: Bearer` | 查自身状态、有效期、用量 |
-| 4 | `POST` | `{P}/api/agent-keys/renewals` | `Authorization: Bearer` | 发起续期（**需人类批准**），成功 `201` |
-| 5 | `GET` | `{P}/api/agent-keys/renewals/{id}` | 头 `X-Teleport-Claim: <claim_secret>` | 轮询续期结果 |
+| 4 | `GET` | `{P}/api/reports` | `Authorization: Bearer` | **列出你自己发布的报告**（见 2.5.1） |
+| 5 | `POST` | `{P}/api/agent-keys/renewals` | `Authorization: Bearer` | 发起续期（**需人类批准**），成功 `201` |
+| 6 | `GET` | `{P}/api/agent-keys/renewals/{id}` | 头 `X-Teleport-Claim: <claim_secret>` | 轮询续期结果 |
 
 > ⚠️ **字段命名约定（最容易踩的一条）**：**请求体字段一律 camelCase**
 > （`label`、`purpose`、`requestedHours`、`expiresInHours`），
@@ -293,9 +294,13 @@ curl -sS "$TELEPORT_BASE/api/agent-keys/me" \
   —— 读到 `0` 请一律理解成「永不」，不要对它做减法或当成异常值。
 - `root`：正常 agent 密钥恒为 `false`。如果你用 `AGENT_SECRET_KEY`（root / 应急密钥）
   调这个接口，会得到 `"root": true` —— 那是运维凭据，你没有也不需要它。
-- 一旦密钥**已过期或被撤销**，所有请求（含 `/me`）都会变成 **401**。
-  已撤销的密钥只能重新申请；已过期的密钥若在过期前提交过续期，仍可能被批准后恢复
-  （见下面的「关键规矩」）。
+- **每次响应都会带两个头告诉你自己的寿命**，不必反复轮询 `/me`：
+  - `X-Teleport-Key-Expires-At`：到期时间的 **Unix 秒**（不是毫秒）。**密钥永不过期时该头不出现**
+    —— 「不出现」= 没有截止日期，不要理解成「未知」。
+  - `X-Teleport-Key-Expired: true`：**只在你已经过期、但仍在宽限期内**时出现。
+    它意味着你现在只剩一个能用的接口：发起续期。
+- 一旦密钥**已过期或被撤销**，`/me` 都会变成 **401**（`/me` 只服务有效密钥）。
+  已撤销的密钥只能重新申请；**已过期的密钥在宽限期内仍可提交续期**（见下面的「关键规矩」）。
 
 **发起续期**（成功返回 **201**）：
 
@@ -353,10 +358,48 @@ granted_expires_at = max(当前 expires_at, 批准时刻) + 批准时长
   - 在密钥**过期前**提交的续期，即使审批拖到密钥已经过期之后才批准，**仍然生效** ——
     密钥会恢复可用（新的 `expires_at` 从批准时刻起算并叠加）。这也是「提前数天发起」
     依然重要的原因：卡点提交不会白费，只要**提交那一刻**密钥还没过期。
-  - 密钥**一旦过期**，你就**无法再新提交**续期：`/me` 与 `POST /api/agent-keys/renewals`
-    都会返回 **401**（Bearer 已失效）。此时只能重新走申请流程（第 2.2 节）。
+  - 密钥**一旦过期**，`/me` 会返回 **401**，但 **`POST /api/agent-keys/renewals` 仍可用**：
+    服务端给你一个 **90 天宽限期**（`KEY_RENEWAL_GRACE`，运维可调；设为 `0` 即关闭）。
+    这 90 天里你唯一能做的就是**发起续期申请** —— 读报告、发报告、撤销链接全部 401。
+    这是刻意的：过期密钥只能「求人给更多时间」，不能继续干活。
+    宽限期的意义是**不让你因为一次疏忽就丢掉自己发布的全部历史报告**：续期不换
+    `key.id`，归属因此保持不变；重新申请则会拿到一个新 `key.id`，你就再也读不到旧报告了。
+  - 宽限期也过去之后，该密钥彻底失效，只能重新走申请流程（第 2.2 节）——
+    此时旧报告对你而言已经永久失去，请务必提前续期。
   - 已**撤销**的密钥**永远不会**被续期复活：批准针对它的续期会返回 **404**
     （服务端把已撤销的密钥当作不存在）。撤销是人类的最终决定，不要试图绕过。
+
+### 2.5.1 列出你自己发布的报告（`GET /api/reports`）
+
+```bash
+curl -sS "$TELEPORT_BASE/api/reports?limit=50" \
+  -H "Authorization: Bearer $TELEPORT_KEY"
+```
+
+返回 `data`，一个**数组**（不是对象），按 `created_at` 倒序，每项与
+`GET /api/reports/{id}` 同形但**不含 `content`**，额外带一个 `owner_key_id`：
+
+```json
+[
+  {
+    "id": "<报告 id>",
+    "title": "...",
+    "category": "general",
+    "format": "markdown",
+    "metadata": {},
+    "created_at": 1791563326606,
+    "updated_at": 1791563326606,
+    "owner_key_id": "<你自己的密钥 id>"
+  }
+]
+```
+
+- **这是唯一能找回你自己报告 id 的方式。** 读别人的 id 一律 404，所以
+  「不记得 id」等于「这条记录对你永久消失」—— 请把重要报告的 id 记下来，或随时用这个接口重建清单。
+- 只返回**你发布的**。用 root 凭据调用时返回**全部**（root 本来就能读所有报告）。
+  由 root 发布的报告 `owner_key_id` 是空字符串 `""`，**具名密钥看不到它们**。
+- 支持的查询参数：`limit`（1–200，默认 50）、`offset`（默认 0）、`category`（精确匹配）。
+- 尚无报告时返回**空数组 `[]`**，不是 `null`，可以直接迭代。
 
 ### 2.6 权限边界：你只能管你自己发布的报告
 
@@ -369,6 +412,8 @@ granted_expires_at = max(当前 expires_at, 批准时刻) + 批准时长
   是同一套语义。**不要把 404 当成故障，也不要拿它去探测别人有哪些报告。**
 - 你的密钥发布报告**不受归属限制**（可以发任意多篇）；归属约束的是读与撤销，
   以及别人的报告对你不可见。
+- 你可以用 `GET /api/reports` **列出自己的全部报告**（见 2.5.1）。这是「管理自己的文章」
+  所需要的全部能力：要改内容就重发一篇并撤销旧分享链接。
 - `AGENT_SECRET_KEY`（root / 应急密钥）能读全部报告，那是运维的凭据，你没有也不需要它。
 - `/api/admin/*` 全部走人类的 Session Cookie，你的 Bearer 密钥在这里无效；
   反过来面板的 Session Cookie 也不能调 `/api/reports`。

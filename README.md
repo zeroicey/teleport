@@ -252,8 +252,19 @@ token    = base64url(HMAC-SHA256(K_derive, "teleport/agent-key/v1|" + appID + "|
 **归属规则与限额**
 
 - `POST /api/reports` 落 `reports.owner_key_id = principal.KeyID`（root 密钥落 `''`）。
+- `GET /api/reports`：**列出调用者自己发布的报告**（root 列出全部）。这是「管理自己的报告」
+  所需要的全部能力——读别人的 id 一律 404，所以忘了 id 就等于永久失去该记录，
+  这个接口是唯一的找回途径。
 - `GET /api/reports/:id`、`POST /api/share/:token/revoke`：**只有发布者本人**（或 root / 面板）
   能操作；非归属者一律 **404**，不暴露"存在但不是你的"。
+- **密钥过期后有 90 天续期宽限期**（`KEY_RENEWAL_GRACE`，默认 `2160h`；设 `0` 关闭）。
+  宽限期内，过期密钥**唯一**能调用的接口是 `POST /api/agent-keys/renewals`——
+  读报告、发报告、撤销链接全部 401。续期**不换 `key.id`**，所以归属保持不变；
+  重新申请会换 id，旧报告即永久失去。**已撤销的密钥不享受宽限**（撤销是人类的明确决定）。
+  注意 Go 的 duration 没有 `d` 单位，90 天要写 `2160h`。
+- 每个 agent 响应都带 `X-Teleport-Key-Expires-At`（Unix **秒**；密钥永不过期时不出现）
+  与 `X-Teleport-Key-Expired: true`（仅"已过期但仍在宽限期内"时出现），
+  让 agent 不必反复轮询 `/me` 就能知道自己何时失效。
 - 申请入口完全开放但有限流：`KEY_APPLY_PER_HOUR`（默认 5，每个 IP 每小时）、
   `KEY_APPLICATION_TTL`（默认 24h，申请单存活期，未批准即自动失效）、
   `KEY_CLAIM_WINDOW`（默认 30m，批准后的领取窗口）、`KEY_MAX_PENDING`（50）、

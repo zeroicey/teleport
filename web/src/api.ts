@@ -77,6 +77,16 @@ export interface ReportSummary {
   metadata: Record<string, unknown>;
   created_at: number;
   updated_at: number;
+  /**
+   * The agent_keys.id that published this report, or '' for the root
+   * (break-glass) credential and for rows that predate ownership.
+   *
+   * Only the dashboard list carries this: the agent-facing list omits it because
+   * every row there is already the caller's own.
+   */
+  owner_key_id?: string;
+  /** Human label for `owner_key_id`, resolved server-side. */
+  owner_name?: string;
 }
 
 export interface ReportDetail extends ReportSummary {

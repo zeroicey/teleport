@@ -400,18 +400,45 @@ func scanKey(row interface{ Scan(...any) error }) (*domain.AgentKey, error) {
 //
 // Expiry and revocation are filtered in SQL so an unusable key is simply absent
 // — the caller cannot accidentally treat a revoked key as valid.
+//
+// "Live" is strict: a key past its expiry does not resolve. Callers that must
+// tolerate an expired key — the renewal path, so an agent which let its key
+// lapse can still ask a human for more time — use ResolveAgentKeyWithinGrace.
 func (s *Store) ResolveAgentKey(tokenHash string, nowMS int64) (*domain.AgentKey, error) {
+	k, _, err := s.ResolveAgentKeyWithinGrace(tokenHash, nowMS, 0)
+	return k, err
+}
+
+// ResolveAgentKeyWithinGrace finds a key by token hash, tolerating one that is
+// past its expiry by up to graceMS milliseconds.
+//
+// The second return value reports whether the row matched *only* because of the
+// grace window, i.e. the key is genuinely expired and must not be treated as a
+// usable credential. It is always false when graceMS is 0.
+//
+// Revocation is never tolerated at any grace: revoked_at != 0 means a human
+// deliberately killed the key, and forgetting to renew is not the same act as
+// being told to stop. An unknown, revoked or beyond-grace key yields nil — the
+// three stay indistinguishable, which is what the auth middleware promises.
+//
+// The comparison is `expires_at > nowMS - graceMS` rather than
+// `expires_at + graceMS > nowMS` so that adding two millisecond values can never
+// overflow. expires_at is bounded at write time (see expiryFrom) and the config
+// validator bounds grace, so the subtraction cannot underflow either.
+func (s *Store) ResolveAgentKeyWithinGrace(tokenHash string, nowMS, graceMS int64) (*domain.AgentKey, bool, error) {
 	k, err := scanKey(s.db.QueryRow(
 		`SELECT `+keyColumns+` FROM agent_keys
-		  WHERE token_hash = ? AND revoked_at = 0 AND (expires_at = 0 OR expires_at > ?)`,
-		tokenHash, nowMS))
+		  WHERE token_hash = ? AND revoked_at = 0
+		    AND (expires_at = 0 OR expires_at > ?)`,
+		tokenHash, nowMS-graceMS))
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("resolve agent key: %w", err)
+		return nil, false, fmt.Errorf("resolve agent key: %w", err)
 	}
-	return k, nil
+	expired := k.ExpiresAt != 0 && k.ExpiresAt <= nowMS
+	return k, expired, nil
 }
 
 // TouchAgentKey records use of a key.

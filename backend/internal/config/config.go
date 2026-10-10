@@ -101,6 +101,17 @@ type Config struct {
 	// KeyMaxActive caps live credentials, so a compromised approver or a runaway
 	// agent cannot mint unbounded keys.
 	KeyMaxActive int
+	// KeyRenewalGrace is how long past its expiry a key may still be presented
+	// to ask for a renewal.
+	//
+	// Expiry used to be unrecoverable by the agent itself: the renewal request
+	// needs the key to authenticate, so a key that lapsed without a pending
+	// request could never be renewed, and re-applying mints a *new* key id —
+	// orphaning every report the old one had published, since ownership is
+	// compared by key id. The grace window closes that: an expired key can still
+	// file the request, and a human still has to approve it. Zero disables the
+	// window entirely, restoring the old behaviour.
+	KeyRenewalGrace time.Duration
 }
 
 // Load builds a Config from the environment, after optionally loading a .env
@@ -190,6 +201,9 @@ func Load() (*Config, error) {
 	if cfg.KeyMaxActive, err = envInt("KEY_MAX_ACTIVE", 100); err != nil {
 		return nil, err
 	}
+	if cfg.KeyRenewalGrace, err = envDurationAllowZero("KEY_RENEWAL_GRACE", 90*24*time.Hour); err != nil {
+		return nil, err
+	}
 	// A zero or negative limit would reject every request, which reads as a
 	// broken deployment rather than a strict one. Reject it at startup instead.
 	if cfg.KeyApplyPerHour <= 0 {
@@ -206,6 +220,17 @@ func Load() (*Config, error) {
 	}
 	if cfg.KeyClaimWindow <= 0 {
 		return nil, fmt.Errorf("KEY_CLAIM_WINDOW must be positive (got %s)", cfg.KeyClaimWindow)
+	}
+	// Zero is meaningful here — it turns the grace window off and restores strict
+	// expiry — so it is accepted, unlike the other KEY_* durations. A negative
+	// value would silently widen the window instead of closing it.
+	if cfg.KeyRenewalGrace < 0 {
+		return nil, fmt.Errorf("KEY_RENEWAL_GRACE must not be negative (got %s)", cfg.KeyRenewalGrace)
+	}
+	// Bound it so a typo cannot widen the window to effectively forever, and so
+	// `now - grace` in the resolver's SQL stays far from underflowing.
+	if cfg.KeyRenewalGrace > 10*365*24*time.Hour {
+		return nil, fmt.Errorf("KEY_RENEWAL_GRACE must be at most 10 years (got %s)", cfg.KeyRenewalGrace)
 	}
 	if cfg.CookieSecure, err = envBool("COOKIE_SECURE", true); err != nil {
 		return nil, err
@@ -303,6 +328,30 @@ func envDuration(key string, fallback time.Duration) (time.Duration, error) {
 	d, err := time.ParseDuration(raw)
 	if err != nil || d <= 0 {
 		return 0, fmt.Errorf("%s must be a positive duration (e.g. 12h), got %q", key, raw)
+	}
+	return d, nil
+}
+
+// envDurationAllowZero is envDuration for a knob where zero carries meaning
+// rather than being an unusable value.
+//
+// KEY_RENEWAL_GRACE is the case: 0 is how an operator turns the renewal grace
+// window off and restores strict expiry, so rejecting it as "not positive" would
+// make the feature unremovable through configuration. A negative duration stays
+// an error — it would *widen* the window instead of closing it, which is the
+// opposite of what someone typing a minus sign intends.
+func envDurationAllowZero(key string, fallback time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 0 {
+		// Go durations have no day unit, and the natural way to write a 90-day
+		// window is "90d" — which fails. Say what to write instead of only
+		// saying no: this is the one value most likely to be set by hand.
+		return 0, fmt.Errorf("%s must be a duration of at least 0 (0 disables it), got %q "+
+			"(Go durations have no day unit; write 90 days as 2160h)", key, raw)
 	}
 	return d, nil
 }

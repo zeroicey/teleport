@@ -75,6 +75,7 @@ func testServerWith(t *testing.T, mutate func(*config.Config)) (http.Handler, *c
 		KeyClaimWindow:    30 * time.Minute,
 		KeyMaxPending:     50,
 		KeyMaxActive:      100,
+		KeyRenewalGrace:   90 * 24 * time.Hour,
 	}
 	if mutate != nil {
 		mutate(cfg)
@@ -832,14 +833,32 @@ func testServerWithFrontend(t *testing.T) (http.Handler, *config.Config) {
 	return handler, cfg
 }
 
-// TestMethodNotAllowed checks that a wrong verb on a known path is not silently
-// treated as a 404 by the catch-all.
+// TestMethodNotAllowed checks that a wrong verb on a known path is neither
+// executed nor turned into the SPA's HTML 404.
 func TestMethodNotAllowed(t *testing.T) {
 	h, _ := testServer(t)
-	// GET on the create endpoint: only POST is registered.
-	rec := do(t, h, http.MethodGet, testPrefix+"/api/reports", "", agentHeaders())
-	if rec.Code == http.StatusCreated || rec.Code == http.StatusOK {
-		t.Errorf("GET on a POST-only route unexpectedly succeeded: %d", rec.Code)
+	// The answer is 404 with the JSON envelope, not net/http's 405: the /api/
+	// catch-all is registered for every method, so it matches before ServeMux
+	// gets to consider "path exists, method does not".
+	//
+	// The example here used to be GET /api/reports, described as "only POST is
+	// registered". That stopped being true when the route gained a GET of its own
+	// (listing the caller's own reports), and this test caught it — which is the
+	// point of naming a real route rather than a made-up one. Pick a path that is
+	// genuinely single-verb; if it grows a second verb, fix the example rather
+	// than weakening the assertion.
+	rec := do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/applications", "", agentHeaders())
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("GET on a POST-only route = %d, want %d", rec.Code, http.StatusNotFound)
+	}
+	if ok, _, code := decodeEnvelope(t, rec); ok || code != "not_found" {
+		t.Errorf("wrong verb must still answer the JSON envelope: ok=%v code=%q", ok, code)
+	}
+
+	// The route that forced the move must answer its own verb.
+	rec = do(t, h, http.MethodGet, testPrefix+"/api/reports", "", agentHeaders())
+	if rec.Code != http.StatusOK {
+		t.Errorf("GET /api/reports (list own) = %d, want %d", rec.Code, http.StatusOK)
 	}
 }
 

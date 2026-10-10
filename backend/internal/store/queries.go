@@ -278,6 +278,44 @@ func (s *Store) ListReports(category string, limit, offset int) ([]domain.Report
 	return out, rows.Err()
 }
 
+// ListReportsByOwner returns newest-first summaries published by one key.
+//
+// This is the read side of the ownership model. Without it an agent can retrieve
+// a report only if it still remembers the id it was handed at creation time —
+// asking about anyone else's id returns 404, so a forgotten id is unrecoverable.
+// Owning something you cannot enumerate is not ownership.
+//
+// An empty ownerKeyID is a real value, not a wildcard: it selects the reports
+// published by the root credential, whose owner_key_id is ''. Callers wanting
+// "everything" must use ListReports.
+func (s *Store) ListReportsByOwner(ownerKeyID, category string, limit, offset int) ([]domain.Report, error) {
+	base := `SELECT id, title, category, format, '' AS content, metadata, created_at, updated_at, owner_key_id
+	           FROM reports WHERE owner_key_id = ?`
+	args := []any{ownerKeyID}
+	if category != "" {
+		base += ` AND category = ?`
+		args = append(args, category)
+	}
+	base += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`
+	args = append(args, limit, offset)
+
+	rows, err := s.db.Query(base, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := []domain.Report{}
+	for rows.Next() {
+		report, err := scanReport(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *report)
+	}
+	return out, rows.Err()
+}
+
 // GetShareToken returns a single token row.
 func (s *Store) GetShareToken(token string) (*domain.ShareToken, error) {
 	row := s.db.QueryRow(

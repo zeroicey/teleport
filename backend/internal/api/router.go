@@ -69,7 +69,17 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	// middleware hashes the bearer token and asks the store whether that hash is
 	// a live key. Root stays a property of the environment credential and never
 	// passes through here.
-	requireAgent := httpx.RequireAgent(authCfg, keyResolver{store: st})
+	//
+	// The grace window is passed into the resolver rather than applied in a
+	// route: it decides whether an expired key is *reported at all*, and the
+	// middleware decides whether that report is admitted. Only the renewal route
+	// uses the admitting middleware, so every other endpoint stays strict
+	// without anyone having to remember to keep it strict.
+	keyAuth := keyResolver{store: st, graceMS: int64(cfg.KeyRenewalGrace / time.Millisecond)}
+	requireAgent := httpx.RequireAgent(authCfg, keyAuth)
+	// Used by exactly one route: filing a renewal request. An expired key may ask
+	// a human for more time and may do nothing else.
+	requireAgentRenewal := httpx.RequireAgentAllowExpired(authCfg, keyAuth)
 	requireSession := httpx.RequireSession(authCfg)
 
 	mux := http.NewServeMux()
@@ -95,6 +105,7 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 
 	// -- agent ----------------------------------------------------------------
 	mux.Handle("POST "+p+"/api/reports", requireAgent(http.HandlerFunc(s.handleCreateReport)))
+	mux.Handle("GET "+p+"/api/reports", requireAgent(http.HandlerFunc(s.handleListOwnReports)))
 	mux.Handle("GET "+p+"/api/reports/{id}", requireAgent(http.HandlerFunc(s.handleGetReport)))
 	mux.Handle("POST "+p+"/api/share/{token}/revoke", requireAgent(http.HandlerFunc(s.handleRevoke)))
 
@@ -110,7 +121,10 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	mux.HandleFunc("GET "+p+"/api/agent-keys/renewals/{id}", s.handlePollRenewal)
 
 	mux.Handle("GET "+p+"/api/agent-keys/me", requireAgent(http.HandlerFunc(s.handleKeyMe)))
-	mux.Handle("POST "+p+"/api/agent-keys/renewals", requireAgent(http.HandlerFunc(s.handleCreateRenewal)))
+	// The one route that admits an expired key, so that letting a key lapse is
+	// recoverable by the agent itself instead of orphaning every report it ever
+	// published. Everything it can reach is a *request*; a human still decides.
+	mux.Handle("POST "+p+"/api/agent-keys/renewals", requireAgentRenewal(http.HandlerFunc(s.handleCreateRenewal)))
 
 	// -- dashboard ------------------------------------------------------------
 	mux.HandleFunc("POST "+p+"/api/admin/login", s.handleLogin)
@@ -515,6 +529,57 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	httpx.OK(w, r, map[string]any{"authenticated": true, "subject": subject})
 }
 
+// handleListOwnReports lists the reports the caller itself published.
+//
+// Root sees everything, because every ownership check in this package already
+// grants root access to every report; a named key sees only rows whose
+// owner_key_id is its own. That asymmetry is the ownership model, not a
+// convenience: an agent must not be able to enumerate another agent's work, and
+// it must not accidentally see the root-published reports either (owner_key_id
+// '' is root's own).
+func (s *Server) handleListOwnReports(w http.ResponseWriter, r *http.Request) {
+	principal := httpx.PrincipalFrom(r.Context())
+	if principal == nil {
+		httpx.WriteError(w, r, httpx.Unauthorized(agentAuthFailed))
+		return
+	}
+
+	q := r.URL.Query()
+	limit := clampInt(q.Get("limit"), 50, 1, 200)
+	offset := clampInt(q.Get("offset"), 0, 0, 100_000)
+	category := q.Get("category")
+
+	var (
+		reports []domain.Report
+		err     error
+	)
+	if principal.Root {
+		reports, err = s.store.ListReports(category, limit, offset)
+	} else {
+		reports, err = s.store.ListReportsByOwner(principal.KeyID, category, limit, offset)
+	}
+	if err != nil {
+		httpx.WriteError(w, r, httpx.Internal("Failed to list reports").WithCause(err))
+		return
+	}
+
+	// Always emit a JSON array, never null, so clients can iterate directly.
+	out := make([]map[string]any, 0, len(reports))
+	for _, report := range reports {
+		out = append(out, map[string]any{
+			"id":           report.ID,
+			"title":        report.Title,
+			"category":     report.Category,
+			"format":       report.Format,
+			"metadata":     report.Metadata,
+			"created_at":   report.CreatedAt,
+			"updated_at":   report.UpdatedAt,
+			"owner_key_id": report.OwnerKeyID,
+		})
+	}
+	httpx.OK(w, r, out)
+}
+
 func (s *Server) handleListReports(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	limit := clampInt(q.Get("limit"), 50, 1, 200)
@@ -526,20 +591,54 @@ func (s *Server) handleListReports(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, r, httpx.Internal("Failed to list reports").WithCause(err))
 		return
 	}
+
+	// Resolve owner ids to the names a human chose at approval time. The list
+	// query already selected owner_key_id; dropping it here is what made the
+	// dashboard unable to answer "who published this", so it is carried through
+	// and labelled rather than shown as a raw uuid.
+	ownerNames, err := s.ownerNameIndex()
+	if err != nil {
+		httpx.WriteError(w, r, httpx.Internal("Failed to list reports").WithCause(err))
+		return
+	}
+
 	// Always emit a JSON array, never null, so clients can iterate directly.
 	out := make([]map[string]any, 0, len(reports))
 	for _, report := range reports {
 		out = append(out, map[string]any{
-			"id":         report.ID,
-			"title":      report.Title,
-			"category":   report.Category,
-			"format":     report.Format,
-			"metadata":   report.Metadata,
-			"created_at": report.CreatedAt,
-			"updated_at": report.UpdatedAt,
+			"id":           report.ID,
+			"title":        report.Title,
+			"category":     report.Category,
+			"format":       report.Format,
+			"metadata":     report.Metadata,
+			"created_at":   report.CreatedAt,
+			"updated_at":   report.UpdatedAt,
+			"owner_key_id": report.OwnerKeyID,
+			"owner_name":   ownerNames[report.OwnerKeyID],
 		})
 	}
 	httpx.OK(w, r, out)
+}
+
+// ownerNameIndex maps owner_key_id to a human label for the dashboard.
+//
+// The empty key is present on purpose: it is how root-published (and
+// pre-ownership) reports are stored, and a blank cell there would read as "the
+// dashboard does not know" rather than "nobody's named key".
+func (s *Server) ownerNameIndex() (map[string]string, error) {
+	keys, err := s.store.ListAgentKeys()
+	if err != nil {
+		return nil, err
+	}
+	names := make(map[string]string, len(keys)+1)
+	names[""] = "root (break-glass)"
+	for _, k := range keys {
+		// A key that was renamed keeps one row, so the latest name wins by
+		// construction; revoked keys stay listed, because a report does not stop
+		// having an author when the credential is withdrawn.
+		names[k.ID] = k.Name
+	}
+	return names, nil
 }
 
 func (s *Server) handleAdminGetReport(w http.ResponseWriter, r *http.Request) {

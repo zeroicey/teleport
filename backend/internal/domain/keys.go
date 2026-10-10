@@ -15,6 +15,18 @@ type Principal struct {
 	Name string
 	// Root is true when the caller presented AGENT_SECRET_KEY.
 	Root bool
+	// Expired reports that the presented key is past its expires_at and is being
+	// tolerated only by the renewal grace window.
+	//
+	// This is not an authorization level: it is a request for the caller to be
+	// admitted *solely* so it can ask a human for more time. Every endpoint that
+	// can change state must refuse such a principal, and the only endpoint that
+	// admits it is the renewal request — see RequireAgentAllowExpired.
+	Expired bool
+	// ExpiresAt is the key's expiry in epoch milliseconds, 0 meaning "never".
+	// Root has no row and therefore carries 0 here, which is the same value a
+	// never-expiring key has; use Root, not this field, to tell them apart.
+	ExpiresAt int64
 }
 
 // AgentKey is an issued, named credential.

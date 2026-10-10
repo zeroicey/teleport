@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/zeroicey/teleport/backend/internal/agentkey"
 	"github.com/zeroicey/teleport/backend/internal/domain"
@@ -374,8 +375,83 @@ func TestResolveAgentKeyHonoursExpiryAndRevocation(t *testing.T) {
 	}
 }
 
-func TestTouchAgentKeyCounts(t *testing.T) {
+// TestResolveAgentKeyWithinGrace pins the window's boundaries, including the two
+// ends that are easy to get wrong: exactly at expiry, and exactly at the end of
+// the grace period. Off-by-one here decides whether a key is usable.
+func TestResolveAgentKeyWithinGrace(t *testing.T) {
 	s := newTestStore(t)
+	now := NowMS()
+	const grace = 90 * 24 * int64(time.Hour/time.Millisecond) // 90 days in ms
+
+	key, token, err := s.CreateManualKey("k", 1, "", 100, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := agentkey.HashToken(token)
+	expiry := key.ExpiresAt
+	if expiry == 0 {
+		t.Fatal("a 1-hour key must have a real expiry")
+	}
+
+	for _, tc := range []struct {
+		name       string
+		at         int64
+		wantFound  bool
+		wantExpire bool
+	}{
+		{"well before expiry", expiry - int64(time.Hour/time.Millisecond), true, false},
+		{"one ms before expiry", expiry - 1, true, false},
+		// At the exact expiry instant the key is no longer live. Treating this
+		// as "still valid" would make the boundary depend on clock granularity.
+		{"exactly at expiry", expiry, true, true},
+		{"inside grace", expiry + int64(24*time.Hour/time.Millisecond), true, true},
+		{"one ms before grace ends", expiry + grace - 1, true, true},
+		{"exactly when grace ends", expiry + grace, false, false},
+		{"long past grace", expiry + grace + int64(time.Hour/time.Millisecond), false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, expired, err := s.ResolveAgentKeyWithinGrace(hash, tc.at, grace)
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if (got != nil) != tc.wantFound {
+				t.Fatalf("found = %v, want %v", got != nil, tc.wantFound)
+			}
+			if expired != tc.wantExpire {
+				t.Errorf("expired = %v, want %v", expired, tc.wantExpire)
+			}
+		})
+	}
+
+	// A zero grace window means "no window at all" — the escape hatch that
+	// restores strict expiry, so it must not accidentally mean "unbounded".
+	if got, _, err := s.ResolveAgentKeyWithinGrace(hash, expiry+1, 0); err != nil || got != nil {
+		t.Errorf("grace=0 resolved an expired key: %v %v", got, err)
+	}
+
+	// A never-expiring key is never "expired", however far the clock moves: 0
+	// means unbounded, not "expired at the epoch".
+	_, foreverToken, err := s.CreateManualKey("forever", 0, "", 100, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, expired, err := s.ResolveAgentKeyWithinGrace(agentkey.HashToken(foreverToken),
+		now+100*365*24*3600*1000, grace)
+	if err != nil || got == nil || expired {
+		t.Errorf("never-expiring key: got=%v expired=%v err=%v", got, expired, err)
+	}
+
+	// Revocation outranks the window: no amount of grace resurrects a key a human
+	// deliberately killed.
+	if _, err := s.UpdateAgentKey(key.ID, KeyPatch{Revoked: boolPtr(true)}, now); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err := s.ResolveAgentKeyWithinGrace(hash, expiry+1, grace); err != nil || got != nil {
+		t.Errorf("revoked key resolved inside the grace window: %v %v", got, err)
+	}
+}
+
+func TestTouchAgentKeyCounts(t *testing.T) {	s := newTestStore(t)
 	now := NowMS()
 	key, _, err := s.CreateManualKey("k", 1, "", 100, now)
 	if err != nil {

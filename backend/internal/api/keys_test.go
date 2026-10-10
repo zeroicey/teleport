@@ -13,6 +13,8 @@ import (
 
 	"github.com/zeroicey/teleport/backend/internal/agentkey"
 	"github.com/zeroicey/teleport/backend/internal/config"
+	"github.com/zeroicey/teleport/backend/internal/httpx"
+	"github.com/zeroicey/teleport/backend/internal/store"
 )
 
 // ---------------------------------------------------------------------------
@@ -1662,4 +1664,421 @@ func TestStringFieldsRejectInvisibleAndControl(t *testing.T) {
 			t.Fatalf("status = %d, want 201: %s", rec.Code, rec.Body.String())
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// renewal grace window (KEY_RENEWAL_GRACE)
+// ---------------------------------------------------------------------------
+
+// expireKey forces a key's expiry into the past.
+//
+// Nothing in the API can express a expiry that has already passed, and that is
+// deliberate: expiryFrom maps any non-positive duration to "never expires", so a
+// past grant is not something an operator can produce by accident. Moving time is
+// therefore a database edit, and the test makes it explicit rather than reaching
+// for a negative duration that would silently mean the opposite.
+func expireKey(t *testing.T, cfg *config.Config, keyID string, expiresAt int64) {
+	t.Helper()
+	db, err := store.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatalf("open store for expiry edit: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`UPDATE agent_keys SET expires_at = ? WHERE id = ?`, expiresAt, keyID); err != nil {
+		t.Fatalf("expire key %s: %v", keyID, err)
+	}
+}
+
+// TestExpiredKeyMayFileRenewalAndNothingElse is the whole point of the grace
+// window, stated as the one sentence it has to keep true: an expired key can ask
+// a human for more time, and can do nothing else at all.
+//
+// Before this existed, letting a key lapse was unrecoverable by the agent — the
+// renewal request itself needs a working credential — so the only path left was
+// re-applying, which mints a *new* key id and orphans every report the old one
+// had published, because ownership is compared by key id.
+func TestExpiredKeyMayFileRenewalAndNothingElse(t *testing.T) {
+	h, cfg := testServer(t)
+	cookie := map[string]string{"Cookie": login(t, h)}
+	token, keyID := mintKey(t, h, cookie, "lapsed-agent")
+	reportID, shareToken := publishReport(t, h, token, "published before it lapsed")
+
+	// An hour past expiry: comfortably inside the 90-day default window.
+	expireKey(t, cfg, keyID, store.NowMS()-time.Hour.Milliseconds())
+
+	// -- the one endpoint it may still reach -------------------------------
+	rec := do(t, h, http.MethodPost, testPrefix+"/api/agent-keys/renewals",
+		`{"requestedHours":24}`, bearerHeaders(token))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("expired key filing a renewal: status = %d, want 201: %s", rec.Code, rec.Body.String())
+	}
+	_, data, _ := decodeEnvelope(t, rec)
+	if data["key_expired"] != true {
+		t.Errorf("renewal response key_expired = %v, want true", data["key_expired"])
+	}
+	if got := rec.Header().Get(httpx.KeyExpiredHeader); got != "true" {
+		t.Errorf("%s = %q, want \"true\"", httpx.KeyExpiredHeader, got)
+	}
+	if got := rec.Header().Get(httpx.KeyExpiresAtHeader); got == "" {
+		t.Errorf("%s missing on an expired key's response", httpx.KeyExpiresAtHeader)
+	}
+	claim, ok := data["claim_secret"].(string)
+	if !ok || claim == "" {
+		t.Fatalf("renewal must still hand back a claim secret: %s", rec.Body.String())
+	}
+	renewalID, _ := data["id"].(string)
+
+	// The loop has to be closable by the agent itself, or filing the request
+	// would be pointless: the poll endpoint is guarded by the claim secret
+	// rather than by Bearer, so an expired key can still learn the outcome.
+	poll := do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/renewals/"+renewalID,
+		"", claimHeaders(claim))
+	if poll.Code != http.StatusOK {
+		t.Fatalf("expired key cannot poll its own renewal: status = %d: %s", poll.Code, poll.Body.String())
+	}
+	_, polled, _ := decodeEnvelope(t, poll)
+	if polled["status"] != "pending" {
+		t.Errorf("polled status = %v, want pending", polled["status"])
+	}
+	// ...and the claim secret stays the gate: a wrong one must not work.
+	if wrong := do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/renewals/"+renewalID,
+		"", claimHeaders("not-the-claim-secret")); wrong.Code != http.StatusNotFound {
+		t.Errorf("wrong claim secret on a renewal poll = %d, want 404", wrong.Code)
+	}
+
+	// -- everything else refuses, indistinguishably from an unknown key ----
+	for _, tc := range []struct {
+		name, method, path, body string
+	}{
+		{"read own identity", http.MethodGet, testPrefix + "/api/agent-keys/me", ""},
+		{"read own report", http.MethodGet, testPrefix + "/api/reports/" + reportID, ""},
+		{"list own reports", http.MethodGet, testPrefix + "/api/reports", ""},
+		{"publish", http.MethodPost, testPrefix + "/api/reports", `{"title":"sneaking one in","content":"x"}`},
+		{"revoke a share link", http.MethodPost, testPrefix + "/api/share/" + shareToken + "/revoke", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := do(t, h, tc.method, tc.path, tc.body, bearerHeaders(token))
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want 401: %s", rec.Code, rec.Body.String())
+			}
+			// The refusal must not carry the lifetime headers. Emitting them
+			// would tell an unauthenticated caller that its guess is a real key
+			// that merely lapsed — undoing the identical-401 property.
+			if got := rec.Header().Get(httpx.KeyExpiredHeader); got != "" {
+				t.Errorf("refused request leaked %s = %q", httpx.KeyExpiredHeader, got)
+			}
+			if got := rec.Header().Get(httpx.KeyExpiresAtHeader); got != "" {
+				t.Errorf("refused request leaked %s = %q", httpx.KeyExpiresAtHeader, got)
+			}
+		})
+	}
+}
+
+// TestExpiredBeyondGraceIsIndistinguishableFromUnknown checks the window closes.
+// Past it the key is simply not a key: same status, same body as a token that
+// never existed, so nothing about the row is observable.
+func TestExpiredBeyondGraceIsIndistinguishableFromUnknown(t *testing.T) {
+	h, cfg := testServer(t)
+	cookie := map[string]string{"Cookie": login(t, h)}
+	token, keyID := mintKey(t, h, cookie, "long-forgotten")
+
+	// Beyond the 90-day default by a comfortable margin.
+	expireKey(t, cfg, keyID, store.NowMS()-(100*24*time.Hour).Milliseconds())
+
+	unknown := do(t, h, http.MethodPost, testPrefix+"/api/agent-keys/renewals",
+		`{"requestedHours":24}`, bearerHeaders("no-such-token-at-all"))
+	beyond := do(t, h, http.MethodPost, testPrefix+"/api/agent-keys/renewals",
+		`{"requestedHours":24}`, bearerHeaders(token))
+
+	if beyond.Code != http.StatusUnauthorized {
+		t.Fatalf("beyond grace: status = %d, want 401", beyond.Code)
+	}
+	if beyond.Code != unknown.Code {
+		t.Errorf("beyond-grace status = %d, unknown status = %d", beyond.Code, unknown.Code)
+	}
+	// Compare the error *shape*, not the raw bytes: every response carries a
+	// unique requestId, so byte equality can never hold and asserting it would
+	// fail for a reason unrelated to what the test claims to check.
+	sameEnvelope(t, "beyond-grace key vs unknown key", beyond.Body.Bytes(), unknown.Body.Bytes())
+}
+
+// sameEnvelope fails unless two responses share a top-level envelope once the
+// per-response correlation id is removed — that id is deliberately unique, so it
+// is the one field that must differ.
+func sameEnvelope(t *testing.T, label string, got, want []byte) {
+	t.Helper()
+	var g, w map[string]any
+	if err := json.Unmarshal(got, &g); err != nil {
+		t.Fatalf("%s: decode got: %v", label, err)
+	}
+	if err := json.Unmarshal(want, &w); err != nil {
+		t.Fatalf("%s: decode want: %v", label, err)
+	}
+	delete(g, "requestId")
+	delete(w, "requestId")
+	gb, _ := json.Marshal(g)
+	wb, _ := json.Marshal(w)
+	if string(gb) != string(wb) {
+		t.Errorf("%s is distinguishable:\n got %s\nwant %s", label, gb, wb)
+	}
+}
+
+// TestRevokedKeyIsNotRescuedByTheGraceWindow pins the asymmetry between the two
+// ways a key can stop working: forgetting to renew is an accident worth
+// forgiving, revocation is a human decision that must not be undone by the same
+// code path.
+func TestRevokedKeyIsNotRescuedByTheGraceWindow(t *testing.T) {
+	h, cfg := testServer(t)
+	cookie := map[string]string{"Cookie": login(t, h)}
+	token, keyID := mintKey(t, h, cookie, "deliberately-killed")
+
+	// Expired but well inside the grace window, so only revocation can be the
+	// reason it is refused.
+	expireKey(t, cfg, keyID, store.NowMS()-time.Hour.Milliseconds())
+
+	rec := do(t, h, http.MethodPatch, testPrefix+"/api/admin/keys/"+keyID, `{"revoked":true}`, cookie)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("revoke: status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(t, h, http.MethodPost, testPrefix+"/api/agent-keys/renewals",
+		`{"requestedHours":24}`, bearerHeaders(token))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("a revoked key inside the grace window filed a renewal: status = %d, want 401", rec.Code)
+	}
+
+	// And the approval side must refuse to resurrect it, not merely the front
+	// door: a renewal filed *before* revocation is the way to try this.
+	token2, keyID2 := mintKey(t, h, cookie, "filed-then-killed")
+	rec = do(t, h, http.MethodPost, testPrefix+"/api/agent-keys/renewals",
+		`{"requestedHours":24}`, bearerHeaders(token2))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("file renewal before revoking: status = %d: %s", rec.Code, rec.Body.String())
+	}
+	_, data, _ := decodeEnvelope(t, rec)
+	renewalID, _ := data["id"].(string)
+	if rec := do(t, h, http.MethodPatch, testPrefix+"/api/admin/keys/"+keyID2, `{"revoked":true}`, cookie); rec.Code != http.StatusOK {
+		t.Fatalf("revoke second key: status = %d", rec.Code)
+	}
+	rec = do(t, h, http.MethodPost, testPrefix+"/api/admin/key-renewals/"+renewalID+"/approve", `{}`, cookie)
+	if rec.Code == http.StatusOK {
+		t.Errorf("approving a renewal for a revoked key succeeded; revocation must be absolute")
+	}
+}
+
+// TestGraceWindowCanBeDisabled checks the escape hatch: KEY_RENEWAL_GRACE=0
+// restores the strict behaviour, so the feature is not unremovable.
+func TestGraceWindowCanBeDisabled(t *testing.T) {
+	h, cfg := testServerWith(t, func(c *config.Config) { c.KeyRenewalGrace = 0 })
+	cookie := map[string]string{"Cookie": login(t, h)}
+	token, keyID := mintKey(t, h, cookie, "no-grace")
+	expireKey(t, cfg, keyID, store.NowMS()-time.Hour.Milliseconds())
+
+	rec := do(t, h, http.MethodPost, testPrefix+"/api/agent-keys/renewals",
+		`{"requestedHours":24}`, bearerHeaders(token))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("grace disabled: expired key got %d, want 401", rec.Code)
+	}
+}
+
+// TestApprovedRenewalRestoresAccessAndKeepsTheOldReports is the payoff, and the
+// claim the whole feature rests on: renewing keeps the same key id, so the
+// reports published before the lapse are still this key's own.
+//
+// If renewal ever started minting a fresh key row, this test is what fails — not
+// some assertion about expiry arithmetic, but the thing the user actually cares
+// about: an agent that renews does not lose its history.
+func TestApprovedRenewalRestoresAccessAndKeepsTheOldReports(t *testing.T) {
+	h, cfg := testServer(t)
+	cookie := map[string]string{"Cookie": login(t, h)}
+	token, keyID := mintKey(t, h, cookie, "lapsed-but-recovering")
+	reportID, _ := publishReport(t, h, token, "the work I did before I lapsed")
+
+	expireKey(t, cfg, keyID, store.NowMS()-time.Hour.Milliseconds())
+
+	// Confirm the premise: while expired, the report is out of reach.
+	if rec := do(t, h, http.MethodGet, testPrefix+"/api/reports/"+reportID, "", bearerHeaders(token)); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("premise broken: expired key read its report with %d, want 401", rec.Code)
+	}
+
+	rec := do(t, h, http.MethodPost, testPrefix+"/api/agent-keys/renewals",
+		`{"requestedHours":24}`, bearerHeaders(token))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("file renewal: status = %d: %s", rec.Code, rec.Body.String())
+	}
+	_, data, _ := decodeEnvelope(t, rec)
+	renewalID, _ := data["id"].(string)
+
+	if rec := do(t, h, http.MethodPost, testPrefix+"/api/admin/key-renewals/"+renewalID+"/approve", `{"expiresInHours":24}`, cookie); rec.Code != http.StatusOK {
+		t.Fatalf("approve renewal: status = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Same token, same identity, working again.
+	rec = do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/me", "", bearerHeaders(token))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("after approval: /me = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	_, me, _ := decodeEnvelope(t, rec)
+	if got, _ := me["id"].(string); got != keyID {
+		t.Errorf("renewal changed the key id: got %q, want %q — ownership would be orphaned", got, keyID)
+	}
+	if v, _ := me["expires_at"].(float64); v <= float64(store.NowMS()) {
+		t.Errorf("expires_at = %v, want a future timestamp", me["expires_at"])
+	}
+
+	// The report published under the old expiry is still readable — this is the
+	// ownership continuity the grace window exists to preserve.
+	rec = do(t, h, http.MethodGet, testPrefix+"/api/reports/"+reportID, "", bearerHeaders(token))
+	if rec.Code != http.StatusOK {
+		t.Errorf("report from before the lapse: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+
+	// And the lifetime headers now describe a live key, not an expired one.
+	if got := rec.Header().Get(httpx.KeyExpiredHeader); got != "" {
+		t.Errorf("a renewed key still advertises %s = %q", httpx.KeyExpiredHeader, got)
+	}
+}
+
+// TestExpiryIsAdvertisedOnAuthenticatedResponses covers the cheap half of the
+// fix: an agent should not have to remember to poll /me to discover the date
+// that decides whether it keeps working.
+func TestExpiryIsAdvertisedOnAuthenticatedResponses(t *testing.T) {
+	h, _ := testServer(t)
+	cookie := map[string]string{"Cookie": login(t, h)}
+
+	t.Run("a dated key advertises its expiry", func(t *testing.T) {
+		token, _ := mintKey(t, h, cookie, "dated")
+		rec := do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/me", "", bearerHeaders(token))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		raw := rec.Header().Get(httpx.KeyExpiresAtHeader)
+		secs, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || secs <= 0 {
+			t.Fatalf("%s = %q, want Unix seconds", httpx.KeyExpiresAtHeader, raw)
+		}
+		if secs*1000 <= store.NowMS() {
+			t.Errorf("%s = %d, which is not in the future", httpx.KeyExpiresAtHeader, secs)
+		}
+		if got := rec.Header().Get(httpx.KeyExpiredHeader); got != "" {
+			t.Errorf("a live key advertised %s = %q", httpx.KeyExpiredHeader, got)
+		}
+	})
+
+	t.Run("a key that never expires stays quiet", func(t *testing.T) {
+		token, _ := mintKey(t, h, cookie, "undated")
+		// 0 hours means "never expires", the absolute timestamp 0.
+		if rec := do(t, h, http.MethodPatch, testPrefix+"/api/admin/keys/"+mustKeyID(t, h, cookie, token),
+			`{"expiresInHours":0}`, cookie); rec.Code != http.StatusOK {
+			t.Fatalf("make permanent: status = %d: %s", rec.Code, rec.Body.String())
+		}
+		rec := do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/me", "", bearerHeaders(token))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		// Absent means "no deadline", which must not be confused with a past one.
+		if got := rec.Header().Get(httpx.KeyExpiresAtHeader); got != "" {
+			t.Errorf("never-expiring key set %s = %q; absence is what means unbounded", httpx.KeyExpiresAtHeader, got)
+		}
+	})
+
+	t.Run("root has no expiry to advertise", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/me", "", agentHeaders())
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d", rec.Code)
+		}
+		if got := rec.Header().Get(httpx.KeyExpiresAtHeader); got != "" {
+			t.Errorf("root advertised %s = %q", httpx.KeyExpiresAtHeader, got)
+		}
+	})
+
+	t.Run("an unknown token learns nothing", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/me", "", bearerHeaders("nope"))
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want 401", rec.Code)
+		}
+		if got := rec.Header().Get(httpx.KeyExpiresAtHeader); got != "" {
+			t.Errorf("a rejected request leaked %s = %q", httpx.KeyExpiresAtHeader, got)
+		}
+	})
+}
+
+// mustKeyID mints nothing; it reads the id back for a token already minted.
+func mustKeyID(t *testing.T, h http.Handler, cookie map[string]string, token string) string {
+	t.Helper()
+	rec := do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/me", "", bearerHeaders(token))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("me: status = %d", rec.Code)
+	}
+	_, data, _ := decodeEnvelope(t, rec)
+	id, _ := data["id"].(string)
+	if id == "" {
+		t.Fatalf("no key id in %s", rec.Body.String())
+	}
+	return id
+}
+
+// TestListOwnReportsIsScopedToTheCaller covers the endpoint that made "manage my
+// own reports" possible at all: an agent that forgot a report id previously had
+// no way to recover it, because reading anyone else's id answers 404.
+func TestListOwnReportsIsScopedToTheCaller(t *testing.T) {
+	h, cfg := testServer(t)
+	cookie := map[string]string{"Cookie": login(t, h)}
+
+	tokenA, keyA := mintKey(t, h, cookie, "agent-a")
+	tokenB, keyB := mintKey(t, h, cookie, "agent-b")
+	mineA, _ := publishReport(t, h, tokenA, "A's report")
+	mineB, _ := publishReport(t, h, tokenB, "B's report")
+	// Published by root, whose owner_key_id is '' — the value a named key must
+	// never be able to claim as its own.
+	roots, _ := publishReport(t, h, testAgentSecret, "root's report")
+
+	ids := func(t *testing.T, rec *httptest.ResponseRecorder) map[string]bool {
+		t.Helper()
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+		}
+		// The envelope wraps the array under "data".
+		var env struct {
+			Data []map[string]any `json:"data"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		out := env.Data
+		got := map[string]bool{}
+		for _, r := range out {
+			id, _ := r["id"].(string)
+			got[id] = true
+		}
+		return got
+	}
+
+	gotA := ids(t, do(t, h, http.MethodGet, testPrefix+"/api/reports", "", bearerHeaders(tokenA)))
+	if !gotA[mineA] {
+		t.Errorf("agent A cannot see its own report; got %v", gotA)
+	}
+	if gotA[mineB] {
+		t.Errorf("agent A can see agent B's report")
+	}
+	if gotA[roots] {
+		t.Errorf("agent A can see root's report (owner_key_id '')")
+	}
+
+	gotB := ids(t, do(t, h, http.MethodGet, testPrefix+"/api/reports", "", bearerHeaders(tokenB)))
+	if !gotB[mineB] || gotB[mineA] || gotB[roots] {
+		t.Errorf("agent B's list is not scoped to itself; got %v", gotB)
+	}
+
+	// Root sees everything, matching every other ownership check in this server.
+	gotRoot := ids(t, do(t, h, http.MethodGet, testPrefix+"/api/reports", "", agentHeaders()))
+	for _, want := range []string{mineA, mineB, roots} {
+		if !gotRoot[want] {
+			t.Errorf("root cannot see %s; got %v", want, gotRoot)
+		}
+	}
+
+	_ = keyA
+	_ = keyB
+	_ = cfg
 }

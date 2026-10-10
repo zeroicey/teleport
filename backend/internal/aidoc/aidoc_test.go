@@ -221,3 +221,64 @@ func TestKeyLimitPlaceholdersFollowConfiguration(t *testing.T) {
 		}
 	}
 }
+
+// TestGuideKeepsTheRenewalGraceContract pins the two facts an agent cannot
+// afford to get wrong about a lapsed key.
+//
+// Both were true statements in the guide until the 90-day grace window landed,
+// and both then became actively harmful: an agent that still believed /me works
+// while expired would conclude it was dead, re-apply, and silently lose access
+// to every report it had ever published (a new key id does not inherit the old
+// one's reports). The guide is the only place an agent learns this, so the
+// statements are asserted rather than trusted.
+func TestGuideKeepsTheRenewalGraceContract(t *testing.T) {
+	got := Markdown(testFacts())
+
+	// 1. The grace window must be described at all, with its length.
+	for _, needle := range []string{"90 天", "宽限期", "KEY_RENEWAL_GRACE"} {
+		if !strings.Contains(got, needle) {
+			t.Errorf("guide never mentions %q; an agent cannot know a lapsed key is still recoverable", needle)
+		}
+	}
+
+	// 2. The renewal endpoint must be stated as the surviving capability, and
+	//    stated to keep the same key id — that is the reason to renew rather
+	//    than re-apply.
+	for _, needle := range []string{"/api/agent-keys/renewals", "key.id", "归属"} {
+		if !strings.Contains(got, needle) {
+			t.Errorf("guide omits %q from the grace-window rules", needle)
+		}
+	}
+
+	// 3. The expiry headers must be documented, because they are the mechanism
+	//    that makes "renew early" possible without polling /me.
+	for _, needle := range []string{"X-Teleport-Key-Expires-At", "X-Teleport-Key-Expired"} {
+		if !strings.Contains(got, needle) {
+			t.Errorf("guide does not document %s", needle)
+		}
+	}
+
+	// 4. The stale claim must be gone. Before the grace window, "once expired you
+	//    can no longer submit a renewal" was correct; it is now false, and a
+	//    guide that still says it tells agents to give up one paragraph after
+	//    telling them not to.
+	if strings.Contains(got, "无法再新提交") {
+		t.Error("guide still says an expired key cannot submit a renewal; the grace window made that false")
+	}
+}
+
+// TestGuideDocumentsTheOwnReportList covers the endpoint that makes ownership
+// usable. Without it an agent can only read a report whose id it still
+// remembers, and a mislaid id is unrecoverable by design (asking about someone
+// else's is a 404), so the guide has to name it.
+func TestGuideDocumentsTheOwnReportList(t *testing.T) {
+	got := Markdown(testFacts())
+	if !strings.Contains(got, "GET /api/reports`") && !strings.Contains(got, "`GET` | `{P}/api/reports`") {
+		t.Error("guide does not document GET /api/reports (list your own)")
+	}
+	for _, needle := range []string{"owner_key_id", "只返回**你发布的**"} {
+		if !strings.Contains(got, needle) {
+			t.Errorf("guide's own-report list section omits %q", needle)
+		}
+	}
+}

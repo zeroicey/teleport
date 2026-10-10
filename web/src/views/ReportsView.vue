@@ -78,6 +78,7 @@ const categories = computed(() =>
         <tr>
           <th>标题</th>
           <th>分类</th>
+          <th>发布者</th>
           <th>格式</th>
           <th>创建时间</th>
         </tr>
@@ -89,6 +90,12 @@ const categories = computed(() =>
             <div class="muted mono" style="font-size: 11px">{{ r.id }}</div>
           </td>
           <td><span class="badge">{{ r.category }}</span></td>
+          <td class="muted">
+            {{ r.owner_name || '未知' }}
+            <div v-if="r.owner_key_id" class="muted mono" style="font-size: 11px">
+              {{ r.owner_key_id.slice(0, 8) }}
+            </div>
+          </td>
           <td class="muted">{{ r.format }}</td>
           <td class="muted" :title="new Date(r.created_at).toISOString()">
             {{ relativeTime(r.created_at) }}

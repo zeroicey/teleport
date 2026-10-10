@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,27 +34,61 @@ type AuthConfig struct {
 //
 // tokenHash is the lowercase sha256 hex digest of the presented bearer token —
 // never the plaintext, so a resolver implementation cannot log a credential it
-// was never given. Implementations must return ok=false for unknown, revoked
-// and expired keys alike: the three are indistinguishable to the caller, and
-// callers must not be handed the difference.
+// was never given. Implementations must return ok=false for unknown and revoked
+// keys alike: those are indistinguishable to the caller, and callers must not be
+// handed the difference.
+//
+// The one deliberate exception is a key that is past its expiry but still inside
+// the renewal grace window. A resolver MAY report it with Principal.Expired set
+// — the fact is not a secret from the caller, who already holds the token — and
+// the middleware then decides whether to admit it. RequireAgent refuses it and
+// emits the byte-identical 401; RequireAgentAllowExpired admits it for the
+// renewal request alone. Beyond the grace window a resolver must return ok=false.
 type KeyResolver interface {
 	Resolve(ctx context.Context, tokenHash string) (domain.Principal, bool)
 }
 
 // agentAuthMessage is the one and only message this middleware emits on
 // failure. Missing header, non-Bearer scheme, wrong root key, unknown key, a
-// resolver miss and an identityless resolver hit all produce a byte-identical
-// 401 body, so a client cannot use the response to learn *why* it failed.
+// resolver miss an identityless resolver hit and an expired key refused by the
+// strict middleware all produce a byte-identical 401 body, so a client cannot use
+// the response to learn *why* it failed.
 const agentAuthMessage = "Invalid agent credentials"
 
 func agentUnauthorized() *Error { return Unauthorized(agentAuthMessage) }
+
+// Headers that tell an authenticated agent when its own credential lapses.
+//
+// They exist because expiry is otherwise invisible until it is fatal: the agent
+// has to remember to poll GET /api/agent-keys/me to discover a date it needs in
+// order to stay alive. Attaching the date to every response it already reads
+// turns "did I remember to check?" into "it is on every line of my transcript".
+//
+// Both are set only on responses to a caller that presented a valid named key,
+// and never on a rejected request: telling an unauthenticated caller that a
+// guessed token is a real-but-expired key would undo the identical-401 property
+// above.
+const (
+	// KeyExpiresAtHeader is the expiry as Unix seconds. Absent when the key
+	// never expires, so "absent" means "no deadline", not "unknown".
+	KeyExpiresAtHeader = "X-Teleport-Key-Expires-At"
+	// KeyExpiredHeader is "true" only inside the renewal grace window, i.e. the
+	// key is already past its expiry and only the renewal request will work.
+	KeyExpiredHeader = "X-Teleport-Key-Expired"
+)
 
 // RequireAgent authenticates an agent request with `Authorization: Bearer <key>`.
 //
 // Two credential paths are accepted:
 //
 //  1. the root/break-glass AGENT_SECRET_KEY in cfg (Principal.Root = true), and
-//  2. any key registered with resolver, matched by the sha256 hex of the token.
+//  2. any live key registered with resolver, matched by the sha256 hex of the token.
+//
+// A key past its expiry is refused here, with the same 401 as an unknown key.
+// That is the default on purpose: a route wired with RequireAgent is strict
+// without anyone having to remember to make it strict, so adding an endpoint can
+// never accidentally hand a dead credential working access. The renewal request
+// opts in to the exception explicitly via RequireAgentAllowExpired.
 //
 // Both paths are evaluated before the decision is made. Short-circuiting on a
 // root miss would make "the root key did not match" measurably faster than "the
@@ -63,6 +98,22 @@ func agentUnauthorized() *Error { return Unauthorized(agentAuthMessage) }
 // A nil resolver disables path 2 entirely and keeps the historical env-only
 // behaviour, which callers (and the older single-key tests) rely on.
 func RequireAgent(cfg AuthConfig, resolver KeyResolver) Middleware {
+	return requireAgent(cfg, resolver, false)
+}
+
+// RequireAgentAllowExpired is RequireAgent plus one exception: a key that is
+// past its expiry but still inside the renewal grace window is admitted, with
+// Principal.Expired set to true.
+//
+// Use it for the renewal request and nothing else. The handler behind it must
+// still refuse an expired principal from doing anything state-changing except
+// filing that request — an expired key can ask a human for more time, and that
+// is the entire extent of what it can do.
+func RequireAgentAllowExpired(cfg AuthConfig, resolver KeyResolver) Middleware {
+	return requireAgent(cfg, resolver, true)
+}
+
+func requireAgent(cfg AuthConfig, resolver KeyResolver, allowExpired bool) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			provided, ok := bearerToken(r.Header.Get("Authorization"))
@@ -109,6 +160,13 @@ func RequireAgent(cfg AuthConfig, resolver KeyResolver) Middleware {
 				// One assignment is cheap insurance against a whole-system
 				// privilege escalation.
 				stored.Root = false
+				// Refuse before anything is written, so the rejection carries no
+				// header and no timing difference that would reveal "this token
+				// is a real key that merely lapsed" rather than "no such key".
+				if stored.Expired && !allowExpired {
+					WriteError(w, r, agentUnauthorized())
+					return
+				}
 				principal = stored
 			default:
 				// Two ways to land here: nothing matched, or the resolver claimed
@@ -127,8 +185,24 @@ func RequireAgent(cfg AuthConfig, resolver KeyResolver) Middleware {
 				return
 			}
 
+			announceKeyLifetime(w, &principal)
 			next.ServeHTTP(w, r.WithContext(WithPrincipal(r.Context(), &principal)))
 		})
+	}
+}
+
+// announceKeyLifetime advertises the caller's own expiry on the response.
+//
+// Safe only here, after the principal has been accepted. Printing it any earlier
+// would hand an unauthenticated caller a way to tell a real-but-expired token
+// from an unknown one.
+func announceKeyLifetime(w http.ResponseWriter, principal *domain.Principal) {
+	if principal.Root || principal.ExpiresAt == 0 {
+		return
+	}
+	w.Header().Set(KeyExpiresAtHeader, strconv.FormatInt(principal.ExpiresAt/1000, 10))
+	if principal.Expired {
+		w.Header().Set(KeyExpiredHeader, "true")
 	}
 }
 

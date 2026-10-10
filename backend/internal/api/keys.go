@@ -62,16 +62,22 @@ const maxKeyLifetimeHours = 100 * 365 * 24
 // plaintext never reaches this layer.
 type keyResolver struct {
 	store *store.Store
+	// graceMS is how far past its expiry a key may be and still be reported, with
+	// Principal.Expired set. It is the same value the SQL filter uses, so the flag
+	// and the match can never disagree.
+	graceMS int64
 }
 
 // Resolve looks the hash up and turns a hit into a Principal.
 //
-// Failures are deliberately not distinguished: an unknown, revoked and expired
-// key all yield ok=false, matching what the middleware must tell the caller
-// (nothing).
+// Unknown and revoked keys both yield ok=false, matching what the middleware
+// must tell the caller (nothing). One case is reported rather than hidden: a key
+// past its expiry but inside the grace window resolves with Expired set, because
+// the caller already holds that token — the fact is not a secret from it — and
+// the middleware, not this layer, decides whether to admit it.
 func (r keyResolver) Resolve(ctx context.Context, tokenHash string) (domain.Principal, bool) {
 	nowMS := store.NowMS()
-	key, err := r.store.ResolveAgentKey(tokenHash, nowMS)
+	key, expired, err := r.store.ResolveAgentKeyWithinGrace(tokenHash, nowMS, r.graceMS)
 	if err != nil {
 		// A database failure must fail closed *and* stay invisible on the wire:
 		// the middleware answers with the same 401 as a bad token.
@@ -88,7 +94,12 @@ func (r keyResolver) Resolve(ctx context.Context, tokenHash string) (domain.Prin
 	if err := r.store.TouchAgentKey(key.ID, store.NowMS()); err != nil {
 		slog.WarnContext(ctx, "touch agent key failed", "keyId", key.ID, "error", err)
 	}
-	return domain.Principal{KeyID: key.ID, Name: key.Name}, true
+	return domain.Principal{
+		KeyID:     key.ID,
+		Name:      key.Name,
+		Expired:   expired,
+		ExpiresAt: key.ExpiresAt,
+	}, true
 }
 
 // limitKeyApplications throttles the public application endpoint per source IP.
@@ -396,7 +407,12 @@ func (s *Server) handleCreateRenewal(w http.ResponseWriter, r *http.Request) {
 		writeKeyLifecycleError(w, r, err)
 		return
 	}
-	httpx.OK(w, r, s.renewalCreatedPayload(renewal), http.StatusCreated)
+	payload := s.renewalCreatedPayload(renewal)
+	// Tell the agent explicitly when it is filing from beyond the grave, rather
+	// than leaving it to infer why every other endpoint just 401'd. The header
+	// says the same thing, but a body field survives clients that drop headers.
+	payload["key_expired"] = principal.Expired
+	httpx.OK(w, r, payload, http.StatusCreated)
 }
 
 // ---------------------------------------------------------------------------

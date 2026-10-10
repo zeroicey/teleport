@@ -158,6 +158,26 @@ function keyState(key: AgentKey): KeyState {
   return 'active';
 }
 
+/**
+ * Whether an expired key can still file a renewal request.
+ *
+ * This is the difference between "this agent is dead and its reports are
+ * orphaned" and "this agent can ask you for more time" — the whole reason the
+ * grace window exists — so the badge must not flatten the two into one grey
+ * "已过期".
+ *
+ * The window length lives in the server's KEY_RENEWAL_GRACE and is deliberately
+ * not exposed here: an admin endpoint that published the deployment's internal
+ * policy would be a new disclosure surface for no real gain. The panel therefore
+ * states what it actually knows — the key lapsed and can ask again — and lets
+ * the server enforce the deadline. Whether a request is still inside the window
+ * is visible where it matters: it either appears in the renewal queue or is
+ * refused with a 401.
+ */
+function expiredMayStillRenew(key: AgentKey): boolean {
+  return keyState(key) === 'expired';
+}
+
 function formatLastUsed(ms: number): string {
   return ms > 0 ? relativeTime(ms) : '从未使用';
 }
@@ -564,6 +584,14 @@ async function rejectRenewal(renewal: KeyRenewal) {
             >
               {{ stateLabel[keyState(k)] }}
             </span>
+            <div
+              v-if="expiredMayStillRenew(k)"
+              class="muted"
+              style="font-size: 11px; margin-top: 2px"
+              title="宽限期内该密钥仍可提交续期申请；超过宽限期后彻底失效"
+            >
+              仍可申请续期
+            </div>
           </td>
           <td>
             <div class="row" style="justify-content: flex-end; gap: 4px">
