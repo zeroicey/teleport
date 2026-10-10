@@ -13,6 +13,7 @@ import (
 	"github.com/zeroicey/teleport/backend/internal/config"
 	"github.com/zeroicey/teleport/backend/internal/password"
 	"github.com/zeroicey/teleport/backend/internal/store"
+	"github.com/zeroicey/teleport/backend/internal/views"
 )
 
 const (
@@ -393,6 +394,12 @@ func TestSharePageRendering(t *testing.T) {
 			if !strings.Contains(csp, want) {
 				t.Errorf("CSP missing %q: %s", want, csp)
 			}
+		}
+		// The header must be the shared constant, not a second copy that can
+		// drift from the one in views. Comparing whole strings is what catches
+		// an edit to either side.
+		if csp != views.ContentSecurityPolicy {
+			t.Errorf("CSP = %q\nwant %q", csp, views.ContentSecurityPolicy)
 		}
 	})
 

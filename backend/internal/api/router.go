@@ -25,6 +25,7 @@ import (
 	"github.com/zeroicey/teleport/backend/internal/password"
 	"github.com/zeroicey/teleport/backend/internal/spa"
 	"github.com/zeroicey/teleport/backend/internal/store"
+	"github.com/zeroicey/teleport/backend/internal/views"
 	"github.com/zeroicey/teleport/backend/internal/webui"
 )
 
@@ -330,12 +331,12 @@ func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
 	_ = s.store.RecordView(token)
 
 	// Never cache a page whose lifetime is deliberately bounded.
+	//
+	// The policy lives in views, next to the HTML it constrains, so the two
+	// cannot be edited independently.
 	h := w.Header()
 	h.Set("Cache-Control", "no-store, must-revalidate")
-	h.Set("Content-Security-Policy", "default-src 'none'; "+
-		"script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "+
-		"font-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; "+
-		"frame-ancestors 'none'; upgrade-insecure-requests")
+	h.Set("Content-Security-Policy", views.ContentSecurityPolicy)
 	h.Set("Content-Type", "text/html; charset=utf-8")
 
 	page := renderSharePage(s, resolution)

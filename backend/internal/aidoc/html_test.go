@@ -85,6 +85,10 @@ func TestLLMSTxtPointsAtTheGuide(t *testing.T) {
 		f.AppBase + "/api/health",
 		"Bearer",
 		"markdown",
+		// The key is self-service. An agent that reads only llms.txt must not be
+		// sent to the user, who cannot read an agent's key back out by design.
+		f.AppBase + "/api/agent-keys/applications",
+		"X-Teleport-Claim",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("llms.txt omits %q", want)
@@ -92,6 +96,35 @@ func TestLLMSTxtPointsAtTheGuide(t *testing.T) {
 	}
 	if strings.Contains(got, "{{") {
 		t.Error("llms.txt contains an unresolved placeholder")
+	}
+}
+
+// Tripwire for a drift that shipped once: llms.txt kept telling agents to ask
+// the user for a key long after keys became self-service. It is the discovery
+// file, so that is exactly where the wrong instruction does the most damage —
+// and nothing else caught it, because the canonical guide was already correct.
+//
+// The needles are deliberately broad: pinning only the exact sentence that
+// shipped would let a reworded version ("ask the user for a key", "request it
+// from the user") through.
+func TestLLMSTxtDoesNotSendAgentsToTheUserForAKey(t *testing.T) {
+	got := strings.ToLower(LLMSTxt(testFacts()))
+	for _, forbidden := range []string{
+		"ask the user",
+		"from the user",
+		"the user for a key",
+		"user for the key",
+		"not published here",
+	} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("llms.txt contains %q; keys are self-service, the user cannot hand one over", forbidden)
+		}
+	}
+	// ...and it must positively route agents to the self-service endpoint, so
+	// that removing the instruction entirely also fails rather than passing
+	// vacuously.
+	if !strings.Contains(got, "/api/agent-keys/applications") {
+		t.Error("llms.txt does not point at the self-service application endpoint")
 	}
 }
 
