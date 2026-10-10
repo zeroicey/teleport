@@ -2,6 +2,49 @@
 
 **Status:** ✅ 全部已部署上线 · **Updated:** 2026-10-11 · **线上版本:** `711f194`
 
+## 2026-10-11 追加④：报告的更新与删除 —— **已实现（待部署）**
+
+用户原话：「继续做报告更新删除这些操作吧」。
+裁决记录：`decisions/2026-10-11-report-update-and-delete.md`（含 D1–D6 与三条我自行拍板的设计）。
+
+**关键认识：这不是新设计，是把 schema 里已经写下的意图接通。**
+- `reports.updated_at` + `trg_reports_touch_updated_at`（注释原文
+  "keep reports.updated_at honest without trusting the caller"）——
+  在一个"报告不可变"的模型里，这个列和这条触发器毫无意义。分享页也**早就**
+  渲染了「更新 / Updated」字段（只是它一直恒等于创建时间）。→ 更新本就是**原地**的。
+- `share_tokens.report_id ... ON DELETE CASCADE` —— 删报告就该连带删链接。
+
+| 交付 | 位置 |
+| --- | --- |
+| `PATCH`/`DELETE /api/reports/{id}`（agent，归属限定） | `api/router.go` |
+| `PATCH`/`DELETE /api/admin/reports/{id}`（面板 god-view） | 同上，共用 `applyReportPatch`/`applyReportDelete` |
+| `UpdateReport`（COALESCE 局部更新）/ `DeleteReport`（级联） | `store/queries.go` |
+| `domain.ReportPatch` + `Provided()` | `domain/types.go` |
+| `ParseUpdateReportInput`：未知字段 400 / 空 patch 400 | `validate/validate.go` |
+| 面板：编辑卡片 + 删除二次确认（点名链接会全失效） | `ReportDetailView.vue` |
+| 列表「已更新」标记 | `ReportsView.vue` + `api.ts` |
+| `/ai.md`、`/llms.txt`、`README.md` | 三处 |
+
+**设计要点（默认严格）**：未知字段 **400** 而不是静默忽略 —— 否则
+`{"Content": "..."}`（大写 C，最可能的笔误）会返回 200 而正文一个字没改，
+调用方会把假结论告诉用户。空 patch 也是 400（否则 `updated_at` 前移，
+分享页显示一次并不存在的更新）。`owner_key_id` **不可更新**（归属是安全边界）。
+
+**验证**：`pnpm run check` / `backend:vet` / `go test -race` 全绿；
+6 条守卫**逐条反证**过；真实二进制实测：同毫秒连续 4 次更新严格递增、
+同一条分享链接立刻展示新正文（且旧正文消失）、非归属者 PATCH/DELETE 双 404
+且内容未被改动、未知字段 400（`details.updatable` 列出白名单）、
+删除后 2 条 token → 0 且全库零孤儿、旧链接/读/改/再删/面板读全部 404。
+
+⚠️ **反证过程中发现并修掉一个真 bug**：`updated_at` 曾会**倒退到创建时间之前**
+（最多 999ms）。原因：`updated_at` 写成朴素 `now`，当它与已存值**同毫秒相等**时，
+`trg_reports_touch_updated_at` 的 `WHEN NEW.updated_at = OLD.updated_at` 成立，
+触发器用 `strftime('%s','now')*1000`（**截断到整秒**）覆盖，值可能落到创建之前。
+改为 `updated_at = MAX(?, updated_at + 1)`：严格递增 → 触发器永不触发，
+且时钟回拨也不会倒退。**它能藏住，是因为我原测试里有一句 `time.Sleep(3ms)`
+恰好排除了同毫秒这一被测条件**。详见
+`pitfalls/cases/2026-10-11-update-delete-and-the-dead-cascade.md`。
+
 ## 2026-10-10 追加③：密钥过期后的身份连续性 —— **已实现并部署（`711f194`）**
 
 用户裁决（见 `decisions/2026-10-10-agent-key-identity-across-expiry.md`，已 ACCEPTED）：
