@@ -118,6 +118,99 @@ async function copy(token: string) {
 const activeCount = computed(
   () => report.value?.share_tokens.filter((t) => expiryState(t) === 'active').length ?? 0,
 );
+
+// -- edit ---------------------------------------------------------------------
+//
+// The form is seeded from the loaded report and then owned by the user. It is
+// NOT re-seeded on every load(), so a background refresh cannot silently discard
+// half-typed edits.
+const editing = ref(false);
+const saving = ref(false);
+const form = ref({ title: '', category: '', content: '' });
+
+function startEdit() {
+  if (!report.value) return;
+  form.value = {
+    title: report.value.title,
+    category: report.value.category,
+    content: report.value.content,
+  };
+  editing.value = true;
+  error.value = '';
+}
+
+/**
+ * Only the fields that actually changed are sent.
+ *
+ * Two reasons, both load-bearing: a PATCH carrying a field the server rejects is
+ * a 400, and sending an unchanged `content` of a large report would re-upload
+ * megabytes for nothing. The server's own rule is that an empty patch is a 400 —
+ * which is correct, since it would otherwise bump updated_at and make the share
+ * page advertise an edit nobody made.
+ */
+async function saveEdit() {
+  if (!report.value) return;
+  const current = report.value;
+  const patch: { title?: string; category?: string; content?: string } = {};
+  if (form.value.title !== current.title) patch.title = form.value.title;
+  if (form.value.category !== current.category) patch.category = form.value.category;
+  if (form.value.content !== current.content) patch.content = form.value.content;
+
+  if (Object.keys(patch).length === 0) {
+    editing.value = false;
+    flash('没有改动');
+    return;
+  }
+
+  saving.value = true;
+  error.value = '';
+  try {
+    report.value = await api.updateReport(current.id, patch);
+    editing.value = false;
+    flash('已保存。已有分享链接立即展示新内容。');
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : '保存失败';
+  } finally {
+    saving.value = false;
+  }
+}
+
+// -- delete -------------------------------------------------------------------
+
+const deleting = ref(false);
+
+/**
+ * Deleting takes the share links with it, so the confirmation has to name that
+ * consequence rather than ask a generic "are you sure?". The count comes from
+ * the loaded report, which already lists the links.
+ */
+async function removeReport() {
+  if (!report.value) return;
+  const total = report.value.share_tokens.length;
+  const live = activeCount.value;
+  const warning =
+    total === 0
+      ? `删除报告「${report.value.title}」？此操作不可撤销。`
+      : `删除报告「${report.value.title}」？\n\n` +
+        `它名下的 ${total} 条分享链接（其中 ${live} 条当前有效）会一并删除，` +
+        `已经拿到链接的人会立刻看到 404。\n\n此操作不可撤销，也没有回收站。`;
+  if (!window.confirm(warning)) return;
+
+  deleting.value = true;
+  error.value = '';
+  try {
+    await api.deleteReport(report.value.id);
+    await router.push('/dashboard/reports');
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : '删除失败';
+    deleting.value = false;
+  }
+}
+
+/** True once the report has been edited after publication. */
+const wasEdited = computed(
+  () => !!report.value && report.value.updated_at > report.value.created_at,
+);
 </script>
 
 <template>
@@ -139,9 +232,54 @@ const activeCount = computed(
           <span class="muted" style="margin-left: 10px">
             {{ activeCount }} / {{ report.share_tokens.length }} 条链接有效
           </span>
+          <span v-if="wasEdited" class="muted" style="margin-left: 10px" :title="formatDateTime(report.updated_at)">
+            已于 {{ formatDateTime(report.updated_at) }} 更新
+          </span>
         </p>
       </div>
+      <div class="row" style="gap: 8px">
+        <button type="button" @click="editing ? (editing = false) : startEdit()">
+          {{ editing ? '取消编辑' : '编辑内容' }}
+        </button>
+        <button class="danger" type="button" :disabled="deleting" @click="removeReport">
+          {{ deleting ? '正在删除…' : '删除报告' }}
+        </button>
+      </div>
     </div>
+
+    <!-- ---- edit ---- -->
+    <section v-if="editing" class="card stack" style="margin-bottom: 20px">
+      <h2 style="margin: 0; font-size: 1.05rem">编辑报告</h2>
+      <p class="muted" style="margin: 0; font-size: 13px">
+        保存后<strong>立即生效</strong>：报告 ID 不变，因此
+        <strong>已经发出去的分享链接会直接展示新内容</strong>，不会失效也不会换成新链接。
+        如果你需要「发出即冻结」的那一版，请改为重新发布一篇。
+      </p>
+
+      <label for="edit-title">标题</label>
+      <input id="edit-title" v-model="form.title" type="text" maxlength="300" />
+
+      <label for="edit-category">分类</label>
+      <input
+        id="edit-category"
+        v-model="form.category"
+        type="text"
+        placeholder="general / pentest / architecture / progress"
+      />
+      <span class="muted" style="font-size: 12px">
+        小写字母、数字、下划线与连字符，最长 32 字符
+      </span>
+
+      <label for="edit-content">正文（Markdown）</label>
+      <textarea id="edit-content" v-model="form.content" rows="18" class="mono"></textarea>
+
+      <div class="row" style="justify-content: flex-end; gap: 8px">
+        <button type="button" :disabled="saving" @click="editing = false">取消</button>
+        <button class="primary" type="button" :disabled="saving" @click="saveEdit">
+          {{ saving ? '保存中…' : '保存' }}
+        </button>
+      </div>
+    </section>
 
     <div v-if="error" class="alert error" style="margin-bottom: 16px">{{ error }}</div>
     <div v-if="notice" class="alert ok" style="margin-bottom: 16px">{{ notice }}</div>

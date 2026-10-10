@@ -467,3 +467,97 @@ func joinComma(parts []string) string {
 	}
 	return out
 }
+
+// ---------------------------------------------------------------------------
+// writes: update and delete
+// ---------------------------------------------------------------------------
+
+// UpdateReport applies a partial update and returns the stored row afterwards.
+//
+// found is false when the report does not exist — including when it was deleted
+// between the caller's ownership check and this statement, which is why the
+// caller must treat it as a 404 rather than assume its earlier read still holds.
+//
+// The COALESCE trick is what makes PATCH a patch: a nil argument leaves the
+// column untouched, so "field absent" and "field set to this value" stay
+// distinguishable without building SQL by string concatenation.
+//
+// updated_at is `MAX(now, updated_at + 1)` rather than a plain `now`, and both
+// halves of that matter:
+//
+//   - `MAX(..., updated_at + 1)` keeps it strictly increasing. Without the +1,
+//     an update landing in the same millisecond as the previous write would set
+//     updated_at to the value already stored, which is exactly the condition
+//     trg_reports_touch_updated_at watches for — the trigger would then fire and
+//     rewrite the column from strftime('%s','now') * 1000, i.e. truncated to
+//     whole SECONDS. The result could land up to 999ms *before* created_at, so
+//     the share page would show "Updated" earlier than "Created". Because the
+//     +1 guarantees the column always changes, the trigger never fires on this
+//     path and its second-granularity stamp cannot leak into the data.
+//   - `MAX(now, ...)` means a backwards system clock cannot move the column
+//     backwards either.
+func (s *Store) UpdateReport(id string, patch domain.ReportPatch, nowMS int64) (*domain.Report, bool, error) {
+	var metadataJSON *string
+	if patch.Metadata != nil {
+		encoded, err := json.Marshal(patch.Metadata)
+		if err != nil {
+			return nil, false, fmt.Errorf("encode metadata: %w", err)
+		}
+		asString := string(encoded)
+		metadataJSON = &asString
+	}
+
+	var format *string
+	if patch.Format != nil {
+		f := string(*patch.Format)
+		format = &f
+	}
+
+	res, err := s.db.Exec(
+		`UPDATE reports
+		    SET title      = COALESCE(?, title),
+		        category   = COALESCE(?, category),
+		        format     = COALESCE(?, format),
+		        content    = COALESCE(?, content),
+		        metadata   = COALESCE(?, metadata),
+		        updated_at = MAX(?, updated_at + 1)
+		  WHERE id = ?`,
+		patch.Title, patch.Category, format, patch.Content, metadataJSON, nowMS, id)
+	if err != nil {
+		return nil, false, fmt.Errorf("update report: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, false, fmt.Errorf("update report rows: %w", err)
+	}
+	if affected == 0 {
+		return nil, false, nil
+	}
+
+	report, err := s.reportByID(id)
+	if err != nil {
+		return nil, false, fmt.Errorf("reload report: %w", err)
+	}
+	return report, true, nil
+}
+
+// DeleteReport removes a report. found is false when there was nothing to
+// delete, so a repeated DELETE answers 404 rather than pretending to succeed.
+//
+// The report's share tokens go with it: share_tokens.report_id declares
+// ON DELETE CASCADE and the connection sets foreign_keys(1), so this single
+// statement is the whole operation. Without that pragma the cascade would be
+// dead code and orphaned tokens would linger — harmless to readers (the join
+// would find no report) but permanently unreachable rows, and a
+// `DELETE FROM reports` that silently leaves debris.
+func (s *Store) DeleteReport(id string) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM reports WHERE id = ?`, id)
+	if err != nil {
+		return false, fmt.Errorf("delete report: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("delete report rows: %w", err)
+	}
+	return affected > 0, nil
+}

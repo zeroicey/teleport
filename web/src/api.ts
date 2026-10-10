@@ -311,6 +311,56 @@ export const api = {
     return request<ReportDetail>(`/api/admin/reports/${encodeURIComponent(id)}`);
   },
 
+  /**
+   * Update a report in place.
+   *
+   * `patch` is a genuine partial update: omitted keys are left untouched, so
+   * sending only `content` does not blank the title. `metadata` is the
+   * exception — it REPLACES the stored object rather than merging, because
+   * merging cannot express "remove this key". Send `{}` to clear it.
+   *
+   * Two of these keys are deliberately absent:
+   *
+   *  - `id` / `created_at`: identity is not editable.
+   *  - `owner_key_id`: ownership is a security boundary, not data. The server
+   *    rejects a body carrying it rather than ignoring it.
+   *
+   * Sending a field the server does not know is a 400, not a silent no-op.
+   * That is on purpose: a typo (the classic one being `Content`, since request
+   * bodies are camelCase while responses are snake_case) would otherwise return
+   * 200 while changing nothing.
+   */
+  async updateReport(
+    id: string,
+    patch: {
+      title?: string;
+      category?: string;
+      format?: 'markdown' | 'html';
+      content?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ) {
+    return request<ReportDetail>(`/api/admin/reports/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    });
+  },
+
+  /**
+   * Delete a report and, with it, every share link pointing at it.
+   *
+   * The cascade is not a side effect to be worked around — it is the meaning of
+   * deleting a report. Anyone holding one of those links gets a 404 from the
+   * next request, so the confirmation in the UI has to say so before the fact.
+   * There is no undo and no recycle bin.
+   */
+  async deleteReport(id: string) {
+    return request<{ id: string; deleted: boolean }>(
+      `/api/admin/reports/${encodeURIComponent(id)}`,
+      { method: 'DELETE' },
+    );
+  },
+
   // -- share tokens ----------------------------------------------------------
   async createShare(reportId: string, expiresInHours: number) {
     return request<ShareToken>(

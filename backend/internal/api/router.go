@@ -107,6 +107,8 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	mux.Handle("POST "+p+"/api/reports", requireAgent(http.HandlerFunc(s.handleCreateReport)))
 	mux.Handle("GET "+p+"/api/reports", requireAgent(http.HandlerFunc(s.handleListOwnReports)))
 	mux.Handle("GET "+p+"/api/reports/{id}", requireAgent(http.HandlerFunc(s.handleGetReport)))
+	mux.Handle("PATCH "+p+"/api/reports/{id}", requireAgent(http.HandlerFunc(s.handleUpdateReport)))
+	mux.Handle("DELETE "+p+"/api/reports/{id}", requireAgent(http.HandlerFunc(s.handleDeleteReport)))
 	mux.Handle("POST "+p+"/api/share/{token}/revoke", requireAgent(http.HandlerFunc(s.handleRevoke)))
 
 	// Key self-service. The application and renewal poll endpoints are their own
@@ -132,6 +134,8 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	mux.Handle("GET "+p+"/api/admin/session", requireSession(http.HandlerFunc(s.handleSession)))
 	mux.Handle("GET "+p+"/api/admin/reports", requireSession(http.HandlerFunc(s.handleListReports)))
 	mux.Handle("GET "+p+"/api/admin/reports/{id}", requireSession(http.HandlerFunc(s.handleAdminGetReport)))
+	mux.Handle("PATCH "+p+"/api/admin/reports/{id}", requireSession(http.HandlerFunc(s.handleAdminUpdateReport)))
+	mux.Handle("DELETE "+p+"/api/admin/reports/{id}", requireSession(http.HandlerFunc(s.handleAdminDeleteReport)))
 	mux.Handle("POST "+p+"/api/admin/reports/{id}/shares", requireSession(http.HandlerFunc(s.handleCreateShare)))
 	mux.Handle("PATCH "+p+"/api/admin/shares/{token}", requireSession(http.HandlerFunc(s.handlePatchShare)))
 	mux.Handle("DELETE "+p+"/api/admin/shares/{token}", requireSession(http.HandlerFunc(s.handleDeleteShare)))
@@ -470,6 +474,126 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.OK(w, r, map[string]any{"token": token, "is_active": false})
+}
+
+// ---------------------------------------------------------------------------
+// update / delete
+// ---------------------------------------------------------------------------
+
+// applyReportPatch is the shared body of the agent and dashboard PATCH routes.
+//
+// The two routes differ only in who may touch the report, which is decided by
+// the caller-supplied authorise function. Everything else — parsing, the
+// ownership check happening before the write, the 404-not-403 rule, and the
+// response shape — lives here once, so the dashboard cannot drift into being
+// more permissive or more talkative than the agent API.
+func (s *Server) applyReportPatch(w http.ResponseWriter, r *http.Request, authorise func(*domain.Report) bool) {
+	id := r.PathValue("id")
+
+	raw, err := io.ReadAll(io.LimitReader(r.Body, s.cfg.MaxContentBytes+1<<16))
+	if err != nil {
+		httpx.WriteError(w, r, httpx.BadRequest("Could not read request body", nil))
+		return
+	}
+	body, err := validateJSON(raw)
+	if err != nil {
+		httpx.WriteError(w, r, err)
+		return
+	}
+	patch, err := parseUpdateReport(body, s.cfg.MaxContentBytes)
+	if err != nil {
+		httpx.WriteError(w, r, err)
+		return
+	}
+
+	// Resolve and authorise BEFORE writing. Doing it after would mean the write
+	// already happened for a caller who turns out not to be allowed, and any
+	// "0 rows changed" answer would have to double as both "no such report" and
+	// "not yours" — the two must stay indistinguishable, so the decision has to
+	// be made on a read that can return 404 for both.
+	existing, err := s.store.GetReport(id)
+	if err != nil {
+		httpx.WriteError(w, r, httpx.Internal("Failed to load report").WithCause(err))
+		return
+	}
+	if existing == nil || !authorise(existing) {
+		httpx.WriteError(w, r, httpx.NotFound("Report not found"))
+		return
+	}
+
+	report, found, err := s.store.UpdateReport(id, patch, time.Now().UnixMilli())
+	if err != nil {
+		httpx.WriteError(w, r, httpx.Internal("Failed to update report").WithCause(err))
+		return
+	}
+	if !found {
+		// Deleted between the check and the write. Report it as absent rather
+		// than resurrecting a success for a row that no longer exists.
+		httpx.WriteError(w, r, httpx.NotFound("Report not found"))
+		return
+	}
+	httpx.OK(w, r, report)
+}
+
+// applyReportDelete is the shared body of the agent and dashboard DELETE routes.
+func (s *Server) applyReportDelete(w http.ResponseWriter, r *http.Request, authorise func(*domain.Report) bool) {
+	id := r.PathValue("id")
+
+	existing, err := s.store.GetReport(id)
+	if err != nil {
+		httpx.WriteError(w, r, httpx.Internal("Failed to load report").WithCause(err))
+		return
+	}
+	// Same rule as PATCH and as every other ownership check in this package: a
+	// caller who is not allowed to see the report must not be able to tell it
+	// apart from one that does not exist.
+	if existing == nil || !authorise(existing) {
+		httpx.WriteError(w, r, httpx.NotFound("Report not found"))
+		return
+	}
+
+	found, err := s.store.DeleteReport(id)
+	if err != nil {
+		httpx.WriteError(w, r, httpx.Internal("Failed to delete report").WithCause(err))
+		return
+	}
+	if !found {
+		httpx.WriteError(w, r, httpx.NotFound("Report not found"))
+		return
+	}
+	// The response reports what actually happened to the links, so a client can
+	// say "and its N links are dead now" without guessing.
+	httpx.OK(w, r, map[string]any{
+		"id":      id,
+		"deleted": true,
+	})
+}
+
+func (s *Server) handleUpdateReport(w http.ResponseWriter, r *http.Request) {
+	principal := httpx.PrincipalFrom(r.Context())
+	s.applyReportPatch(w, r, func(report *domain.Report) bool {
+		return ownerCanAccess(principal, report.OwnerKeyID)
+	})
+}
+
+func (s *Server) handleDeleteReport(w http.ResponseWriter, r *http.Request) {
+	principal := httpx.PrincipalFrom(r.Context())
+	s.applyReportDelete(w, r, func(report *domain.Report) bool {
+		return ownerCanAccess(principal, report.OwnerKeyID)
+	})
+}
+
+// The dashboard routes deliberately apply no ownership predicate: the dashboard
+// is already authenticated as the human owner of the deployment, and
+// ownerCanAccess grants root (and therefore a session, which carries none of
+// the agent principal's fields) access to everything. Passing "always true"
+// keeps that in one visible place.
+func (s *Server) handleAdminUpdateReport(w http.ResponseWriter, r *http.Request) {
+	s.applyReportPatch(w, r, func(*domain.Report) bool { return true })
+}
+
+func (s *Server) handleAdminDeleteReport(w http.ResponseWriter, r *http.Request) {
+	s.applyReportDelete(w, r, func(*domain.Report) bool { return true })
 }
 
 // ---------------------------------------------------------------------------

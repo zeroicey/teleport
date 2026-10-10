@@ -255,6 +255,17 @@ token    = base64url(HMAC-SHA256(K_derive, "teleport/agent-key/v1|" + appID + "|
 - `GET /api/reports`：**列出调用者自己发布的报告**（root 列出全部）。这是「管理自己的报告」
   所需要的全部能力——读别人的 id 一律 404，所以忘了 id 就等于永久失去该记录，
   这个接口是唯一的找回途径。
+- `PATCH /api/reports/{id}`：**原地更新**自己的报告。`report.id` 不变，因此
+  **已发出的分享链接直接展示新内容**（分享页会显示「更新 / Updated」时间）。
+  局部更新，可更新字段仅 `title`/`content`/`category`/`format`/`metadata`；
+  `metadata` **整体替换**（清空发 `{}`）；**未知字段与空 patch 都是 400**——
+  静默忽略字段会让 `{"Content": ...}` 返回 200 却什么都没改，那是错误答案而非宽容；
+  `owner_key_id` **不可更新**（归属是安全边界，不是数据）。
+- `DELETE /api/reports/{id}`：删除报告，**连同它的全部分享链接**
+  （`share_tokens.report_id` 上的 `ON DELETE CASCADE`，依赖 DSN 里的
+  `_pragma=foreign_keys(1)`）。已拿到链接的人立刻 404；**不可撤销、无软删除**。
+  只想收回链接而保留报告，应当用 `POST /api/share/{token}/revoke`。
+  重复 DELETE 返回 404（与「未知 token 一律 404」一致，不做幂等 204）。
 - `GET /api/reports/:id`、`POST /api/share/:token/revoke`：**只有发布者本人**（或 root / 面板）
   能操作；非归属者一律 **404**，不暴露"存在但不是你的"。
 - **密钥过期后有 90 天续期宽限期**（`KEY_RENEWAL_GRACE`，默认 `2160h`；设 `0` 关闭）。

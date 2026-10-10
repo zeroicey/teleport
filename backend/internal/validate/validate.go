@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"math"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf16"
@@ -262,4 +263,103 @@ func jsToNumber(v any) (float64, bool) {
 		return math.NaN(), true
 	}
 	return math.NaN(), true
+}
+
+// updatableReportFields is the closed set of fields PATCH /api/reports/{id}
+// accepts. Anything else is a 400, not a silent no-op.
+var updatableReportFields = []string{"title", "content", "category", "format", "metadata"}
+
+// ParseUpdateReportInput validates the body of PATCH /api/reports/{id}.
+//
+// Two rules here are deliberate and cost a little convenience:
+//
+//  1. An unknown field is a 400. The whole point of PATCH is that a caller can
+//     send one field and expect it to change; if we ignored unrecognised keys
+//     then `{"Content": "..."}` (capital C — the single most likely mistake,
+//     since request bodies are camelCase but responses are snake_case) would
+//     return 200 while changing nothing. The caller, quite likely an agent,
+//     would report success to its user. A loud 400 is strictly better than a
+//     silent wrong answer.
+//  2. An empty patch is a 400. It would otherwise bump updated_at, and the share
+//     page renders "Updated", so the page would advertise a change that never
+//     happened.
+//
+// Absent and null both mean "leave unchanged". Note the asymmetry with
+// present(): `{"content": ""}` is *provided* (so it fails the non-empty check
+// loudly) rather than silently ignored as absent.
+func ParseUpdateReportInput(body any, maxContentBytes int64) (domain.ReportPatch, error) {
+	var out domain.ReportPatch
+
+	obj, ok := body.(map[string]any)
+	if !ok {
+		return out, httpx.BadRequest("Request body must be a JSON object", nil)
+	}
+
+	for key := range obj {
+		if !slices.Contains(updatableReportFields, key) {
+			return out, httpx.BadRequest(
+				"`"+key+"` is not an updatable field",
+				map[string]any{"field": key, "updatable": updatableReportFields})
+		}
+	}
+
+	if v, ok := obj["title"]; ok && v != nil {
+		title, err := RequireString(v, "title", 1, TITLE_MAX)
+		if err != nil {
+			return out, err
+		}
+		out.Title = &title
+	}
+
+	if v, ok := obj["content"]; ok && v != nil {
+		content, ok := v.(string)
+		if !ok || content == "" {
+			return out, httpx.BadRequest("`content` must be a non-empty string",
+				map[string]any{"field": "content"})
+		}
+		// Byte length, not code units: SQLite limits are byte-based and CJK is
+		// ~3 bytes per character. Same rule as create.
+		if contentBytes := int64(len(content)); contentBytes > maxContentBytes {
+			return out, httpx.PayloadTooLarge(
+				"`content` is " + strconv.FormatInt(contentBytes, 10) + " bytes, exceeding the " +
+					strconv.FormatInt(maxContentBytes, 10) + " byte limit")
+		}
+		out.Content = &content
+	}
+
+	if v, ok := obj["category"]; ok && v != nil {
+		s, ok := v.(string)
+		if !ok || !categoryRE.MatchString(s) {
+			return out, httpx.BadRequest(
+				"`category` must match /^[a-z0-9][a-z0-9_-]{0,31}$/ (e.g. pentest, architecture, progress)",
+				map[string]any{"field": "category"})
+		}
+		out.Category = &s
+	}
+
+	if v, ok := obj["format"]; ok && v != nil {
+		s, ok := v.(string)
+		if !ok || !formatSet[s] {
+			return out, httpx.BadRequest("`format` must be one of: markdown, html",
+				map[string]any{"field": "format"})
+		}
+		f := domain.ReportFormat(s)
+		out.Format = &f
+	}
+
+	if v, ok := obj["metadata"]; ok && v != nil {
+		m, ok := v.(map[string]any)
+		if !ok {
+			return out, httpx.BadRequest("`metadata` must be a JSON object",
+				map[string]any{"field": "metadata"})
+		}
+		out.Metadata = m
+	}
+
+	if !out.Provided() {
+		return out, httpx.BadRequest(
+			"Request body must contain at least one field to update",
+			map[string]any{"updatable": updatableReportFields})
+	}
+	return out, nil
 }

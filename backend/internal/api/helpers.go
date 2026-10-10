@@ -29,6 +29,10 @@ func parseCreateReport(body any, maxContentBytes int64) (domain.CreateReportInpu
 	return validate.ParseCreateReportInput(body, maxContentBytes)
 }
 
+func parseUpdateReport(body any, maxContentBytes int64) (domain.ReportPatch, error) {
+	return validate.ParseUpdateReportInput(body, maxContentBytes)
+}
+
 func requireString(value any, field string, min, max int) (string, error) {
 	return validate.RequireString(value, field, min, max)
 }

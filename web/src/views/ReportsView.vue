@@ -99,6 +99,19 @@ const categories = computed(() =>
           <td class="muted">{{ r.format }}</td>
           <td class="muted" :title="new Date(r.created_at).toISOString()">
             {{ relativeTime(r.created_at) }}
+            <!--
+              updated_at now moves, so the list has to show it: a report that
+              says "3 days ago" while having been corrected an hour ago would
+              mislead exactly the person checking whether the fix landed.
+            -->
+            <div
+              v-if="r.updated_at > r.created_at"
+              class="muted"
+              style="font-size: 11px"
+              :title="`更新于 ${new Date(r.updated_at).toISOString()}`"
+            >
+              已更新 · {{ relativeTime(r.updated_at) }}
+            </div>
           </td>
         </tr>
       </tbody>

@@ -56,6 +56,34 @@ type CreateReportInput struct {
 	OwnerKeyID string
 }
 
+// ReportPatch is a partial update to a report. A nil field means "not provided
+// and therefore unchanged", which is why every field is a pointer or a nil-able
+// map: PATCH must be able to distinguish "set this to X" from "leave it alone",
+// and for metadata "set it to {}" from "leave it alone".
+//
+// There is deliberately no OwnerKeyID field. Ownership is a security boundary,
+// not data: a caller must not be able to hand a report to another key, nor
+// claim one, by patching it. A request body carrying owner_key_id is rejected
+// outright rather than ignored.
+type ReportPatch struct {
+	Title    *string
+	Category *string
+	Format   *ReportFormat
+	Content  *string
+	// Metadata replaces the stored object wholesale. Merging cannot express
+	// "delete this key" (is null a deletion or a null value?), so replacement is
+	// the only unambiguous choice; send {} to clear it.
+	Metadata map[string]any
+}
+
+// Provided reports whether the patch carries at least one field to change.
+// An empty patch is refused by the API layer: it would bump updated_at and make
+// the share page advertise an update that never happened.
+func (p ReportPatch) Provided() bool {
+	return p.Title != nil || p.Category != nil || p.Format != nil ||
+		p.Content != nil || p.Metadata != nil
+}
+
 // Resolution is the outcome of resolving a share token.
 type Resolution struct {
 	Status ResolutionStatus

@@ -72,7 +72,7 @@ export TELEPORT_BASE='{{APP_BASE}}'
 | 形式 | 一个不透明的字符串（服务端保证 256 位熵） |
 | 获取方式 | **自助申请**：`POST /api/agent-keys/applications` → 轮询 → 一次性领取 `key.token` |
 | 传递方式 | 通过 `Authorization: Bearer <AGENT_KEY>` 请求头发送 |
-| 适用接口 | `POST /api/reports` · `GET /api/reports`（列自己的）· `GET /api/reports/{id}` · `POST /api/share/{token}/revoke` · `GET /api/agent-keys/me` · `POST /api/agent-keys/renewals` |
+| 适用接口 | `POST /api/reports` · `GET /api/reports`（列自己的）· `GET /api/reports/{id}` · `PATCH /api/reports/{id}`（改自己的）· `DELETE /api/reports/{id}`（删自己的）· `POST /api/share/{token}/revoke` · `GET /api/agent-keys/me` · `POST /api/agent-keys/renewals` |
 | 不适用 | `/api/admin/*`（那是浏览器会话 Cookie 的地盘） |
 
 ### 2.1 端点一览
@@ -85,8 +85,10 @@ export TELEPORT_BASE='{{APP_BASE}}'
 | 2 | `GET` | `{P}/api/agent-keys/applications/{id}` | 头 `X-Teleport-Claim: <claim_secret>` | 轮询状态；批准后**一次性**领取 `key.token` |
 | 3 | `GET` | `{P}/api/agent-keys/me` | `Authorization: Bearer` | 查自身状态、有效期、用量 |
 | 4 | `GET` | `{P}/api/reports` | `Authorization: Bearer` | **列出你自己发布的报告**（见 2.5.1） |
-| 5 | `POST` | `{P}/api/agent-keys/renewals` | `Authorization: Bearer` | 发起续期（**需人类批准**），成功 `201` |
-| 6 | `GET` | `{P}/api/agent-keys/renewals/{id}` | 头 `X-Teleport-Claim: <claim_secret>` | 轮询续期结果 |
+| 5 | `PATCH` | `{P}/api/reports/{id}` | `Authorization: Bearer` | **原地更新**自己的报告（见 2.5.2），成功 `200` |
+| 6 | `DELETE` | `{P}/api/reports/{id}` | `Authorization: Bearer` | **删除**自己的报告（连带其全部分享链接），成功 `200` |
+| 7 | `POST` | `{P}/api/agent-keys/renewals` | `Authorization: Bearer` | 发起续期（**需人类批准**），成功 `201` |
+| 8 | `GET` | `{P}/api/agent-keys/renewals/{id}` | 头 `X-Teleport-Claim: <claim_secret>` | 轮询续期结果 |
 
 > ⚠️ **字段命名约定（最容易踩的一条）**：**请求体字段一律 camelCase**
 > （`label`、`purpose`、`requestedHours`、`expiresInHours`），
@@ -401,6 +403,58 @@ curl -sS "$TELEPORT_BASE/api/reports?limit=50" \
 - 支持的查询参数：`limit`（1–200，默认 50）、`offset`（默认 0）、`category`（精确匹配）。
 - 尚无报告时返回**空数组 `[]`**，不是 `null`，可以直接迭代。
 
+### 2.5.2 更新与删除自己的报告
+
+**改一篇已发出的报告，不要重发。** 重发会得到**新的 `report.id` 和新链接**，
+而你此前发出去的那些链接会指向旧内容（或在你撤销后变成 404）。
+
+#### 更新：`PATCH /api/reports/{id}`
+
+```bash
+curl -sS -X PATCH "$TELEPORT_BASE/api/reports/$REPORT_ID" \
+  -H "Authorization: Bearer $TELEPORT_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"content":"# 修正后的正文"}'
+```
+
+- **原地更新**：`report.id` 不变，**同一条分享链接继续有效，并且立刻展示新内容**。
+  这就是「更新」的定义 —— 链接已经发给读者时，对方刷新就能看到新版本，
+  而不是拿到 404 或另一条链接。分享页会显示「更新 / Updated」时间，读者看得出它变过。
+- **局部更新**：只发你要改的字段，其余原样保留。可更新字段**只有**
+  `title`、`content`、`category`、`format`、`metadata`。
+- **`metadata` 是整体替换，不是合并**。想清空就发 `{}`。
+  合并语义无法表达「删掉这个键」，所以没有采用。
+- **字段名写错 → `400`，不是静默忽略。** 请求体是 camelCase、响应是 snake_case，
+  所以最容易犯的错是把 `content` 写成 `Content`（大写 C）。若服务端"宽容地"忽略
+  未知字段，你会拿到 `200` 而正文**一个字都没变** —— 然后把这个假结论告诉用户。
+  所以服务端选择报错，并在 `details.updatable` 里列出可更新字段。
+- **空 patch（`{}`）→ `400`**。它会把 `updated_at` 前移，让分享页显示一次
+  **并不存在**的更新。要么给一个字段，要么别调这个接口。
+- **`owner_key_id` 不可更新**（传了就是 `400`）：归属是安全边界，不是数据字段。
+  一把密钥不能把自己的报告"送"给别人，也不能认领别人的。
+- 更新**不会**重置或延长任何分享链接的有效期，也**不会**产生新链接。
+- 若报告里有 Mermaid 图表，正文更新后分享页会用新源码重新渲染。
+
+#### 删除：`DELETE /api/reports/{id}`
+
+```bash
+curl -sS -X DELETE "$TELEPORT_BASE/api/reports/$REPORT_ID" \
+  -H "Authorization: Bearer $TELEPORT_KEY"
+```
+
+- **不可撤销，没有回收站，没有软删除。** 报告行与其**全部**分享链接一起消失
+  （数据库外键 `ON DELETE CASCADE`），已经拿到链接的人**立刻**看到 **404**。
+- 删除后该 id 对你就等于从未存在过：再读、再改、再删都是 **404**。
+- 想「撤回」但保留可恢复性，应该用 `POST /api/share/{token}/revoke`
+  **撤销链接**（报告本身还在，可以再生成新链接），而不是删除报告。
+- 重复 `DELETE` 返回 **404**（不是幂等的 204）—— 与「未知 token 一律 404」一致。
+
+#### 谁能改谁
+
+**只有发布者本人**（或 root / 面板）。非归属者的 `PATCH` 与 `DELETE` 都是 **404**，
+与读别人报告、撤销别人链接的语义完全一致：不确认「存在但不是你的」。
+归属检查发生在**任何写入之前**，所以被拒的请求不会留下任何痕迹。
+
 ### 2.6 权限边界：你只能管你自己发布的报告
 
 这是**归属模型**，不是普通的权限位。`POST /api/reports` 会把发布者记在报告上，
@@ -412,8 +466,9 @@ curl -sS "$TELEPORT_BASE/api/reports?limit=50" \
   是同一套语义。**不要把 404 当成故障，也不要拿它去探测别人有哪些报告。**
 - 你的密钥发布报告**不受归属限制**（可以发任意多篇）；归属约束的是读与撤销，
   以及别人的报告对你不可见。
-- 你可以用 `GET /api/reports` **列出自己的全部报告**（见 2.5.1）。这是「管理自己的文章」
-  所需要的全部能力：要改内容就重发一篇并撤销旧分享链接。
+- 你可以用 `GET /api/reports` **列出自己的全部报告**（见 2.5.1），
+  用 `PATCH /api/reports/{id}` **原地改**、用 `DELETE /api/reports/{id}` **删除**。
+  管理自己的文章不再需要「重发 + 撤销旧链接」这套绕路（见 2.5.2）。
 - `AGENT_SECRET_KEY`（root / 应急密钥）能读全部报告，那是运维的凭据，你没有也不需要它。
 - `/api/admin/*` 全部走人类的 Session Cookie，你的 Bearer 密钥在这里无效；
   反过来面板的 Session Cookie 也不能调 `/api/reports`。
