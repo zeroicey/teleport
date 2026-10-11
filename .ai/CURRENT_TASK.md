@@ -1,9 +1,9 @@
 # Current task
 
-**Status:** ✅ **UI 优化 + TailwindCSS 迁移 + 自托管字体已完成，全部闸门绿** ·
-`pnpm run check` / `backend:vet` / `build:release` 全通过；真浏览器 7 组页面全绿、a11y 审计 0 失败 ·
+**Status:** ✅ **UI 优化已上线并线上真浏览器实测通过（37/37）** · 线上 `dbca734` ·
+`pnpm run check` / `backend:vet` / `build:release` 全绿 · a11y 审计 0 失败
 **Updated:** 2026-10-12
-**下一步：** ①（承接上一轮）把交接链接发给真人试用；② 本轮改动尚未 `git commit`，提交前需人类确认
+**下一步：** 把交接链接发给真人试用（承接上一轮，尚未开始）；另需从**大陆观测点**复验（见下）
 
 > 本文件是**当前状态**，不是流水账。每一轮的完整叙事在
 > `.ai/sessions/*-handoff.md` 与 `.ai/decisions/`、`.ai/pitfalls/` 里。
@@ -14,6 +14,18 @@
 
 > 「用搜索工具去搜一下 ui 设计的 skills 我们要给当前项目进行 ui 优化 你去推荐几个 ui 设计专业的 skills」
 > 「按你推荐的来，css 可以迁移到 tailwindcss，不用系统自带字体」
+> 「测试没问题就改提交提交改部署部署」
+
+### 上线状态
+
+| 项 | 值 |
+| --- | --- |
+| 提交 | `723c76e`（UI 主体）、`dbca734`（CSP 修复） |
+| 线上版本 | `dbca734`，sha256 `21fcffd5…`，已 `git push origin main` |
+| 部署前备份 | `teleport.db.bak-20261012-021215` 与 `…-0212xx`，`integrity_check=ok`、5 篇报告 |
+| 回滚材料 | `teleport.prev-20261012-021215`（`6a1b135`）、`teleport.prev-<第二次>` |
+| 停机窗口 | 各约 2 秒（停服→备份→换二进制→启动） |
+| 本次迁移 | **无**（仍是 `0001_init` + `0002_agent_keys`），回滚二进制安全 |
 
 ### 装了什么 skill
 
@@ -21,60 +33,61 @@
 
 | Skill | 来源 | 为什么装 |
 | --- | --- | --- |
-| `web-design-guidelines` | vercel-labs/agent-skills | 框架无关的质量闸门，规则可逐条核对（a11y / 焦点 / 表单 / 动画 / 排版 / 触控） |
-| `accessibility-review` | anthropics/knowledge-work-plugins | WCAG 2.1 AA 审计流程 + 输出模板，补上前者没有的对比度与语义检查 |
+| `web-design-guidelines` | vercel-labs/agent-skills | 框架无关的质量闸门，规则可逐条核对 |
+| `accessibility-review` | anthropics/knowledge-work-plugins | WCAG 2.1 AA 审计流程 + 输出模板 |
 
-**明确排除**：Vercel 的 React/Next 系列（本项目是 Vue）；另外 4 个推荐过但没装的见
-`.ai/skills/` 说明。装之前逐字读过内容，未发现 prompt injection
+**明确排除**：Vercel 的 React/Next 系列（本项目是 Vue）。
+装之前逐字读过内容，未发现 prompt injection
 （背景：Snyk 的 ToxicSkills 研究测出 36% 的 skill 含注入、1,467 个恶意载荷）。
 
 ### 改了什么
 
 1. **TailwindCSS v4 接入**：`@tailwindcss/vite` 插件，无 `tailwind.config.js`、
-   无 PostCSS，token 全在 `@theme`。`web/src/styles.css` → `web/src/app.css`。
-   裁决与理由：**`.ai/decisions/2026-10-12-tailwind-css-migration.md`**。
+   无 PostCSS，token 全在 `@theme`。`web/src/styles.css` → `web/src/app.css`，
+   且 `web/src` 里**不再有任何 `<style>` 块**。
+   裁决：**`.ai/decisions/2026-10-12-tailwind-css-migration.md`**。
 2. **自托管字体**：Outfit（拉丁）+ Noto Sans SC（中文，109 个 `unicode-range` 切片）
-   + JetBrains Mono（ID/代码）。取材脚本 `scripts/fonts/fetch_fonts.py`，
-   产物在 `web/public/fonts/`（4.4 MiB）。
+   + JetBrains Mono。取材脚本 `scripts/fonts/fetch_fonts.py`，
+   产物 `web/public/fonts/`（4.8 MB / 110 文件）。
    裁决：**`.ai/decisions/2026-10-12-self-hosted-webfonts.md`**。
-   SPA、分享页、交接页、`/ai` 页**四处都换掉了系统字体栈**。
-3. **a11y 与交互修复**（都是真浏览器测出来的，不是照着清单抄的）：
-   跳转链接、`role="alert"`/`role="status"`、表格 `<caption>` + `scope="col"`、
-   表单 `<label>`、对话框 `role="dialog"` + `aria-modal` + **焦点陷阱 + Escape**、
-   移动端导航触控目标 20px→32px、`tabular-nums`、`text-wrap: balance`、
-   `overscroll-behavior: contain`、`touch-action: manipulation`、`theme-color`。
-4. **顺手修掉五个真实缺陷**（都是本轮改动**暴露**出来的，见踩坑记录）：
+   SPA、分享页、交接页、`/ai` **四处**都换掉了系统字体栈。
+3. **a11y 与交互修复**（真浏览器测出，非照单抄）：跳转链接、`role="alert"`/`"status"`、
+   表格 `<caption>` + `scope`、表单 `<label>`、5 个对话框的
+   `role="dialog"` + `aria-modal` + **焦点陷阱 + Escape**、触控目标 20px→32px、
+   `tabular-nums`、`text-wrap: balance`、`overscroll-behavior`、
+   `touch-action`、`theme-color`、`autocomplete=off`。
+4. **顺手修掉六个真实缺陷**（均由本轮改动暴露，详见踩坑记录）：
    - 深链接刷新时字体 404（相对 URL 在 SPA 回退下按路由深度解析）；
-   - `no-cache` 配 `embed.FS` 没有校验器 → **每次整页加载重下 260–830 KB 字体**。
-     修法是字体文件名内容寻址 + 稳定名加 ETag；
-     并给后端补了此前**完全没有**的 gzip 中间件；
-   - **把 `<style scoped>` 搬进全局层后特异性丢失**，`.card` 的 `p-5` 盖掉了
-     登录卡的 `padding: 28px`（实测 20px）。构建/类型检查/Go 测试全绿，
-     只有真浏览器读 computed style 才抓得到；
-   - 完全没有 favicon（标签页空白图标），已补手绘 SVG 并在 4 处声明；
-   - 分享页 Mermaid 图表的 `fontFamily` 仍是系统字体栈，
-     与它旁边的正文不是同一个字族。
+   - `no-cache` 配 `embed.FS` 没有校验器 → 每次整页加载重下 260–830 KB 字体；
+   - 后端此前完全没有压缩 → 新增 gzip 中间件（`fonts.css` 107 KB → 32 KB）；
+   - 把 `<style scoped>` 搬进全局层后特异性丢失，`.card` 的 `p-5` 盖掉登录卡
+     `padding: 28px`（实测 20px）；
+   - 完全没有 favicon；
+   - **`/ai` 的 CSP 拦掉了自托管字体**（上线后由生产真浏览器抓出，见下）。
 
-### 验证（都是真跑出来的）
+### 线上验证（真浏览器打生产，37/37）
 
-- `pnpm run check`（typecheck + schema 同步 + Go 测试）、`backend:vet`、
-  `build:release`（25 MB 单文件）**全绿**；
-- **真 Chromium**：7 组页面/主题，字体实际加载、零控制台错误、零失败请求、
-  深链接与移动端 390px 无横向溢出、对话框键盘契约（Tab 12 次不逃逸、Escape 关闭）；
-  登录页 computed style 24/24（padding / max-width / flex / 渐变 / 字体）；
-  三个 SSR 页面（`/ai`、`/s/{token}`、`/k/{id}`）字体 + 图标链接各 2/2；
-- **a11y 审计**（脚本 `/tmp/uiverify/audit.mjs`）：浅色/深色全部 token 对比度
-  ≥4.5:1（最低 4.83:1）、渲染文本对比度全过、结构/焦点/触控目标 0 失败；
-- **真实二进制**核对响应头：字体 `immutable`、`fonts.css` + ETag 304、
-  woff2 不被 gzip、JSON 仍合法、gzip 后 body 解压字节数一致。
+| 检查 | 结果 |
+| --- | --- |
+| 4 组页面/主题 + `/ai` | ✅ 200、字体实际加载、0 控制台错误、0 失败请求 |
+| 字体切片实际传输 | ✅ 494 KB / 9 片（`unicode-range` 生效） |
+| `/ai` 三个字族 | ✅ Outfit + Noto Sans SC + JetBrains Mono |
+| 缓存头（runbook 4.1） | ✅ `share.js`/shell `no-cache`、哈希资源 `immutable` |
+| 字体内容寻址 | ✅ `outfit-000-….woff2` → `immutable` |
+| `fonts.css` ETag | ✅ 条件请求 → 304 |
+| `fonts.css` gzip | ✅ 解码 107,422 字节，与本地一致 |
+| 分享页 CSP | ✅ `font-src 'self'` + `style-src 'self' 'unsafe-inline'` |
+| 契约未变 | ✅ 未知 `/api/*` 仍 JSON、未知分享 token 仍 404 |
 
-### 还没做
+### ⚠️ 还没做
 
-- **没有 `git commit`** —— AGENTS.md 要求先问人类。
-- **没有从大陆观测点验证**（AGENTS.md 完成定义第 3 条）。本轮字体是自托管的，
-  不引入任何外域依赖，但线上仍需实测确认。
-- 浏览器验证脚本目前在 `/tmp/uiverify/`，**没有进仓库**（避免把 playwright
-  加进 devDependencies）。要不要收进 `scripts/` 需要人类决定。
+- **没有从大陆观测点验证**（AGENTS.md 完成定义第 3 条）。
+  上述 37/37 是从**本机**发起的；本机能否代表大陆网络，我无法确认。
+  字体是自托管的、不引入任何外域依赖，**理论上**不新增大陆风险，
+  但这条验收项本身仍未完成。
+- 浏览器验证脚本在 `/tmp/uiverify/`，**未进仓库**
+  （刻意避免把 playwright 加进 devDependencies）。
+- Go SSR 页仍是各自内联的手写 CSS，未与 SPA 统一。
 
 ---
 
@@ -149,15 +162,21 @@ Chrome for Testing 156）：领取按钮出现 → 真点击 → 拿到 43 字�
 
 ---
 
-## 线上状态（2026-10-11 16:07 部署，`6a1b135`）
+## 线上状态（2026-10-12 02:12 部署，`dbca734`）
 
 | 项 | 值 |
 | --- | --- |
-| 二进制 sha256 | `1209cb46c6fbdecef68437339ae1896311a076ce0b55312d4f41c394dbe63531`（本地=线上） |
-| 回滚二进制 | `/data/services/teleport/teleport.prev-20261011-160742`（= 首个交接版本 `60bcbe8`）；更早 `teleport.prev-20261011-152828`（= `adc2be3`） |
-| 数据库备份 | `teleport.db.bak-20261011-160742`（部署前冷备）、`teleport.db.bak-cleanup-20261011-*`（清验证残留前） |
-| 库内容 | **3 reports / 4 share_tokens / 1 agent_key / 1 application**，`integrity_check` = ok，零孤儿（与部署前**完全一致**） |
-| 部署窗口日志 | `error|panic|fatal` = **0** |
+| 线上版本 | `dbca734`（UI 主体 `723c76e` + `/ai` CSP 修复），`git push origin main` 已推 |
+| 二进制 sha256 | `21fcffd5cc7fd50cd279770e39b6e52e4b30889fdba991846e1e15b8decaab94`（本地=线上） |
+| 回滚二进制 | `/data/services/teleport/teleport.prev-20261012-021215`（= `6a1b135`，上一版生产）；本次部署前另存了一份 |
+| 数据库备份 | `teleport.db.bak-20261012-021215` 及本次部署的同类备份，停服后冷备 |
+| 库内容 | **5 reports / 2 agent_keys**，`integrity_check` = ok |
+| 迁移 | 仍是 `0001_init` + `0002_agent_keys` —— **本次无迁移**，回滚二进制安全 |
+| 停机窗口 | 各约 2 秒（停服 → 冷备 → `mv` 原子替换 → 启动） |
+| 上线后实测 | 生产真浏览器 **37/37**；缓存头、gzip、ETag、CSP、契约逐条核对通过 |
+
+> 上一次部署（2026-10-11 16:07，`6a1b135`）的完整记录在
+> `.ai/sessions/` 与下面「上一轮」小节里。
 
 **线上实测（生产脚本走公网 URL，故 Caddy + 前缀 + TLS 全在内）：31/31 全绿**
 （`bin/e2e/verify-handoff-online.py`，在 hcyj 上跑）：
@@ -181,11 +200,15 @@ Cookie 在**真实 Chromium 里打开线上面板** → 点「生成交接链接
 全部 **200 且 `id="app"` 出现 0 次**（说明页，不是 SPA 外壳）；既有分享页仍 200；
 `HEAD` 领取 **405**；缓存头三连查通过（`share.js` = `no-cache`、入口 = `immutable`）。
 
-## 下一步（唯一一件）
+## 下一步
 
-把交接链接**发给真人试用**。用户明确要求「找一些人来测试一下」，
-而这条功能本身就是为了把「发给别人」变成一步，所以**试用就是验收**。
-邀请模板与「为什么值得试」见本文件末尾「给人试用怎么说」。
+1. **把交接链接发给真人试用**（承接上一轮，仍未开始）。用户明确要求
+   「找一些人来测试一下」，而这条功能本身就是为了把「发给别人」变成一步，
+   所以**试用就是验收**。邀请模板见本文件末尾「给人试用怎么说」。
+2. **从大陆观测点复验 UI 优化**（AGENTS.md 完成定义第 3 条）。
+   本轮 37/37 是从**本机**发起的；字体已自托管、不引入外域依赖，
+   理论上不新增大陆风险，但这条验收项本身**仍未完成**。
+   上一轮用过的大陆观测点是 koma 腾讯云。
 
 ---
 

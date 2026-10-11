@@ -99,7 +99,23 @@ Go 的 SPA 回退对**任意**未匹配路径返回 `index.html`，于是该文�
 而它渲染出的 SVG 就在分享页正文旁边。已改为与页面一致的
 `"Outfit", "Noto Sans SC", sans-serif`。
 
-### 9. 交互与排版细节
+### 9. `/ai` 页 CSP 拦截自托管字体 —— 🔴 高（已上线，静默降级）
+
+`backend/internal/aidoc/html.go:20` — CSP 为
+`default-src 'none'; style-src 'unsafe-inline'`，**既没有 `style-src 'self'`**
+（导致 `<link rel=stylesheet>` 被直接拒绝），**也没有 `font-src 'self'`**
+（即使样式表加载成功，`@font-face` 的抓取仍回退到 `default-src 'none'`）。
+
+页面 200、内容完整可读，**只是悄悄用回系统字体**。上线后由「真浏览器打生产」
+抓出。分享页本来就带这两条指令，所以同一个改动两个页面一好一坏 ——
+正是这种不对称让它躲过了所有本地检查（本地 stub 不发 CSP 头）。
+
+修法：`style-src 'self' 'unsafe-inline'` + `font-src 'self'`，
+**保持 `script-src` 完全不存在**（该页按设计无脚本）。
+守卫：`aidoc/html_test.go` 的 `TestCSPAllowsExactlyWhatThePageLoads`
+把「页面引用了什么」与「策略允许什么」互校，已反证验过。
+
+### 10. 交互与排版细节
 
 | 位置 | 问题 |
 | --- | --- |
@@ -175,6 +191,23 @@ node /tmp/uiverify/logincheck.mjs    # 登录页 computed style（抓层叠回�
 | 深链接 shell 声明图标（前缀绝对） | ✅ |
 | 登录页 computed style（padding/maxWidth/flex/渐变/字体） | ✅ 24/24 |
 | 既有契约（`/api/*` JSON、未知分享 token 404） | ✅ 未变 |
+
+**生产真浏览器（`/tmp/uiverify/prodcheck.mjs`，走 Caddy + Cloudflare + TLS）：37/37**
+
+| 检查 | 结果 |
+| --- | --- |
+| 4 组页面/主题 + `/ai` | ✅ 200、字体实际加载、0 控制台错误、0 失败请求 |
+| 字体切片实际传输 | ✅ 494 KB / 9 片（证明 `unicode-range` 生效，不是整包下载） |
+| `/ai` 三个字族 | ✅ Outfit + Noto Sans SC + JetBrains Mono |
+| 资源 URL 携带路由前缀 | ✅ `href="/yeciorez/teleport/fonts/fonts.css"` |
+| 线上缓存头 | ✅ `share.js`/shell `no-cache`、哈希资源 `immutable` |
+| 字体内容寻址 | ✅ `outfit-000-….woff2` → `immutable` |
+| `fonts.css` ETag / gzip | ✅ 条件请求 304；gzip 解码 107,422 字节与本地一致 |
+| 分享页 CSP（真实 token） | ✅ `font-src 'self'` + `style-src 'self' 'unsafe-inline'` |
+
+> 这一轮最有价值的教训：**本地 stub 不发 CSP 头**，所以整个本地验证套件
+> 对「策略拦截资源」这类缺陷是完全盲的 —— 只有真浏览器打真环境才抓得到。
+> 它确实抓到了一个已上线的真实 bug（第 9 条）。
 
 ---
 
