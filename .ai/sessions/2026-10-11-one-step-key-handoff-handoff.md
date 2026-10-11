@@ -1,6 +1,6 @@
 # 一键交接链接（管理员一步发密钥）— handoff
 
-**Date:** 2026-10-11 · **Branch/Commit:** `main @ 732b1f5` + 本轮改动 · **线上:** 部署后回填
+**Date:** 2026-10-11 · **Branch/Commit:** `main @ 60bcbe8` · **线上:** `60bcbe8`（已部署并实测）
 
 ## Where we ended
 
@@ -73,9 +73,22 @@ Chrome；Chrome 的 profile 是**单例**，第二个实例会静默交接给第
 为 false，Clipboard API 会合法拒绝 —— 要 `Emulation.setFocusEmulationEnabled`，
 且**合成点击没有 user activation**，必须 `Input.dispatchMouseEvent` 才是真实路径。
 
+## Deployment and online verification (done)
+
+- 构建 `60bcbe8`，sha256 `fa224ae1…`；`scp` → `mv` 原子替换 → `systemctl restart`；
+  回滚材料 `/data/services/teleport/teleport.prev-20261011-152828` +
+  冷备 `teleport.db.bak-20261011-152828`。部署窗口 `error|panic|fatal` = **0**。
+- **生产端到端 29/29**（`bin/e2e/verify-handoff-online.py` 在 hcyj 上跑，走**公网 URL**）：
+  创建 → 匿名读页（fragment 不进服务器、页面无 secret、`data-app-base` 正确、`no-store`、
+  非 SPA 外壳）→ 领取 200 → **重放 404** → 页面翻 `spent="1"` → 未知 id 同样说明 →
+  发布报告 201 → 分享可读 → 复原。
+- **大陆观测点（koma）**：`/api/health` 200；`/k/`、`/k/{uuid}`、`/k/{uuid}/extra` 全 200 且
+  `id="app"` 0 次；缓存头三连查通过。
+- **生产已复原到部署前状态**：3 reports / 4 share_tokens / 1 agent_key / 1 application，
+  `integrity_check` = ok。验证过程中产生的密钥与申请行已清除
+  （`bin/e2e/verify-handoff-online.py` 会按 label 清扫自己，包括**上一次崩溃运行**留下的残留）。
+
 ## Next session: start here
 
-1. 部署到 hcyj（`pnpm run build:release` → `scp` → `mv` → `systemctl restart`），
-   按 runbook 做缓存头三连查 + 停服冷备数据库。
-2. 线上验证：`GET /k/{未知 uuid}` 必须 **200 + 说明页 + no-store + 不是 SPA 外壳**（大陆观测点）。
-3. 把交接链接发给真人试用 —— 这是用户要的「找人测试」，也是这条功能的验收方式。
+把交接链接发给真人试用 —— 这是用户要的「找人测试」，也是这条功能的验收方式。
+话术与「请对方反馈哪三件事」写在 `.ai/CURRENT_TASK.md` 末尾「给人试用怎么说」。
