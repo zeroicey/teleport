@@ -213,6 +213,17 @@ func (s *Server) handleCreateKeyApplication(w http.ResponseWriter, r *http.Reque
 // handlePollKeyApplication is how an agent learns the decision, and the one
 // moment a plaintext credential exists.
 func (s *Server) handlePollKeyApplication(w http.ResponseWriter, r *http.Request) {
+	// net/http serves HEAD from the GET pattern, so this state-changing handler
+	// would otherwise run for a HEAD — and a HEAD has no body to carry the token
+	// back. A proxy, prefetcher or link checker that reissues a request as HEAD
+	// with the claim header would silently burn the link and leave the recipient
+	// with a credential nobody can read.
+	if r.Method == http.MethodHead {
+		w.Header().Set("Allow", http.MethodGet)
+		httpx.WriteError(w, r, httpx.MethodNotAllowed("Claim this application with GET"))
+		return
+	}
+
 	id := r.PathValue("id")
 	provided := r.Header.Get(claimHeader)
 	// No id and no secret are the same answer as a secret that does not match:
@@ -271,6 +282,14 @@ func (s *Server) handlePollKeyApplication(w http.ResponseWriter, r *http.Request
 
 // handlePollRenewal exposes a renewal's outcome to the agent that filed it.
 func (s *Server) handlePollRenewal(w http.ResponseWriter, r *http.Request) {
+	// Same trap as the application poll: ServeMux serves HEAD from GET, and this
+	// handler hands back a credential.
+	if r.Method == http.MethodHead {
+		w.Header().Set("Allow", http.MethodGet)
+		httpx.WriteError(w, r, httpx.MethodNotAllowed("Poll this renewal with GET"))
+		return
+	}
+
 	id := r.PathValue("id")
 	provided := r.Header.Get(claimHeader)
 	if id == "" || provided == "" {

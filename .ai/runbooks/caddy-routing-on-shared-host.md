@@ -95,3 +95,23 @@ curl -sI https://api.hcyj.xyz/   # 确认恢复
 - `/etc/caddy/Caddyfile.new` 这类"旁边改名"写法**不可见**（单文件 bind mount）。
 - Caddyfile 里**没有站点级 `log` 指令** → 没有逐请求访问日志。
   全局 `log` 块只设置默认 logger，不等于开启访问日志（曾据此误判为"日志回归"）。
+- **站点级 `log` 会明文记录 `X-Teleport-Claim`。** Caddy 默认只脱敏
+  `Authorization` 与 `Cookie`（实测本地 Caddy：`{"headers":{"Authorization":["REDACTED"],
+  "Cookie":["REDACTED"],"X-Teleport-Claim":["<明文>"]}}`）。交接链接的一次性凭证走的就是这个头，
+  所以**一旦给 `handle /yeciorez/teleport*` 加上 `log`，所有 claim secret 就会落盘**。
+  要开日志就必须同时过滤掉它：
+
+  ```caddy
+  log {
+      format filter {
+          wrap json
+          fields {
+              request>headers>X-Teleport-Claim delete
+          }
+      }
+  }
+  ```
+
+  Go 侧的 `LogRequests` 只记 `method/path/status/bytes/requestId`，**不记任何请求头**，
+  所以这条约束只关乎反向代理这一层。见
+  `.ai/decisions/2026-10-11-one-step-key-handoff.md` 的 D12。

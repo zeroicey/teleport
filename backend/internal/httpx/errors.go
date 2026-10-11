@@ -62,6 +62,15 @@ func Gone(message string) *Error {
 	return &Error{Status: http.StatusGone, Code: "gone", Message: message}
 }
 
+// MethodNotAllowed rejects a method the route does not implement.
+//
+// It exists for one specific trap: net/http's ServeMux serves HEAD from a GET
+// pattern, so a HEAD request reaches handlers that change state. A HEAD has no
+// body, so such a handler can consume a one-time credential and return nothing.
+func MethodNotAllowed(message string) *Error {
+	return &Error{Status: http.StatusMethodNotAllowed, Code: "method_not_allowed", Message: message}
+}
+
 func PayloadTooLarge(message string) *Error {
 	return &Error{Status: http.StatusRequestEntityTooLarge, Code: "payload_too_large", Message: message}
 }

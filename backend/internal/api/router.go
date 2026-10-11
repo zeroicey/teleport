@@ -349,11 +349,22 @@ func (s *Server) handleReadShare(w http.ResponseWriter, r *http.Request) {
 // application row, which stores no secret, and the exchange itself happens in
 // the browser (see setupKeyHandoff in web/src/share/main.ts).
 //
-// Unknown, claimed and expired links all render 200 with an explanation. That
-// is not a leak: an application id is a 122-bit UUID and the page reveals no
-// more than "this id is not usable", which is exactly what the recipient needs
-// to read. Returning an error envelope here would show a person an API message
-// for a normal, expected outcome (a link used twice).
+// Unknown, claimed and expired links all render 200 with an explanation, and
+// returning an error envelope would show a person an API message for a normal,
+// expected outcome (a link used twice).
+//
+// What this page discloses is deliberately *more* than the API does. The claim
+// endpoint folds "claimed" into 404 so a guessed id tells an attacker nothing;
+// this page, by contrast, tells the holder of an id whether the link is still
+// claimable, when it lapses, and the label the administrator typed — because
+// that is exactly what the person the link was forwarded to needs to read (an
+// id alone is not the capability; the fragment is). The bound is the id itself,
+// a 122-bit UUID that is never enumerable, so this is an accepted disclosure
+// rather than an oversight. It is pinned by TestKeyHandoffPageStateVisibility:
+// dropping the distinction is a product decision, not a cleanup.
+//
+// The clearing exception is the secret: nothing on this page can show, derive or
+// be made to reveal the fragment.
 func (s *Server) handleKeyHandoffPage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	nowMS := store.NowMS()

@@ -399,3 +399,98 @@ func TestKeyHandoffDoesNotCreateAKeyUntilClaimed(t *testing.T) {
 		t.Errorf("claimed key name = %q, want the hand-off label", keys[0].Name)
 	}
 }
+
+// TestKeyHandoffClaimRefusesHEAD pins down a trap that cost a real credential.
+//
+// net/http serves HEAD from a GET pattern, so a HEAD with the claim header
+// reached the claim handler, consumed the one-time link and created a key — and
+// then threw the token away, because a HEAD response has no body. Anything that
+// reissues a request as HEAD (a proxy, a prefetcher, a link checker) could burn
+// a hand-off link without the recipient ever seeing a credential.
+func TestKeyHandoffClaimRefusesHEAD(t *testing.T) {
+	h, _ := testServer(t)
+	data := createHandoff(t, h, map[string]string{"Cookie": login(t, h)}, `{"label":"HEAD 测试"}`)
+	id, _ := data["id"].(string)
+	secret, _ := data["claim_secret"].(string)
+
+	rec := do(t, h, http.MethodHead, testPrefix+"/api/agent-keys/applications/"+id, "",
+		claimHeaders(secret))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("HEAD claim: status = %d, want 405 (body %q)", rec.Code, rec.Body.String())
+	}
+	if allow := rec.Header().Get("Allow"); allow != http.MethodGet {
+		t.Errorf("Allow = %q, want GET", allow)
+	}
+	if code := envelopeCode(t, rec); code != "method_not_allowed" {
+		t.Errorf("HEAD claim code = %q, want method_not_allowed", code)
+	}
+
+	// The link must survive: the recipient still has a credential waiting.
+	rec = do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/applications/"+id, "",
+		claimHeaders(secret))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("claim after HEAD: status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	_, payload, _ := decodeEnvelope(t, rec)
+	key, _ := payload["key"].(map[string]any)
+	if token, _ := key["token"].(string); token == "" {
+		t.Error("claim after HEAD returned no token")
+	}
+}
+
+// TestKeyHandoffPageStateVisibility pins how much the *page* tells a visitor,
+// which is deliberately more than the API tells a caller.
+//
+// The claim endpoint folds "already claimed" into the same 404 an unknown id
+// gets, so a guessed id learns nothing there. The page cannot take that stance:
+// the person a link was forwarded to must be able to read that their link was
+// already collected and what it was for. This test exists so that difference is
+// a recorded decision — if someone later makes the page generic "for safety",
+// this fails and they have to decide on purpose.
+func TestKeyHandoffPageStateVisibility(t *testing.T) {
+	h, _ := testServer(t)
+	cookie := login(t, h)
+	data := createHandoff(t, h, map[string]string{"Cookie": cookie}, `{"label":"给 A姐 的"}`)
+	id, _ := data["id"].(string)
+	secret, _ := data["claim_secret"].(string)
+
+	unknownID := "11111111-2222-3333-4444-555555555555"
+
+	open := do(t, h, http.MethodGet, testPrefix+"/k/"+id, "", nil)
+	if open.Code != http.StatusOK {
+		t.Fatalf("open page: status = %d, want 200", open.Code)
+	}
+	openBody := open.Body.String()
+	if !strings.Contains(openBody, `data-handoff-spent="0"`) {
+		t.Error("an open link must be presented as claimable")
+	}
+	if !strings.Contains(openBody, "给 A姐 的") {
+		t.Error("an open link must name its recipient: that is how they know it is for them")
+	}
+
+	// Claim it, then compare the claimed page with an unknown id.
+	do(t, h, http.MethodGet, testPrefix+"/api/agent-keys/applications/"+id, "", claimHeaders(secret))
+
+	claimed := do(t, h, http.MethodGet, testPrefix+"/k/"+id, "", nil)
+	unknown := do(t, h, http.MethodGet, testPrefix+"/k/"+unknownID, "", nil)
+	if claimed.Code != http.StatusOK || unknown.Code != http.StatusOK {
+		t.Fatalf("statuses = %d / %d, want 200 / 200", claimed.Code, unknown.Code)
+	}
+	claimedBody := claimed.Body.String()
+	unknownBody := unknown.Body.String()
+
+	if claimedBody == unknownBody {
+		t.Error("the page has become generic; if that is intended, update the decision record " +
+			"and this test, because the recipient loses the 'already collected' explanation")
+	}
+	if !strings.Contains(claimedBody, "已经被领取过") {
+		t.Error("a claimed link must say so: the recipient may have lost the credential")
+	}
+	if strings.Contains(unknownBody, "给 A姐 的") {
+		t.Error("an unknown id must not disclose a label it has no row for")
+	}
+	// The one thing that must never differ is the secret's presence.
+	if strings.Contains(claimedBody, secret) || strings.Contains(unknownBody, secret) {
+		t.Error("a page rendered the claim secret")
+	}
+}

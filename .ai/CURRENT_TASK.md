@@ -54,7 +54,28 @@ Chrome for Testing 156）：领取按钮出现 → 真点击 → 拿到 43 字�
 两条都补了守卫，并加进反证脚本（F9/F10）。**反证 10 条全红**（`bin/e2e/falsify-handoff.py`，
 每条都让对应测试变红，且还原后文件逐字节一致）。
 
-**未做**：无。用户没有要求密码保护、批量拒绝、限流等。
+**独立对抗验证（另一个 agent，只读仓库、只打线上/本地接口）**：结论是「6 条主张未能推翻，
+2 处被推翻/存疑」，其中 **1 个真 bug 已修**：
+
+- ✅ **已修（真 bug）**：`HEAD` 请求会**消耗一次性链接并扔掉密钥** —— Go 的 `ServeMux` 把
+  `HEAD` 交给 `GET` 模式，而领取处理器会写状态；HEAD 无 body，收件人什么都拿不到。
+  已改为 405 + `Allow: GET`（领取与续期两个端点都加），新增
+  `TestKeyHandoffClaimRefusesHEAD`（断言「HEAD 之后链接仍可领取」）+ 反证 **F11**。
+  详见 `.ai/pitfalls/cases/2026-10-11-head-request-consumed-a-one-time-link.md`。
+- 📝 **文档与实现不符（已改文档）**：页面层**是**存在性/状态 oracle（能看到
+  `open/claimed/expired/unknown`、label、到期时间），接口层不是（claimed 与 unknown 返回
+  逐字节相同的 404）。原 `router.go` 注释与决策 D11 都写成「页面不确认 id 是否存在」，不实。
+  裁决：**接受页面多说**（收件人要看得懂「已经领过了」），补 `TestKeyHandoffPageStateVisibility`
+  钉住，D11 修订。
+- ⚠️ **配置约束（未改代码，已写入 runbook）**：Caddy 默认只脱敏 `Authorization`/`Cookie`，
+  **站点级 `log` 会把 `X-Teleport-Claim` 明文写盘**。当前线上无站点级 log（已复核
+  `/root/hcyj/caddy/Caddyfile`，`/data/caddy/` 下无 access.log）→ 今天不泄漏，
+  但这是一条「靠没人加 log」维持的性质，故写进
+  `.ai/runbooks/caddy-routing-on-shared-host.md`（含过滤片段）与决策 D12。
+- ℹ️ 已知小差异（不改）：`/k/{id}/extra` 命中 `GET /k/` 子树模式，返回 200「链接无效」页而不是 404 ——
+  与「绝不吐 SPA 外壳」的目的一致，无泄漏。
+
+**未做**：用户没有要求密码保护、批量拒绝、限流等。
 
 ---
 
@@ -136,6 +157,11 @@ Chrome for Testing 156）：领取按钮出现 → 真点击 → 拿到 43 字�
 ---
 
 ## 未做（按价值排序，都还没开工）
+
+0. **给交接端点加限流**：领取端点无独立限流（256 位 secret 使暴力破解无意义，
+   但「生成」端点也没有上限 —— 不过它是 Session 门禁的）。优先级低。
+1. **反向代理日志里的 `X-Teleport-Claim`**：见上，已记录约束；若哪天要给该站点开访问日志，
+   必须同时加过滤片段（runbook 里有现成的）。
 
 1. **HTML 渲染的隔离档位**：打开 `views.HTMLReportSandbox` + `postMessage` 高度上报
 2. **轮换 admin 口令**：线上仍是部署时生成的随机值，从未轮换过（运维动作，不是代码）
