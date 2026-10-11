@@ -86,6 +86,8 @@ func RenderKeyHandoffPage(opts KeyHandoffOptions) string {
 <meta name="referrer" content="no-referrer" />
 <meta name="color-scheme" content="light dark" />
 <title>领取 Teleport 发布密钥</title>
+<link rel="stylesheet" href="` + markdown.Escape(assetBase) + `/fonts/fonts.css" />
+<link rel="icon" type="image/svg+xml" href="` + markdown.Escape(assetBase) + `/favicon.svg" />
 <style>
   :root {
     color-scheme: light dark;
@@ -101,7 +103,7 @@ func RenderKeyHandoffPage(opts KeyHandoffOptions) string {
   * { box-sizing: border-box; }
   body {
     margin:0; background:var(--bg); color:var(--fg);
-    font:16px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",Roboto,Helvetica,Arial,sans-serif;
+    font:16px/1.75 "Outfit","Noto Sans SC",sans-serif;
     -webkit-text-size-adjust:100%;
   }
   .wrap { max-width: 720px; margin: 0 auto; padding: 48px 20px 96px; }
@@ -113,7 +115,7 @@ func RenderKeyHandoffPage(opts KeyHandoffOptions) string {
   ol, ul { padding-left:1.4em; margin:0 0 1em; }
   li { margin:.35em 0; }
   a { color:var(--accent); }
-  code, .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.9em; }
+  code, .mono { font-family:"JetBrains Mono",ui-monospace,monospace; font-size:.9em; }
   code { background:var(--code-bg); border:1px solid var(--border); border-radius:4px; padding:.1em .35em; }
   pre {
     background:var(--code-bg); border:1px solid var(--border); border-radius:8px;

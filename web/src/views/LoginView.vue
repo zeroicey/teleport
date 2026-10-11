@@ -38,33 +38,43 @@ async function submit() {
 </script>
 
 <template>
-  <div class="login-wrap">
-    <form class="card login-card stack" @submit.prevent="submit">
+  <div class="login-shell">
+    <form class="card login-card" @submit.prevent="submit">
       <div>
-        <h1>Teleport</h1>
-        <p class="muted" style="margin: 0">登录以管理报告与分享链接</p>
+        <h1 class="m-0 text-3xl font-semibold tracking-tight">Teleport</h1>
+        <p class="mt-1 mb-0 text-sm text-ink-muted">登录以管理报告与分享链接</p>
       </div>
 
-      <div v-if="error" class="alert error">{{ error }}</div>
+      <!--
+        `role="alert"` rather than `aria-live`: a failed sign-in is exactly the
+        kind of update that must interrupt, and the region only exists in the
+        DOM while there is something to say, so it is never a standing live
+        region announcing nothing.
+      -->
+      <div v-if="error" class="alert alert-error" role="alert">{{ error }}</div>
 
       <div>
-        <label for="password">管理密码</label>
+        <label class="field-label" for="password">管理密码</label>
         <input
           id="password"
           v-model="password"
+          class="input"
           type="password"
+          name="password"
           autocomplete="current-password"
-          autofocus
+          :aria-invalid="error ? 'true' : undefined"
           :disabled="loading"
+          autofocus
         />
       </div>
 
-      <button class="primary" type="submit" :disabled="loading">
-        <span v-if="loading" class="spin" style="margin-right: 8px"></span>
-        {{ loading ? '登录中…' : '登录' }}
+      <button class="btn btn-primary w-full py-2.5" type="submit" :disabled="loading">
+        <span v-if="loading" class="spinner" aria-hidden="true"></span>
+        <span v-if="loading">登录中…</span>
+        <span v-else>登录</span>
       </button>
 
-      <p class="muted" style="font-size: 12px; margin: 0">
+      <p class="m-0 text-xs leading-relaxed text-ink-muted">
         会话使用签名的 HttpOnly Cookie 保存。也可通过 Cloudflare Access 前置保护。
       </p>
     </form>

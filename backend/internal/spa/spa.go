@@ -20,12 +20,18 @@
 package spa
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"io/fs"
 	"net/http"
 	"os"
 	"path"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // indexFile is the SPA shell served for client-side routes.
@@ -33,6 +39,16 @@ const indexFile = "index.html"
 
 // assetsDir is the directory Vite writes content-hashed files into.
 const assetsDir = "assets"
+
+// fontsDir holds the self-hosted webfonts, copied verbatim from the frontend's
+// `public/` directory.
+//
+// It needs its own rule because `public/` files never pass through Vite: their
+// names are chosen by `scripts/fonts/fetch_fonts.py`, not by the bundler. That
+// script puts a content hash in every binary's filename precisely so the files
+// can earn the immutable cache below (see isContentHashed). `fonts/fonts.css`
+// deliberately does not, and therefore revalidates.
+const fontsDir = "fonts"
 
 // stableAssetFiles names the non-hashed files under assetsDir, for the test
 // that pins this list to the filename the build and the share page agree on.
@@ -62,6 +78,12 @@ type Handler struct {
 	fsys   fs.FS
 	source string
 	prefix string
+
+	// ETag cache for non-content-addressed files. Guarded because a single
+	// Handler serves concurrent requests.
+	etagOnce sync.Once
+	etagMu   sync.Mutex
+	etags    map[string]string
 }
 
 // New builds a handler over a frontend build filesystem mounted at prefix
@@ -127,8 +149,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. A real file in the build (favicon.ico, robots.txt, ...).
-	if rel != "" && h.serveFile(w, r, rel, false) {
+	// 2. A real file in the build (favicon.ico, robots.txt, fonts/*, ...).
+	//
+	// The cache decision is the same shape rule as for assets, not a hardcoded
+	// "no": the self-hosted fonts live here (they come from `public/`, so Vite
+	// never puts them under assets/) and are content-addressed by the vendoring
+	// script precisely so they can be immutable. Leaving this `false` made every
+	// page load re-download the font slices — and because embedded files report
+	// a zero modtime, the revalidation could not even resolve to a 304.
+	if rel != "" && h.serveFile(w, r, rel, isContentHashed(rel)) {
 		return
 	}
 
@@ -153,22 +182,43 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // isContentHashed reports whether a build-relative path names a file whose URL
 // is versioned by its own filename, making `immutable` safe.
 //
-// The default is "not safe": only names matching Vite's `[name]-[hash].js`
-// shape earn the year-long cache. Everything else under assets/ — including
-// `assets/share.js` and any future non-hashed asset — revalidates.
+// The default is "not safe": only names that carry a content hash earn the
+// year-long cache. Everything else — including `assets/share.js`,
+// `fonts/fonts.css` and any future stable asset — revalidates.
 //
 // This direction matters. The earlier version asked "is it under assets/?" and
 // answered yes for the whole directory, which silently gave `immutable` to a
 // stable name. Whitelisting the shape means a new stable file is uncached by
 // default, and the failure mode of forgetting to update anything is a cheap
 // revalidation rather than a year of stale bytes.
+//
+// Two directories, two producers, one rule:
+//
+//   - `assets/` — written by Vite as `[name]-[hash].js`.
+//   - `fonts/`  — written by scripts/fonts/fetch_fonts.py as
+//     `<slug>-<NNN>-<sha256[:8]>.woff2`. Public-directory files never reach the
+//     bundler, so this rule is the only thing that keeps them from being
+//     re-downloaded in full on every page load: embedded files report a zero
+//     modtime, so `no-cache` cannot even resolve to a 304.
 func isContentHashed(rel string) bool {
-	if !strings.HasPrefix(rel, assetsDir+"/") {
+	var name string
+	switch {
+	case strings.HasPrefix(rel, assetsDir+"/"):
+		name = strings.TrimPrefix(rel, assetsDir+"/")
+	case strings.HasPrefix(rel, fontsDir+"/"):
+		name = strings.TrimPrefix(rel, fontsDir+"/")
+		// Fonts are only trusted when the digest is actually present in the
+		// shape the fetch script guarantees. `fonts/fonts.css` has a hyphen-free
+		// stem and so falls through to revalidation, which is what it wants.
+		if !fontNameHasContentHash(name) {
+			return false
+		}
+	default:
 		return false
 	}
-	name := strings.TrimPrefix(rel, assetsDir+"/")
-	// Vite emits `[name]-[hash].js`; the hash is base64url-ish and the stem may
-	// itself contain hyphens, so anchor on the last hyphen before the extension.
+
+	// The hash is base64url-ish and the stem may itself contain hyphens, so
+	// anchor on the last hyphen before the extension.
 	dot := strings.LastIndex(name, ".")
 	if dot <= 0 {
 		return false
@@ -178,6 +228,69 @@ func isContentHashed(rel string) bool {
 		return false
 	}
 	return strings.Contains(stem, "-")
+}
+
+// fontNameHasContentHash reports whether a name under fontsDir matches the
+// `<slug>-<NNN>-<8 hex>.woff2` form the vendoring script emits.
+//
+// Matching the digest rather than merely "contains a hyphen" is the point:
+// `no-cache` is the safe failure, so an unrecognised font name must fall back to
+// revalidation instead of being immortalised.
+func fontNameHasContentHash(name string) bool {
+	dot := strings.LastIndex(name, ".")
+	if dot <= 0 || name[dot:] != ".woff2" {
+		return false
+	}
+	parts := strings.Split(name[:dot], "-")
+	if len(parts) < 3 {
+		return false
+	}
+	digest := parts[len(parts)-1]
+	if len(digest) != 8 {
+		return false
+	}
+	if _, err := strconv.ParseUint(digest, 16, 32); err != nil {
+		return false
+	}
+	index := parts[len(parts)-2]
+	if len(index) != 3 {
+		return false
+	}
+	_, err := strconv.Atoi(index)
+	return err == nil
+}
+
+// etagFor returns a strong validator for a non-hashable build file, computing it
+// on first use and caching it for the process lifetime.
+//
+// The build is embedded and immutable for the life of the binary, so one hash
+// per file is enough: a deploy is a new process with a new cache. Computing
+// lazily rather than at startup keeps `New` cheap and avoids hashing ~110 font
+// files that no client will ever revalidate (those are content-addressed and
+// carry `immutable`, so they never reach here).
+func (h *Handler) etagFor(name string) (string, bool) {
+	h.etagOnce.Do(func() { h.etags = map[string]string{} })
+
+	h.etagMu.Lock()
+	defer h.etagMu.Unlock()
+	if tag, ok := h.etags[name]; ok {
+		return tag, tag != ""
+	}
+
+	f, err := h.fsys.Open(name)
+	if err != nil {
+		h.etags[name] = ""
+		return "", false
+	}
+	defer f.Close()
+	sum := sha256.New()
+	if _, err := io.Copy(sum, f); err != nil {
+		h.etags[name] = ""
+		return "", false
+	}
+	tag := `"` + hex.EncodeToString(sum.Sum(nil)[:16]) + `"`
+	h.etags[name] = tag
+	return tag, true
 }
 
 // serveFile writes the named file, reporting whether it existed.
@@ -194,8 +307,8 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, name string,
 	defer f.Close()
 
 	// A content-hashed URL's bytes can never change, so it is cached for a
-	// year. Stable names (index.html, assets/share.js) revalidate instead, so a
-	// deploy is picked up immediately.
+	// year. Stable names (index.html, assets/share.js, fonts/fonts.css)
+	// revalidate instead, so a deploy is picked up immediately.
 	//
 	// Deployments swap the whole binary, so the "changed bytes at a stable URL"
 	// window is the same one a no-cache header exists to cover.
@@ -203,6 +316,18 @@ func (h *Handler) serveFile(w http.ResponseWriter, r *http.Request, name string,
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	} else {
 		w.Header().Set("Cache-Control", "no-cache")
+		// `no-cache` is only cheap if the revalidation can actually succeed.
+		// Embedded files report a ZERO modtime, so ServeContent emits no
+		// Last-Modified and the browser has no validator to send — which turned
+		// every revalidation into a full re-download. That is tolerable for a
+		// 1 KB favicon and unacceptable for `fonts/fonts.css`, which carries a
+		// @font-face block per CJK slice and is ~107 KB.
+		//
+		// An ETag restores the intended behaviour: the browser revalidates, the
+		// server answers 304, and the body is never sent again.
+		if etag, ok := h.etagFor(name); ok {
+			w.Header().Set("ETag", etag)
+		}
 	}
 
 	// ServeContent handles Content-Type detection, Range requests and HEAD.
@@ -231,16 +356,26 @@ func (h *Handler) serveIndex(w http.ResponseWriter, r *http.Request) {
 
 	// Never cache the shell: it references content-hashed bundles, so a cached
 	// copy would pin a client to a build whose files may already be gone.
+	//
+	// "Never cache" still means "revalidate", and the same zero-modtime problem
+	// applies here as to fonts.css — so it carries a validator too, and a
+	// repeat navigation costs a 304 instead of the whole document.
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if etag, ok := h.etagFor(indexFile); ok {
+		w.Header().Set("ETag", etag)
+	}
 
 	body, err := io.ReadAll(f)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	if r.Method == http.MethodHead {
-		return
-	}
-	_, _ = w.Write(body)
+	// ServeContent, not a bare Write: a handler that writes directly gets no
+	// conditional-request handling from net/http, so the ETag set above would
+	// be advertised and then ignored — the browser would revalidate, be handed
+	// a 200 with the full document, and the validator would have bought
+	// nothing. ServeContent compares If-None-Match and answers 304. It also
+	// handles HEAD, which the previous explicit branch did by hand.
+	http.ServeContent(w, r, indexFile, time.Time{}, bytes.NewReader(body))
 }

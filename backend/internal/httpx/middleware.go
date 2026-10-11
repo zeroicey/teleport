@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -235,6 +237,218 @@ func LogRequests(next http.Handler) http.Handler {
 }
 
 // SecurityHeaders applies baseline hardening to every response.
+// Compress gzips compressible response bodies.
+//
+// The single-file deployment has no reverse proxy in front of it — Caddy is
+// expected to sit there in production, but `go run`/the bare binary does not
+// have one, and a 107 KB `fonts.css` or a large JSON page then goes out
+// uncompressed. Compressing in-process makes the binary's behaviour the same
+// with or without a proxy.
+//
+// Deliberately narrow:
+//   - Only these content types. Fonts (woff2) and images are already
+//     compressed; re-compressing them burns CPU to make them larger.
+//   - Only bodies above minSize. Below that the framing overhead outweighs the
+//     saving.
+//   - Only when the client asked for it, and `Vary: Accept-Encoding` always
+//     goes out so a shared cache cannot serve a gzipped body to a client that
+//     cannot read it.
+//
+// Range requests are passed through untouched: gzip and byte ranges do not
+// compose, and the only ranged responses here are media the client seeks.
+func Compress(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead || r.Header.Get("Range") != "" ||
+			!strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		w.Header().Add("Vary", "Accept-Encoding")
+		cw := &compressWriter{ResponseWriter: w}
+		defer cw.Close()
+		next.ServeHTTP(cw, r)
+	})
+}
+
+// compressWriter gzips a response body when it is worth doing.
+//
+// THE ORDERING CONSTRAINT THAT MAKES THIS SUBTLE
+// ----------------------------------------------
+// `Content-Encoding` and `Content-Length` must be correct BEFORE the header
+// block is flushed, and net/http flushes it on the first `WriteHeader` or
+// `Write`. So the decision cannot be made from the body's first chunk: by then
+// `http.ServeContent` — which serves every static asset here — has already
+// written a `Content-Length` and sent the header.
+//
+// Getting this wrong does not merely skip compression, it corrupts the
+// response: the client is told `Content-Length: 107422` with no
+// `Content-Encoding`, receives gzip bytes, and aborts with "end of response
+// with N bytes missing". That is the failure this shape exists to prevent.
+//
+// So the writer DEFERS the header until it can decide, and decides from
+// metadata alone:
+//
+//   - a non-200 has no body worth encoding;
+//   - an uncompressible Content-Type (woff2, images) is passed through;
+//   - a known Content-Length below the floor is passed through;
+//   - an unknown length is buffered until the floor is reached, so a small
+//     response is not padded with gzip framing.
+//
+// Buffering is bounded by minCompressSize, and `Flush` opts a streaming
+// response out immediately rather than accumulating it.
+type compressWriter struct {
+	http.ResponseWriter
+	gz      *gzip.Writer
+	pending []byte
+	status  int
+	decided bool
+	header  bool
+}
+
+// minCompressSize is the point below which gzip framing costs more than it
+// saves. gzip has ~20 bytes of fixed overhead plus per-block headers.
+const minCompressSize = 1024
+
+// compressible reports whether a Content-Type benefits from gzip. Fonts, images
+// and video are already compressed containers; re-compressing them costs CPU to
+// produce a larger body.
+func compressible(contentType string) bool {
+	if i := strings.IndexByte(contentType, ';'); i >= 0 {
+		contentType = contentType[:i]
+	}
+	switch strings.TrimSpace(strings.ToLower(contentType)) {
+	case "text/html", "text/css", "text/plain", "text/javascript",
+		"application/javascript", "application/json", "application/xml",
+		"image/svg+xml":
+		return true
+	}
+	return false
+}
+
+// WriteHeader records the status without flushing, so the encoding decision can
+// still be made. A non-200 is decided at once — it has no body to encode.
+func (c *compressWriter) WriteHeader(status int) {
+	if c.decided || c.header {
+		return
+	}
+	if c.status == 0 {
+		c.status = status
+	}
+	if status != http.StatusOK {
+		c.commit(false)
+	}
+}
+
+func (c *compressWriter) Write(p []byte) (int, error) {
+	if !c.decided {
+		if c.status == 0 {
+			c.status = http.StatusOK
+		}
+		n := c.declaredLength()
+		switch {
+		case !compressible(c.Header().Get("Content-Type")):
+			c.commit(false)
+		case n >= 0 && n < minCompressSize:
+			c.commit(false)
+		case n >= minCompressSize:
+			c.commit(true)
+		default:
+			// Length unknown and still below the floor: hold the bytes rather
+			// than commit to framing that may not pay for itself.
+			c.pending = append(c.pending, p...)
+			if len(c.pending) < minCompressSize {
+				return len(p), nil
+			}
+			c.commit(true)
+			_, err := c.gz.Write(c.pending)
+			c.pending = nil
+			return len(p), err
+		}
+	}
+	return c.write(p)
+}
+
+// declaredLength is the Content-Length the handler set, or -1 when it is not
+// known. A response that is already encoded counts as unknown, so it is never
+// double-encoded.
+func (c *compressWriter) declaredLength() int64 {
+	if c.Header().Get("Content-Encoding") != "" {
+		return -1
+	}
+	cl := c.Header().Get("Content-Length")
+	if cl == "" {
+		return -1
+	}
+	n, err := strconv.ParseInt(cl, 10, 64)
+	if err != nil {
+		return -1
+	}
+	return n
+}
+
+// commit fixes the encoding decision and flushes the header. Safe to call more
+// than once; only the first call has an effect.
+func (c *compressWriter) commit(encode bool) {
+	if c.decided {
+		return
+	}
+	c.decided = true
+	if c.status == 0 {
+		c.status = http.StatusOK
+	}
+	if encode && c.Header().Get("Content-Encoding") == "" {
+		// The declared length described the unencoded body and no longer
+		// applies; dropping it lets net/http frame the gzip stream with chunked
+		// encoding instead of truncating the response.
+		c.Header().Del("Content-Length")
+		c.Header().Set("Content-Encoding", "gzip")
+		c.gz = gzip.NewWriter(c.ResponseWriter)
+	}
+	c.ResponseWriter.WriteHeader(c.status)
+	c.header = true
+}
+
+func (c *compressWriter) write(p []byte) (int, error) {
+	if c.gz != nil {
+		return c.gz.Write(p)
+	}
+	return c.ResponseWriter.Write(p)
+}
+
+// Close finishes the decision for a handler that never reached the floor, and
+// flushes the gzip trailer.
+func (c *compressWriter) Close() {
+	if !c.decided {
+		c.commit(false)
+		if len(c.pending) > 0 {
+			_, _ = c.ResponseWriter.Write(c.pending)
+			c.pending = nil
+		}
+	}
+	if c.gz != nil {
+		_ = c.gz.Close()
+	}
+}
+
+// Flush opts a streaming response out of compression: a server-sent-events
+// stream held back until minCompressSize would simply never arrive.
+func (c *compressWriter) Flush() {
+	if !c.decided {
+		c.commit(false)
+		if len(c.pending) > 0 {
+			_, _ = c.ResponseWriter.Write(c.pending)
+			c.pending = nil
+		}
+	} else if c.gz != nil {
+		_ = c.gz.Flush()
+	}
+	if f, ok := c.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// SecurityHeaders sets the response headers every request must carry.
 func SecurityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h := w.Header()

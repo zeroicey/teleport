@@ -23,11 +23,18 @@ func buildFixture(t *testing.T) string {
 	if err := os.MkdirAll(filepath.Join(dir, "assets"), 0o755); err != nil {
 		t.Fatalf("mkdir assets: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(dir, "fonts"), 0o755); err != nil {
+		t.Fatalf("mkdir fonts: %v", err)
+	}
 	files := map[string]string{
 		"index.html":             `<!DOCTYPE html><div id="app"></div>`,
 		"assets/index-abc123.js": `console.log("bundle")`,
 		"assets/share.js":        `console.log("share")`,
 		"favicon.ico":            "not-really-an-ico",
+		// Content-addressed font (immutable) and the stable stylesheet that
+		// references it (must revalidate).
+		"fonts/outfit-001-6c18d579.woff2": "wOF2-fake-font-bytes",
+		"fonts/fonts.css":                 `@font-face{src:url(./outfit-001-6c18d579.woff2)}`,
 	}
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
@@ -50,6 +57,81 @@ func get(h http.Handler, path string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 	return rec
+}
+
+// TestFontCacheControlThroughTheHandler is the test that the unit-level rule
+// alone could not give: isContentHashed can be perfectly correct while the
+// handler never asks it.
+//
+// It did exactly that. A hashed font under `fonts/` is not under `assets/`, so
+// it reached the generic "serve a real file" branch, which passed a hardcoded
+// `immutable=false`. Every page load therefore re-fetched the font slices in
+// full — embedded files carry a zero modtime, so `no-cache` cannot even resolve
+// to a 304 and the browser has no way to avoid the download. Asserting the
+// header through ServeHTTP is what closes that gap.
+func TestFontCacheControlThroughTheHandler(t *testing.T) {
+	h := newTestHandler(t, "/yeciorez/teleport")
+
+	rec := get(h, "/yeciorez/teleport/fonts/outfit-001-6c18d579.woff2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("hashed font status = %d, want 200", rec.Code)
+	}
+	if got, want := rec.Header().Get("Cache-Control"), "public, max-age=31536000, immutable"; got != want {
+		t.Errorf("hashed font Cache-Control = %q, want %q", got, want)
+	}
+
+	// The stylesheet is the stable-name manifest the Go templates link. It must
+	// keep revalidating even though it lives in the same directory.
+	rec = get(h, "/yeciorez/teleport/fonts/fonts.css")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fonts.css status = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("fonts.css Cache-Control = %q, want %q", got, "no-cache")
+	}
+}
+
+// TestRevalidationActuallySavesTheBody guards the assumption behind `no-cache`.
+//
+// `no-cache` does not mean "cheap": it means "revalidate first". Embedded files
+// report a zero modtime, so without a validator the browser has nothing to send
+// and must re-download the whole body. `fonts/fonts.css` is ~107 KB of
+// @font-face rules, so that mistake is paid on every page load. This test fails
+// if the ETag ever stops being emitted, or stops being honoured.
+func TestRevalidationActuallySavesTheBody(t *testing.T) {
+	h := newTestHandler(t, "/yeciorez/teleport")
+	path := "/yeciorez/teleport/fonts/fonts.css"
+
+	first := get(h, path)
+	if first.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", first.Code)
+	}
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("no ETag on a no-cache response: every revalidation re-downloads the body")
+	}
+	if !strings.HasPrefix(etag, `"`) || !strings.HasSuffix(etag, `"`) {
+		t.Errorf("ETag %q is not a strong validator (must be quoted)", etag)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("If-None-Match", etag)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("conditional GET status = %d, want 304", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("304 carried %d bytes of body; it must be empty", rec.Body.Len())
+	}
+
+	// The validator must be content-derived, not a constant: a stale ETag would
+	// pin clients to old bytes across a deploy.
+	other := get(h, "/yeciorez/teleport/favicon.ico")
+	if other.Header().Get("ETag") == etag {
+		t.Error("two different files share an ETag; it is not derived from content")
+	}
 }
 
 func TestNewRejectsBadDirectory(t *testing.T) {
@@ -183,13 +265,53 @@ func TestStableAssetListMatchesBuild(t *testing.T) {
 	for _, stable := range []string{
 		"assets/share.js",
 		"assets/robots.txt",
-		"assets/SHARE.js",        // case-insensitive filesystems serve share.js here
+		"assets/SHARE.js", // case-insensitive filesystems serve share.js here
 		"assets/nested/deep/x.js",
 		"assets/favicon.ico",
 		"index.html",
 	} {
 		if isContentHashed(stable) {
 			t.Errorf("isContentHashed(%q) = true; unhashed names must revalidate", stable)
+		}
+	}
+}
+
+// TestFontCacheRule covers the second producer feeding this rule.
+//
+// Fonts come from `web/public/`, which Vite copies verbatim, so their names are
+// chosen by scripts/fonts/fetch_fonts.py rather than by the bundler. They carry
+// a content hash for the same reason Vite's chunks do, and the stakes are
+// concrete: embedded files report a zero modtime, so anything that revalidates
+// is re-downloaded in full on every page load — hundreds of KB of CJK glyphs.
+//
+// The negative cases are the point. `fonts/fonts.css` must keep revalidating
+// (the Go templates link it by a stable name), and a font file with no digest
+// must not be trusted: `no-cache` is the safe failure.
+func TestFontCacheRule(t *testing.T) {
+	for _, hashed := range []string{
+		"fonts/outfit-001-6c18d579.woff2",
+		"fonts/noto-sans-sc-100-cf5346b0.woff2",
+		"fonts/jetbrains-mono-005-83c005d4.woff2",
+	} {
+		if !isContentHashed(hashed) {
+			t.Errorf("isContentHashed(%q) = false; a content-addressed font must stay immutable", hashed)
+		}
+	}
+
+	for _, stable := range []string{
+		"fonts/fonts.css",                  // stable name by design: the manifest
+		"fonts/outfit.woff2",               // no index, no digest
+		"fonts/outfit-001.woff2",           // index but no digest
+		"fonts/outfit-001-6c18d57.woff2",   // digest one character short
+		"fonts/outfit-001-6c18d5790.woff2", // digest one character long
+		"fonts/outfit-001-zzzzzzzz.woff2",  // digest is not hex
+		"fonts/outfit-1-6c18d579.woff2",    // index is not three digits
+		"fonts/outfit-001-6c18d579.ttf",    // not a woff2
+		"fonts/nested/deep/outfit-001-6c18d579.woff2",
+		"fonts/outfit-001-6c18d579.woff2.bak",
+	} {
+		if isContentHashed(stable) {
+			t.Errorf("isContentHashed(%q) = true; an unproven name must revalidate", stable)
 		}
 	}
 }
@@ -375,5 +497,39 @@ func TestWorksAtEmptyPrefix(t *testing.T) {
 	}
 	if rec := get(h, "/assets/index-abc123.js"); rec.Code != http.StatusOK {
 		t.Errorf("asset: status = %d, want 200", rec.Code)
+	}
+}
+
+// TestShellRevalidationReturns304 pins the same contract for index.html.
+//
+// The shell is served for every client-side route, so it is the single most
+// re-fetched document in the app. Advertising an ETag without honouring it
+// would be worse than having none: the browser would revalidate and be handed
+// the full document anyway.
+func TestShellRevalidationReturns304(t *testing.T) {
+	h := newTestHandler(t, "/yeciorez/teleport")
+
+	first := get(h, "/yeciorez/teleport/dashboard/reports/rpt_x")
+	if first.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", first.Code)
+	}
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("shell has no ETag; every route navigation re-downloads the document")
+	}
+	if !strings.Contains(first.Body.String(), `id="app"`) {
+		t.Fatal("shell body missing from the unconditional response")
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/yeciorez/teleport/dashboard/reports/rpt_x", nil)
+	req.Header.Set("If-None-Match", etag)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotModified {
+		t.Fatalf("conditional shell GET = %d, want 304", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("304 carried %d body bytes", rec.Body.Len())
 	}
 }

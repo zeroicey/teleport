@@ -46,75 +46,104 @@ const categories = computed(() =>
   <div class="page-head">
     <div>
       <h1>报告</h1>
-      <p v-if="!loading">共 {{ reports.length }} 篇<span v-if="categories.length"> · {{ categories.join(' / ') }}</span></p>
+      <p v-if="!loading">
+        共 {{ reports.length }} 篇<span v-if="categories.length"> · {{ categories.join(' / ') }}</span>
+      </p>
       <p v-else>加载中…</p>
     </div>
-    <div class="row">
+
+    <div class="flex flex-wrap items-center gap-2">
+      <!--
+        The placeholder is not a label: it disappears the moment the field has
+        content, which is precisely when a screen-reader user needs to know what
+        the field is. `sr-only` gives it a real one without adding visual noise.
+      -->
+      <label for="report-search" class="sr-only">搜索报告</label>
       <input
+        id="report-search"
         v-model="search"
+        class="input w-60"
         type="search"
+        name="report-search"
         placeholder="搜索标题 / 分类 / ID"
-        style="width: 240px"
         :disabled="loading"
+        autocomplete="off"
+        enterkeyhint="search"
+        spellcheck="false"
       />
-      <button type="button" :disabled="loading" @click="load">刷新</button>
+      <button class="btn" type="button" :disabled="loading" @click="load">刷新</button>
     </div>
   </div>
 
-  <div v-if="error" class="alert error" style="margin-bottom: 16px">{{ error }}</div>
+  <div v-if="error" class="alert alert-error mb-4" role="alert">{{ error }}</div>
 
-  <div class="card" style="padding: 0">
-    <div v-if="loading" class="empty"><span class="spin"></span> 正在加载报告…</div>
-
-    <div v-else-if="filtered.length === 0" class="empty">
-      <p v-if="reports.length === 0">
-        还没有报告。通过 <code class="mono">POST /api/reports</code> 上报第一篇。
-      </p>
-      <p v-else>没有匹配「{{ search }}」的报告。</p>
+  <div class="card overflow-hidden p-0">
+    <div v-if="loading" class="px-5 py-12 text-center text-ink-muted" role="status">
+      <span class="spinner mr-2" aria-hidden="true"></span> 正在加载报告…
     </div>
 
-    <table v-else class="table">
-      <thead>
-        <tr>
-          <th>标题</th>
-          <th>分类</th>
-          <th>发布者</th>
-          <th>格式</th>
-          <th>创建时间</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="r in filtered" :key="r.id">
-          <td>
-            <RouterLink :to="`/dashboard/reports/${r.id}`">{{ r.title }}</RouterLink>
-            <div class="muted mono" style="font-size: 11px">{{ r.id }}</div>
-          </td>
-          <td><span class="badge">{{ r.category }}</span></td>
-          <td class="muted">
-            {{ r.owner_name || '未知' }}
-            <div v-if="r.owner_key_id" class="muted mono" style="font-size: 11px">
-              {{ r.owner_key_id.slice(0, 8) }}
-            </div>
-          </td>
-          <td class="muted">{{ r.format }}</td>
-          <td class="muted" :title="new Date(r.created_at).toISOString()">
-            {{ relativeTime(r.created_at) }}
-            <!--
-              updated_at now moves, so the list has to show it: a report that
-              says "3 days ago" while having been corrected an hour ago would
-              mislead exactly the person checking whether the fix landed.
-            -->
-            <div
-              v-if="r.updated_at > r.created_at"
-              class="muted"
-              style="font-size: 11px"
-              :title="`更新于 ${new Date(r.updated_at).toISOString()}`"
-            >
-              已更新 · {{ relativeTime(r.updated_at) }}
-            </div>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <div v-else-if="filtered.length === 0" class="px-5 py-12 text-center text-ink-muted">
+      <p v-if="reports.length === 0" class="m-0">
+        还没有报告。通过
+        <code class="rounded bg-surface-sunken px-1.5 py-0.5 font-mono text-[13px]"
+          >POST /api/reports</code
+        >
+        上报第一篇。
+      </p>
+      <p v-else class="m-0">没有匹配「{{ search }}」的报告。</p>
+    </div>
+
+    <!--
+      `overflow-x-auto` on the wrapper: the table has five columns and a long
+      title, and without it the whole page scrolls sideways on a phone instead
+      of just the table.
+    -->
+    <div v-else class="overflow-x-auto">
+      <table class="data-table">
+        <caption class="sr-only">
+          报告列表
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">标题</th>
+            <th scope="col">分类</th>
+            <th scope="col">发布者</th>
+            <th scope="col">格式</th>
+            <th scope="col">创建时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="r in filtered" :key="r.id">
+            <td>
+              <RouterLink :to="`/dashboard/reports/${r.id}`">{{ r.title }}</RouterLink>
+              <div class="mt-0.5 font-mono text-[11px] text-ink-muted">{{ r.id }}</div>
+            </td>
+            <td><span class="badge">{{ r.category }}</span></td>
+            <td class="text-ink-muted">
+              {{ r.owner_name || '未知' }}
+              <div v-if="r.owner_key_id" class="font-mono text-[11px] text-ink-muted">
+                {{ r.owner_key_id.slice(0, 8) }}
+              </div>
+            </td>
+            <td class="text-ink-muted">{{ r.format }}</td>
+            <td class="text-ink-muted" :title="new Date(r.created_at).toISOString()">
+              {{ relativeTime(r.created_at) }}
+              <!--
+                updated_at now moves, so the list has to show it: a report that
+                says "3 days ago" while having been corrected an hour ago would
+                mislead exactly the person checking whether the fix landed.
+              -->
+              <div
+                v-if="r.updated_at > r.created_at"
+                class="text-[11px]"
+                :title="`更新于 ${new Date(r.updated_at).toISOString()}`"
+              >
+                已更新 · {{ relativeTime(r.updated_at) }}
+              </div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </template>

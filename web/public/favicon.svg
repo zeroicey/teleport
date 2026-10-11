@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Teleport">
+  <!--
+    Drawn rather than set in a font: an SVG favicon that depends on a webfont
+    renders differently (or not at all) depending on whether the font has loaded
+    and whether the browser honours fonts in favicons. Paths are deterministic.
+
+    A single accent square with a white mark. It has to read at 16x16 in a
+    browser tab, which rules out anything with fine detail or more than one
+    colour. The accent matches --color-accent so the tab, the sign-in screen's
+    bloom and the primary buttons are visibly the same product.
+  -->
+  <rect width="32" height="32" rx="7" fill="#2563eb"/>
+  <!-- A "T" with a detached crossbar, reading as a mark travelling upward. -->
+  <path d="M9 9.5h14a1.5 1.5 0 0 1 0 3h-5.5v9a1.5 1.5 0 0 1-3 0v-9H9a1.5 1.5 0 0 1 0-3z" fill="#fff"/>
+</svg>

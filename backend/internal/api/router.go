@@ -230,6 +230,9 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 		httpx.LogRequests,
 		httpx.SecurityHeaders,
 		httpx.CORS(cfg.FrontendOrigins),
+		// Innermost, so it sees the final Content-Type before deciding. It only
+		// buffers compressible responses; everything else streams through.
+		httpx.Compress,
 	), nil
 }
 
@@ -808,7 +811,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 // owner_key_id is its own. That asymmetry is the ownership model, not a
 // convenience: an agent must not be able to enumerate another agent's work, and
 // it must not accidentally see the root-published reports either (owner_key_id
-// '' is root's own).
+// ” is root's own).
 func (s *Server) handleListOwnReports(w http.ResponseWriter, r *http.Request) {
 	principal := httpx.PrincipalFrom(r.Context())
 	if principal == nil {

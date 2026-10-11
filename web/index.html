@@ -5,6 +5,38 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="robots" content="noindex, nofollow" />
   <title>Teleport · 报告控制台</title>
+  <!--
+    Tints the browser chrome (mobile address bar, PWA title bar) to match the
+    canvas in each scheme. Without it the OS default fights the dark theme and
+    the top of the page looks like a seam. Values mirror --color-canvas.
+  -->
+  <meta name="theme-color" content="#f7f7f8" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#0b0b0e" media="(prefers-color-scheme: dark)" />
+  <!--
+    Self-hosted webfonts, served from the `public/` directory so the URL is
+    stable and non-hashed — the Go-rendered share and hand-off pages link the
+    very same file.
+
+    `%BASE_URL%` (Vite's HTML env replacement, which expands to the route
+    prefix) rather than a relative or hardcoded path, and this is NOT
+    cosmetic. The Go backend serves this shell for *any* unmatched path under
+    the prefix, so a hard refresh at `/dashboard/reports/<id>` (four segments
+    deep) also renders this document. A relative `./fonts/...` would then
+    resolve to `/dashboard/reports/<id>/fonts/...` and 404, leaving every page
+    but the shallowest one in a fallback face. The placeholder stays correct at
+    any depth and keeps the prefix written down in exactly one place.
+
+    Loaded before the module script so the font requests start as early as the
+    stylesheet does; `font-display: swap` in that stylesheet keeps the first
+    paint from waiting on them.
+  -->
+  <link rel="stylesheet" href="%BASE_URL%fonts/fonts.css" />
+  <!--
+    Same `%BASE_URL%` rule as the fonts, for the same reason: the shell is
+    served for every client-side route, so a relative icon URL would 404 on a
+    deep link and the tab would silently show the browser's blank default.
+  -->
+  <link rel="icon" type="image/svg+xml" href="%BASE_URL%favicon.svg" />
 </head>
 <body>
   <div id="app"></div>

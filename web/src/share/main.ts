@@ -42,8 +42,11 @@ async function renderDiagrams(): Promise<void> {
       // 'strict' sanitizes labels and blocks interactive/click directives.
       securityLevel: 'strict',
       theme: window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'default',
-      fontFamily:
-        '-apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans SC", Roboto, sans-serif',
+      // Must match the share page's own stack. Mermaid emits the family as an
+      // SVG attribute, and an SVG `font-family` list falls back per-glyph —
+      // so a system stack here would render diagram labels in a different face
+      // from the surrounding prose on the very same page.
+      fontFamily: '"Outfit", "Noto Sans SC", sans-serif',
     });
 
     // A single bad diagram must not abort the rest of the page.

@@ -145,6 +145,8 @@ func RenderSharePage(opts SharePageOptions) string {
 <title>`)
 	b.WriteString(markdown.Escape(report.Title))
 	b.WriteString(`</title>
+<link rel="stylesheet" href="` + markdown.Escape(assetBase) + `/fonts/fonts.css" />
+<link rel="icon" type="image/svg+xml" href="` + markdown.Escape(assetBase) + `/favicon.svg" />
 <style>
   :root {
     color-scheme: light dark;
@@ -160,7 +162,7 @@ func RenderSharePage(opts SharePageOptions) string {
   * { box-sizing: border-box; }
   body {
     margin:0; background:var(--bg); color:var(--fg);
-    font:16px/1.75 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",Roboto,Helvetica,Arial,sans-serif;
+    font:16px/1.75 "Outfit","Noto Sans SC",sans-serif;
     -webkit-text-size-adjust:100%;
   }
   .wrap { max-width: 820px; margin: 0 auto; padding: 48px 20px 96px; }
@@ -177,7 +179,7 @@ func RenderSharePage(opts SharePageOptions) string {
     padding:12px 0; margin:0 0 32px; font-size:13px; color:var(--fg-muted);
     display:grid; gap:5px;
   }
-  .meta .mono { font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:12px; }
+  .meta .mono { font-family:"JetBrains Mono",ui-monospace,monospace; font-size:12px; }
 
   #report-root { overflow-wrap: break-word; }
   #report-root h2 { font-size:1.35rem; margin:2.2em 0 .7em; padding-bottom:.3em; border-bottom:1px solid var(--border); }
@@ -202,7 +204,7 @@ func RenderSharePage(opts SharePageOptions) string {
   #report-root :not(pre) > code {
     background:var(--code-bg); border:1px solid var(--border);
     border-radius:4px; padding:.15em .4em;
-    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:.875em;
+    font-family:"JetBrains Mono",ui-monospace,monospace; font-size:.875em;
   }
 
   /* code blocks */
@@ -212,13 +214,13 @@ func RenderSharePage(opts SharePageOptions) string {
     font-size:13.5px; line-height:1.6; margin:0 0 1.2em;
   }
   .code-block code {
-    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-family:"JetBrains Mono",ui-monospace,monospace;
     background:none; border:0; padding:0; font-size:inherit;
   }
   .code-block[data-lang]::before {
     content:attr(data-lang); position:absolute; top:6px; right:10px;
     font-size:11px; color:var(--fg-muted); text-transform:lowercase;
-    font-family:ui-monospace,monospace; pointer-events:none;
+    font-family:"JetBrains Mono",ui-monospace,monospace; pointer-events:none;
   }
 
   /* chroma token colours (hand-rolled theme, no CSS import) */

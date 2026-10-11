@@ -1,0 +1,443 @@
+/* ---------------------------------------------------------------------------
+   Teleport — Tailwind v4 entry point and the single source of design tokens.
+
+   This file replaces the old hand-written `styles.css`. It has three parts,
+   in order:
+
+     1. `@import "tailwindcss"` — Tailwind itself, plus source scanning.
+     2. `@theme`               — the design tokens. Every colour, font and
+                                 radius the app uses is declared here once, and
+                                 Tailwind generates the matching utilities
+                                 (`bg-surface`, `text-ink-muted`, `font-mono`, …).
+     3. `@layer components`    — the handful of primitives that repeat across
+                                 every view (button, card, badge, table, …),
+                                 written with `@apply` so they are built from
+                                 the same tokens and utilities as everything
+                                 else rather than from loose values.
+
+   Dark mode is `prefers-color-scheme`, matching the behaviour this project has
+   always had (and matching what `color-scheme: light dark` tells the browser).
+   There is deliberately no class-based theme toggle and no JS: the dashboard
+   should follow the OS, and a toggle would be state to persist and test for no
+   benefit.
+
+   Nothing in this file may hardcode a colour outside `@theme` / the dark-mode
+   override — that is what keeps light and dark in step.
+   --------------------------------------------------------------------------- */
+
+@import "tailwindcss";
+
+/* Fonts are NOT imported here. `@font-face` rules live in the stable,
+   non-hashed `web/public/fonts/fonts.css`, which the SPA links from
+   `index.html` and the Go share/handoff pages link directly. That single file
+   is shared by both surfaces, and its relative `url(...)` references resolve
+   correctly under the route prefix without any rewriting. See
+   `.ai/decisions/2026-10-12-self-hosted-webfonts.md`. */
+
+/* Tailwind scans these files for class names. Declared explicitly rather than
+   relying on automatic detection, because the SPA lives under `web/src` while
+   the Vite root is `web` — being explicit means a future root change cannot
+   silently drop the app's classes from the build. */
+@source "./**/*.{vue,ts}";
+
+@theme {
+  /* -- typography ---------------------------------------------------------
+     Self-hosted webfonts only (see fonts.css). The generic fallbacks exist so
+     a font that fails to load degrades to *a* sans-serif instead of an
+     unstyled default; they are not the intended rendering. */
+  --font-sans: "Outfit", "Noto Sans SC", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* -- colour -------------------------------------------------------------
+     Semantic names, not literal ones: a component asks for "the muted ink",
+     not "grey 500". Swapping the palette is then a change to this block only. */
+  --color-canvas: #f7f7f8;
+  --color-surface: #ffffff;
+  --color-surface-sunken: #f1f1f3;
+  --color-line: #e4e4e7;
+  --color-line-strong: #d4d4d8;
+  --color-ink: #18181b;
+  --color-ink-muted: #6b6b75;
+  --color-accent: #2563eb;
+  --color-accent-hover: #1d4ed8;
+  --color-accent-ink: #ffffff;
+  --color-danger: #dc2626;
+  --color-danger-hover: #b91c1c;
+  --color-warn: #b45309;
+  --color-ok: #15803d;
+
+  /* -- shape -------------------------------------------------------------- */
+  --radius-card: 10px;
+  --radius-control: 7px;
+
+  /* -- motion -------------------------------------------------------------
+     Short and few. Every transition uses one of these so the interface moves
+     at a consistent speed, and so `prefers-reduced-motion` has one place to
+     neutralise. */
+  --duration-fast: 120ms;
+  --duration-slow: 180ms;
+}
+
+/* Dark palette. Unlayered on purpose: Tailwind emits `@theme` into
+   `@layer theme`, and unlayered declarations outrank any layer, so these
+   simply win without needing `!important` or a higher-specificity selector. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-canvas: #0b0b0e;
+    --color-surface: #17171c;
+    --color-surface-sunken: #101014;
+    --color-line: #2a2a32;
+    --color-line-strong: #3f3f48;
+    --color-ink: #e7e7ea;
+    --color-ink-muted: #9d9daa;
+    --color-accent: #3b82f6;
+    --color-accent-hover: #60a5fa;
+    --color-accent-ink: #0b0b0e;
+    --color-danger: #f87171;
+    --color-danger-hover: #fca5a5;
+    --color-warn: #fbbf24;
+    --color-ok: #4ade80;
+  }
+}
+
+@layer base {
+  /* Let native controls (scrollbars, form widgets, the caret) follow the
+     colour scheme instead of rendering light-on-dark. */
+  :root {
+    color-scheme: light dark;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.6;
+    /* Outfit is a geometric face with a large x-height; CJK needs a little
+       more room than the Latin default to stay legible at 15px. */
+    font-synthesis-weight: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  a {
+    color: var(--color-accent);
+  }
+
+  /* One focus treatment for the whole app. `:focus-visible` so a mouse click
+     does not paint a ring, but every keyboard path does — this is the
+     guideline that the old stylesheet only honoured on inputs. */
+  :where(a, button, input, select, textarea, [tabindex]):focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 2px;
+    border-radius: var(--radius-control);
+  }
+
+  /* Respect the OS setting. Kept global so no component can forget it. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+
+  /* The default on `body` alone would not reach the fixed/sticky layers that
+     actually scroll, so the two properties that decide how touch behaves are
+     set once here rather than per component. */
+  html {
+    /* The topbar is sticky; without this an in-page anchor lands underneath it.
+       Covers every future heading anchor, not just today's. */
+    scroll-padding-top: 72px;
+    /* Removes the ~300ms double-tap-zoom delay on every control. */
+    touch-action: manipulation;
+  }
+
+  h1,
+  h2,
+  h3 {
+    /* Stops a heading from leaving one orphaned word on its last line. */
+    text-wrap: balance;
+  }
+
+  /* Numbers that sit in columns or get compared must not jitter between
+     proportional digit widths. Outfit's default figures are proportional. */
+  .data-table td,
+  .data-table th,
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer components {
+  /* -- layout -------------------------------------------------------------- */
+  .topbar {
+    @apply sticky top-0 z-10 flex flex-wrap items-center justify-between gap-4
+           border-b border-line bg-surface px-6 py-3.5;
+  }
+
+  .brand {
+    @apply font-semibold tracking-tight text-ink no-underline;
+  }
+
+  .topnav {
+    @apply flex items-center gap-3.5 text-sm;
+  }
+
+  .topnav a {
+    /* `py-1.5` is not decoration: without vertical padding the hit area is only
+       ~20px tall, below the 24x24 minimum that WCAG 2.2 SC 2.5.8 sets for
+       pointer targets — and these two links are the main navigation. */
+    @apply py-1.5 text-ink-muted no-underline transition-colors;
+    transition-duration: var(--duration-fast);
+  }
+
+  .topnav a:hover {
+    @apply text-ink;
+  }
+
+  /* Router's active class is applied to the <a> itself. */
+  .topnav a.router-link-active {
+    @apply font-medium text-ink;
+  }
+
+  .container {
+    @apply mx-auto w-full max-w-5xl px-6 pb-20 pt-8;
+  }
+
+  .page-head {
+    @apply mb-6 flex flex-wrap items-end justify-between gap-4;
+  }
+
+  .page-head h1 {
+    @apply m-0 text-2xl font-semibold tracking-tight;
+  }
+
+  .page-head p {
+    @apply mt-1 mb-0 text-sm text-ink-muted;
+  }
+
+  /* -- surfaces ------------------------------------------------------------ */
+  .card {
+    @apply rounded-card border border-line bg-surface p-5;
+  }
+
+  /* -- sign-in screen ------------------------------------------------------- */
+  /* The only screen with a bespoke treatment: signing in is a full-viewport
+     moment rather than a dense tool surface, so it earns decoration the rest of
+     the app deliberately does not have. Token-driven, so it follows light/dark
+     and any future palette change for free. */
+  .login-shell {
+    @apply grid place-items-center p-6;
+    min-height: 100vh;
+    /* A single soft accent bloom behind the card. Cheap — no image, no network
+       request — and it keeps the entry screen from reading as an unstyled form. */
+    background: radial-gradient(
+      60rem 30rem at 50% -10%,
+      color-mix(in srgb, var(--color-accent) 12%, transparent),
+      transparent 70%
+    );
+  }
+
+  /* Declared AFTER `.card` on purpose. Both are single-class selectors in the
+     same layer, so source order decides: `.card` sets `p-5`, and this must
+     override it. The original lived in a `<style scoped>` block, where Vue's
+     attribute selector added specificity — moving it here without moving the
+     order silently shrank the card's padding. */
+  .login-card {
+    @apply flex w-full flex-col;
+    gap: 18px;
+    max-width: 400px;
+    padding: 28px;
+  }
+
+  /* -- buttons -------------------------------------------------------------
+     One base plus modifiers. Sizes are separate (`btn-sm`) so a small ghost
+     button and a small primary button cannot drift apart. */
+  .btn {
+    @apply inline-flex cursor-pointer items-center justify-center gap-2 rounded-control
+           border border-line bg-surface px-3.5 py-2 text-sm font-medium text-ink
+           transition-colors select-none;
+    transition-duration: var(--duration-fast);
+  }
+
+  .btn:hover:not(:disabled) {
+    @apply border-line-strong bg-surface-sunken;
+  }
+
+  .btn:disabled {
+    @apply cursor-not-allowed opacity-50;
+  }
+
+  /* Modifier order matters and is deliberate: Tailwind emits these in source
+     order and they all have the same specificity, so a later rule wins. The
+     borderless modifier comes first so that `btn-ghost btn-danger` still gets
+     the danger border on hover — reversed, `btn-ghost` would erase it. */
+  .btn-ghost {
+    @apply border-transparent bg-transparent px-2 py-1 text-[13px];
+  }
+
+  .btn-ghost:hover:not(:disabled) {
+    @apply border-transparent bg-surface-sunken;
+  }
+
+  .btn-danger {
+    @apply text-danger;
+  }
+
+  .btn-danger:hover:not(:disabled) {
+    @apply border-danger text-danger-hover;
+  }
+
+  .btn-primary {
+    @apply border-accent bg-accent text-accent-ink;
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    @apply border-accent-hover bg-accent-hover;
+  }
+
+  .btn-sm {
+    @apply px-2 py-1 text-[13px];
+  }
+
+  /* -- form controls ------------------------------------------------------- */
+  .input {
+    @apply w-full rounded-control border border-line bg-surface px-3 py-2 text-sm
+           text-ink transition-colors;
+    transition-duration: var(--duration-fast);
+  }
+
+  .input:disabled {
+    @apply cursor-not-allowed bg-surface-sunken text-ink-muted;
+  }
+
+  .field-label {
+    @apply mb-1.5 block text-[13px] font-medium text-ink-muted;
+  }
+
+  /* -- table --------------------------------------------------------------- */
+  .data-table {
+    @apply w-full border-collapse text-sm;
+  }
+
+  .data-table th {
+    @apply border-b border-line px-3 py-2.5 text-left text-xs font-semibold
+           tracking-wider whitespace-nowrap text-ink-muted uppercase;
+  }
+
+  .data-table td {
+    @apply border-b border-line px-3 py-3 align-middle;
+  }
+
+  .data-table tbody tr:last-child td {
+    @apply border-b-0;
+  }
+
+  .data-table tbody tr {
+    @apply transition-colors;
+    transition-duration: var(--duration-fast);
+  }
+
+  .data-table tbody tr:hover {
+    background: color-mix(in srgb, var(--color-ink) 4%, transparent);
+  }
+
+  .data-table a {
+    @apply font-medium no-underline;
+  }
+
+  .data-table a:hover {
+    @apply underline;
+  }
+
+  /* -- badge --------------------------------------------------------------- */
+  .badge {
+    @apply inline-block rounded-full border border-line px-2.5 py-0.5 text-xs
+           whitespace-nowrap text-ink-muted;
+  }
+
+  .badge-ok {
+    @apply text-ok;
+    border-color: color-mix(in srgb, var(--color-ok) 40%, var(--color-line));
+  }
+
+  .badge-warn {
+    @apply text-warn;
+    border-color: color-mix(in srgb, var(--color-warn) 40%, var(--color-line));
+  }
+
+  .badge-danger {
+    @apply text-danger;
+    border-color: color-mix(in srgb, var(--color-danger) 40%, var(--color-line));
+  }
+
+  /* -- alert ---------------------------------------------------------------
+     `role="alert"` is applied in the markup, not here: a stylesheet cannot
+     know whether a message is urgent, and an alert that is always live is
+     noise to a screen reader. */
+  .alert {
+    @apply rounded-control border px-3.5 py-2.5 text-sm;
+  }
+
+  .alert-error {
+    @apply border-danger/40 text-danger;
+    background: color-mix(in srgb, var(--color-danger) 8%, transparent);
+  }
+
+  .alert-ok {
+    @apply border-ok/40 text-ok;
+    background: color-mix(in srgb, var(--color-ok) 8%, transparent);
+  }
+
+  /* -- modal --------------------------------------------------------------- */
+  .modal-backdrop {
+    @apply fixed inset-0 z-40 grid place-items-center p-6;
+    background: rgb(0 0 0 / 0.5);
+    /* A scroll gesture that reaches the end of the dialog must not chain
+       through to the page behind it. */
+    overscroll-behavior: contain;
+  }
+
+  .modal {
+    @apply max-h-[90vh] w-full max-w-lg overflow-y-auto;
+    overscroll-behavior: contain;
+  }
+
+  .modal h2 {
+    @apply m-0 text-lg font-semibold;
+  }
+
+  /* -- misc ---------------------------------------------------------------- */
+  .token-url {
+    @apply rounded border border-line bg-surface-sunken px-2.5 py-1.5 font-mono
+           text-[13px] break-all;
+  }
+
+  .code-block {
+    @apply max-h-[520px] overflow-x-auto rounded-card border border-line
+           bg-surface-sunken p-4 text-[13px] leading-relaxed;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .spinner {
+    @apply inline-block size-3.5 shrink-0 rounded-full border-2 border-line
+           align-[-2px];
+    border-top-color: var(--color-accent);
+    animation: tp-spin 0.7s linear infinite;
+  }
+}
+
+@keyframes tp-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

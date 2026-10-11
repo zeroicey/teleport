@@ -1,6 +1,7 @@
 import { fileURLToPath, URL } from 'node:url';
 import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
+import tailwindcss from '@tailwindcss/vite';
 
 /**
  * Route prefix: the single source of truth for where the app is mounted.
@@ -59,7 +60,12 @@ const DEV_API_TARGET = 'http://127.0.0.1:8788';
 export default defineConfig({
   root: 'web',
   base: BASE,
-  plugins: [vue()],
+  // Tailwind v4 runs as a Vite plugin rather than through PostCSS: it scans
+  // sources itself and emits one stylesheet, so there is no `tailwind.config.js`
+  // and no `postcss.config.js` to keep in sync. The theme lives in
+  // `web/src/app.css` (`@theme`), which is the single place design tokens are
+  // declared — see that file for the token contract.
+  plugins: [vue(), tailwindcss()],
 
   resolve: {
     alias: {

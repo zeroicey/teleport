@@ -1,15 +1,85 @@
 # Current task
 
-**Status:** ✅ **一键交接链接已上线并线上实测（本机真 Chromium 25/25 + 生产接口 31/31 + 生产真浏览器 17/17 + 独立对抗验证）** · 线上 `6a1b135` ·
-**Updated:** 2026-10-11
-**下一步：** 把交接链接**发给真人试用**（用户要的「找一些人来测试一下」——这条功能本身就是邀请方式）
+**Status:** ✅ **UI 优化 + TailwindCSS 迁移 + 自托管字体已完成，全部闸门绿** ·
+`pnpm run check` / `backend:vet` / `build:release` 全通过；真浏览器 7 组页面全绿、a11y 审计 0 失败 ·
+**Updated:** 2026-10-12
+**下一步：** ①（承接上一轮）把交接链接发给真人试用；② 本轮改动尚未 `git commit`，提交前需人类确认
 
 > 本文件是**当前状态**，不是流水账。每一轮的完整叙事在
 > `.ai/sessions/*-handoff.md` 与 `.ai/decisions/`、`.ai/pitfalls/` 里。
 
 ---
 
-## 本轮：一键交接链接（用户原话）
+## 本轮：UI 优化（用户原话）
+
+> 「用搜索工具去搜一下 ui 设计的 skills 我们要给当前项目进行 ui 优化 你去推荐几个 ui 设计专业的 skills」
+> 「按你推荐的来，css 可以迁移到 tailwindcss，不用系统自带字体」
+
+### 装了什么 skill
+
+按「与本项目是否真的相关」筛过，**只装了两个**：
+
+| Skill | 来源 | 为什么装 |
+| --- | --- | --- |
+| `web-design-guidelines` | vercel-labs/agent-skills | 框架无关的质量闸门，规则可逐条核对（a11y / 焦点 / 表单 / 动画 / 排版 / 触控） |
+| `accessibility-review` | anthropics/knowledge-work-plugins | WCAG 2.1 AA 审计流程 + 输出模板，补上前者没有的对比度与语义检查 |
+
+**明确排除**：Vercel 的 React/Next 系列（本项目是 Vue）；另外 4 个推荐过但没装的见
+`.ai/skills/` 说明。装之前逐字读过内容，未发现 prompt injection
+（背景：Snyk 的 ToxicSkills 研究测出 36% 的 skill 含注入、1,467 个恶意载荷）。
+
+### 改了什么
+
+1. **TailwindCSS v4 接入**：`@tailwindcss/vite` 插件，无 `tailwind.config.js`、
+   无 PostCSS，token 全在 `@theme`。`web/src/styles.css` → `web/src/app.css`。
+   裁决与理由：**`.ai/decisions/2026-10-12-tailwind-css-migration.md`**。
+2. **自托管字体**：Outfit（拉丁）+ Noto Sans SC（中文，109 个 `unicode-range` 切片）
+   + JetBrains Mono（ID/代码）。取材脚本 `scripts/fonts/fetch_fonts.py`，
+   产物在 `web/public/fonts/`（4.4 MiB）。
+   裁决：**`.ai/decisions/2026-10-12-self-hosted-webfonts.md`**。
+   SPA、分享页、交接页、`/ai` 页**四处都换掉了系统字体栈**。
+3. **a11y 与交互修复**（都是真浏览器测出来的，不是照着清单抄的）：
+   跳转链接、`role="alert"`/`role="status"`、表格 `<caption>` + `scope="col"`、
+   表单 `<label>`、对话框 `role="dialog"` + `aria-modal` + **焦点陷阱 + Escape**、
+   移动端导航触控目标 20px→32px、`tabular-nums`、`text-wrap: balance`、
+   `overscroll-behavior: contain`、`touch-action: manipulation`、`theme-color`。
+4. **顺手修掉五个真实缺陷**（都是本轮改动**暴露**出来的，见踩坑记录）：
+   - 深链接刷新时字体 404（相对 URL 在 SPA 回退下按路由深度解析）；
+   - `no-cache` 配 `embed.FS` 没有校验器 → **每次整页加载重下 260–830 KB 字体**。
+     修法是字体文件名内容寻址 + 稳定名加 ETag；
+     并给后端补了此前**完全没有**的 gzip 中间件；
+   - **把 `<style scoped>` 搬进全局层后特异性丢失**，`.card` 的 `p-5` 盖掉了
+     登录卡的 `padding: 28px`（实测 20px）。构建/类型检查/Go 测试全绿，
+     只有真浏览器读 computed style 才抓得到；
+   - 完全没有 favicon（标签页空白图标），已补手绘 SVG 并在 4 处声明；
+   - 分享页 Mermaid 图表的 `fontFamily` 仍是系统字体栈，
+     与它旁边的正文不是同一个字族。
+
+### 验证（都是真跑出来的）
+
+- `pnpm run check`（typecheck + schema 同步 + Go 测试）、`backend:vet`、
+  `build:release`（25 MB 单文件）**全绿**；
+- **真 Chromium**：7 组页面/主题，字体实际加载、零控制台错误、零失败请求、
+  深链接与移动端 390px 无横向溢出、对话框键盘契约（Tab 12 次不逃逸、Escape 关闭）；
+  登录页 computed style 24/24（padding / max-width / flex / 渐变 / 字体）；
+  三个 SSR 页面（`/ai`、`/s/{token}`、`/k/{id}`）字体 + 图标链接各 2/2；
+- **a11y 审计**（脚本 `/tmp/uiverify/audit.mjs`）：浅色/深色全部 token 对比度
+  ≥4.5:1（最低 4.83:1）、渲染文本对比度全过、结构/焦点/触控目标 0 失败；
+- **真实二进制**核对响应头：字体 `immutable`、`fonts.css` + ETag 304、
+  woff2 不被 gzip、JSON 仍合法、gzip 后 body 解压字节数一致。
+
+### 还没做
+
+- **没有 `git commit`** —— AGENTS.md 要求先问人类。
+- **没有从大陆观测点验证**（AGENTS.md 完成定义第 3 条）。本轮字体是自托管的，
+  不引入任何外域依赖，但线上仍需实测确认。
+- 浏览器验证脚本目前在 `/tmp/uiverify/`，**没有进仓库**（避免把 playwright
+  加进 devDependencies）。要不要收进 `scripts/` 需要人类决定。
+
+---
+
+## 上一轮：一键交接链接
+
 
 > 「我直接用管理员账号去申请一个密钥，然后把带密钥的链接（或者一段提示词，告诉他去哪里看怎么发布）
 > 直接发给他。他拿到链接后直接就能去弄报告，不需要我再去平台上操作确认，他就可以直接完成所有内容了。

@@ -48,19 +48,21 @@ func HTML(f Facts) string {
 <title>`)
 	b.WriteString(markdown.Escape(title))
 	b.WriteString(`</title>
+<link rel="stylesheet" href="` + markdown.Escape(f.AppBase) + `/fonts/fonts.css" />
+<link rel="icon" type="image/svg+xml" href="` + markdown.Escape(f.AppBase) + `/favicon.svg" />
 <style>
 :root{--bg:#fff;--fg:#1f2328;--fg-muted:#59636e;--border:#d1d9e0;--code-bg:#f6f8fa;--link:#0969da}
 @media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--fg-muted:#9198a1;--border:#3d444d;--code-bg:#151b23;--link:#4493f8}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--fg);
- font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans SC",sans-serif}
+ font:16px/1.65 "Outfit","Noto Sans SC",sans-serif}
 main{max-width:820px;margin:0 auto;padding:40px 20px 96px}
 h1{font-size:1.7rem;line-height:1.3;margin:0 0 1.2rem}
 h2{font-size:1.25rem;margin:2.4rem 0 .8rem;padding-bottom:.35rem;border-bottom:1px solid var(--border)}
 h3{font-size:1.05rem;margin:1.8rem 0 .6rem}
 a{color:var(--link)}
 code{background:var(--code-bg);padding:.15em .35em;border-radius:4px;
- font:.88em/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+ font:.88em/1.5 "JetBrains Mono",ui-monospace,monospace}
 pre{background:var(--code-bg);border:1px solid var(--border);border-radius:6px;
  padding:12px 14px;overflow-x:auto}
 pre code{background:none;padding:0;font-size:.86rem}
