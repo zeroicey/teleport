@@ -1,6 +1,6 @@
 # 一键交接链接（管理员一步发密钥）— handoff
 
-**Date:** 2026-10-11 · **Branch/Commit:** `main @ 60bcbe8` · **线上:** `60bcbe8`（已部署并实测）
+**Date:** 2026-10-11 · **Branch/Commit:** `main @ 6a1b135` · **线上:** `6a1b135`（已部署并实测）
 
 ## Where we ended
 
@@ -75,10 +75,11 @@ Chrome；Chrome 的 profile 是**单例**，第二个实例会静默交接给第
 
 ## Deployment and online verification (done)
 
-- 构建 `60bcbe8`，sha256 `fa224ae1…`；`scp` → `mv` 原子替换 → `systemctl restart`；
-  回滚材料 `/data/services/teleport/teleport.prev-20261011-152828` +
-  冷备 `teleport.db.bak-20261011-152828`。部署窗口 `error|panic|fatal` = **0**。
-- **生产端到端 29/29**（`bin/e2e/verify-handoff-online.py` 在 hcyj 上跑，走**公网 URL**）：
+- 先部署 `60bcbe8`（sha256 `fa224ae1…`），再部署修复版 `6a1b135`（sha256 `1209cb46…`）；
+  两次都 `scp` → `mv` 原子替换 → `systemctl restart`，每次部署前冷备数据库并留 `teleport.prev-*`。
+  回滚材料：`teleport.prev-20261011-160742`（= `60bcbe8`）、
+  `teleport.db.bak-20261011-160742`；部署窗口 `error|panic|fatal` = **0**。
+- **生产端到端 31/31**（`bin/e2e/verify-handoff-online.py` 在 hcyj 上跑，走**公网 URL**）：
   创建 → 匿名读页（fragment 不进服务器、页面无 secret、`data-app-base` 正确、`no-store`、
   非 SPA 外壳）→ 领取 200 → **重放 404** → 页面翻 `spent="1"` → 未知 id 同样说明 →
   发布报告 201 → 分享可读 → 复原。
@@ -87,6 +88,26 @@ Chrome；Chrome 的 profile 是**单例**，第二个实例会静默交接给第
 - **生产已复原到部署前状态**：3 reports / 4 share_tokens / 1 agent_key / 1 application，
   `integrity_check` = ok。验证过程中产生的密钥与申请行已清除
   （`bin/e2e/verify-handoff-online.py` 会按 label 清扫自己，包括**上一次崩溃运行**留下的残留）。
+
+## 独立对抗验证（另一个 agent，只读仓库、只打接口）
+
+结论：**6 条主张未能推翻，1 个真 bug + 1 处文档不实 + 1 条配置约束**。
+
+- **真 bug（已修并部署）**：`HEAD /api/agent-keys/applications/{id}` 带正确 claim 头时
+  **消耗一次性链接并把密钥扔掉**（Go 的 `ServeMux` 把 HEAD 交给 GET 模式，HEAD 无响应体）。
+  修：405 + `Allow: GET`（领取与续期两个端点），守卫 `TestKeyHandoffClaimRefusesHEAD`
+  （断言「HEAD 之后链接仍可领取」），反证 **F11**，生产验证脚本加 HEAD 检查。
+- **文档不实（已改）**：页面层是状态 oracle（能看到 `open/claimed/expired/unknown` + label +
+  到期时间），接口层不是；原 `router.go` 注释与 D11 说法不实。裁决为「接受页面多说」，
+  补 `TestKeyHandoffPageStateVisibility`，D11 修订。
+- **配置约束（已写入 runbook + D12）**：Caddy 默认只脱敏 `Authorization`/`Cookie`，
+  站点级 `log` 会把 `X-Teleport-Claim` 明文写盘；已复核线上**无**站点级 log（无 access.log）。
+- 其余「未推翻」：secret 不进日志/Referer（真 Chromium 19/19 抓包）、一次性、
+  生成时不建密钥行、256 位不可推导、无 JS 时惰性、错误 secret 不烧链接、Session 门禁、
+  无 SPA 兜底、无 CORS 可读、label/id 转义。
+- **注意**：该 agent 违反了「不写仓库」的约束，在仓库根留下 `after_keys.txt` /
+  `before_keys.txt` / `cfp` 三个临时文件 —— 已从提交里剔除并删除。
+  它创建的 2 个撤销密钥与 2 条 application 行也已清扫，生产回到 3/4/1/1。
 
 ## Next session: start here
 

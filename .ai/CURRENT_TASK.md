@@ -1,6 +1,6 @@
 # Current task
 
-**Status:** ✅ **一键交接链接已上线并线上实测（本机真 Chromium 25/25 + 生产 29/29）** · 线上 `60bcbe8` ·
+**Status:** ✅ **一键交接链接已上线并线上实测（本机真 Chromium 25/25 + 生产 31/31 + 独立对抗验证）** · 线上 `6a1b135` ·
 **Updated:** 2026-10-11
 **下一步：** 把交接链接**发给真人试用**（用户要的「找一些人来测试一下」——这条功能本身就是邀请方式）
 
@@ -79,29 +79,30 @@ Chrome for Testing 156）：领取按钮出现 → 真点击 → 拿到 43 字�
 
 ---
 
-## 线上状态（2026-10-11 15:28 部署，`60bcbe8`）
+## 线上状态（2026-10-11 16:07 部署，`6a1b135`）
 
 | 项 | 值 |
 | --- | --- |
-| 二进制 sha256 | `fa224ae13b16e5db42f5ab8c4d04daed16376bfd58fdfc1afd37b1a75e4634cd`（本地=线上） |
-| 回滚二进制 | `/data/services/teleport/teleport.prev-20261011-152828`（= 旧 `adc2be3`） |
-| 数据库备份 | `teleport.db.bak-20261011-152828`（部署前冷备）、`teleport.db.bak-cleanup-20261011-*`（清残留前） |
-| 库内容 | **3 reports / 4 share_tokens / 1 agent_key / 1 application**，`integrity_check` = ok（与部署前**完全一致**） |
+| 二进制 sha256 | `1209cb46c6fbdecef68437339ae1896311a076ce0b55312d4f41c394dbe63531`（本地=线上） |
+| 回滚二进制 | `/data/services/teleport/teleport.prev-20261011-160742`（= 首个交接版本 `60bcbe8`）；更早 `teleport.prev-20261011-152828`（= `adc2be3`） |
+| 数据库备份 | `teleport.db.bak-20261011-160742`（部署前冷备）、`teleport.db.bak-cleanup-20261011-*`（清验证残留前） |
+| 库内容 | **3 reports / 4 share_tokens / 1 agent_key / 1 application**，`integrity_check` = ok，零孤儿（与部署前**完全一致**） |
 | 部署窗口日志 | `error|panic|fatal` = **0** |
 
-**线上实测（生产脚本走公网 URL，故 Caddy + 前缀 + TLS 全在内）：29/29 全绿**
+**线上实测（生产脚本走公网 URL，故 Caddy + 前缀 + TLS 全在内）：31/31 全绿**
 （`bin/e2e/verify-handoff-online.py`，在 hcyj 上跑）：
 生成交接链接 201（fragment 形态、24h 链接、1h 密钥、提示词含 `X-Teleport-Claim`、响应无 hash）→
 匿名访问 `/k/{id}` 200 + `no-store` + 非 SPA 外壳 + `data-handoff-spent="0"` + 有收件人名 +
 **页面不含 claim secret** + `data-app-base` 不是 API 根 + 严格 CSP →
 `X-Teleport-Claim` 领取 200（43 字符）→ **重放 404** → 页面翻到 `spent="1"` →
-未知 id 得到同样的说明（不泄漏）→ 用领到的密钥 `POST /api/reports` **201** 且分享链接可读 200 →
+**HEAD 请求被拒（405 + `Allow: GET`，链接不被烧掉）** → 未知 id 得到同样的说明（不泄漏）→
+用领到的密钥 `POST /api/reports` **201** 且分享链接可读 200 →
 测试数据全部复原（报告删除、密钥撤销；**首次崩溃运行留下的残留也一并扫掉**）→
 审计：报告数回到基线、无存活测试密钥。
 
 **大陆观测点（koma 腾讯云）**：`/api/health` 200；`/k/`、`/k/{uuid}`、`/k/{uuid}/extra`
-全部 **200 且 `id="app"` 出现 0 次**（说明页，不是 SPA 外壳）；缓存头三连查通过
-（`share.js` = `no-cache`、入口 = `immutable`）。
+全部 **200 且 `id="app"` 出现 0 次**（说明页，不是 SPA 外壳）；既有分享页仍 200；
+`HEAD` 领取 **405**；缓存头三连查通过（`share.js` = `no-cache`、入口 = `immutable`）。
 
 ## 下一步（唯一一件）
 
