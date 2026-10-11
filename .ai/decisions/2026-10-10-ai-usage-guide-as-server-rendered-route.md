@@ -44,9 +44,11 @@
 - **变容易**：改 `ROUTE_PREFIX` 或换域名后文档自动跟着走；文档与二进制同版本回滚。
 - **变难/需注意**：新增一个占位符时必须同步 `aidoc.go` 的常量、替换器与测试，
   否则 `TestNoUnresolvedPlaceholders` 会让构建失败（这是刻意的）。
-- **必须保持为真**：`views.HTMLMountEnabled` 若由 `false` 改为 `true`，
-  文档里"HTML 渲染尚未启用"的说法就变成假的 —— `TestHTMLCaveatMatchesImplementation`
-  是这条的绊线。
+- **必须保持为真**：guide 对 `format:'html'` 的说法必须与实现一致 ——
+  `TestHTMLCaveatMatchesImplementation` 是这条的绊线。
+  （2026-10-11 更新：`HTMLMountEnabled` 已删除，改为 `views.HTMLReportsRenderVerbatim`；
+  该绊线已改成**双向**断言，见 `decisions/2026-10-11-html-report-rendering.md`。
+  本条的历史表述保留，不重写。）
 - **文档是公开的**：因此它**不得**包含密钥、也不得写出服务器上密钥的存放路径
   （`TestGuideContainsNoSecret` 守住这条；初版就是因为写了 `teleport.env` 的路径而被该测试拦下）。
 

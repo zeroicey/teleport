@@ -89,6 +89,10 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	mux.HandleFunc("GET "+p+"/api/health", s.handleHealth)
 	mux.HandleFunc("GET "+p+"/api/share/{token}", s.handleReadShare)
 	mux.HandleFunc("GET "+p+"/s/{token}", s.handleSharePage)
+	// The body of a `format: "html"` report, framed by the share page above.
+	// Registered explicitly because `p+"/s/"` is a JSON-404 catch-all: an
+	// unregistered sub-path would answer the iframe with JSON.
+	mux.HandleFunc("GET "+p+"/s/{token}/html", s.handleShareHTML)
 
 	// -- machine-readable usage guide -----------------------------------------
 	//
@@ -360,6 +364,59 @@ func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
 	page := renderSharePage(s, resolution)
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.WriteString(w, page)
+}
+
+// handleShareHTML serves the body of a `format: "html"` report verbatim, for
+// the share page's iframe (and for the "open on its own" link).
+//
+// Resolution semantics are identical to handleSharePage — unknown and revoked
+// are 404, expired is 410 — because this is the same capability, just a
+// different representation of it. A markdown report has no such
+// representation, so it is 404 here as well rather than inventing a new state.
+//
+// Two deliberate differences from handleSharePage:
+//
+//  1. No view is recorded. The outer page owns the counter; counting the frame
+//     as well would double every visit.
+//  2. `X-Frame-Options: DENY` (set for every response by httpx.SecurityHeaders)
+//     is removed, since the one legitimate consumer of this URL is a frame.
+//     The CSP's `frame-ancestors 'self'` below is the replacement restriction —
+//     same-origin frames only, which is exactly what DENY would have prevented.
+func (s *Server) handleShareHTML(w http.ResponseWriter, r *http.Request) {
+	token, err := s.shareToken(r)
+	if err != nil {
+		httpx.WriteError(w, r, err)
+		return
+	}
+
+	resolution, err := s.store.ResolveShare(token)
+	if err != nil {
+		httpx.WriteError(w, r, httpx.Internal("Failed to resolve share link").WithCause(err))
+		return
+	}
+	if resolution.Status == domain.StatusMissing {
+		httpx.WriteError(w, r, httpx.NotFound("Share link not found"))
+		return
+	}
+	if resolution.Status == domain.StatusGone {
+		httpx.WriteError(w, r, httpx.Gone("This share link has expired"))
+		return
+	}
+	if resolution.Report.Format != domain.FormatHTML {
+		httpx.WriteError(w, r, httpx.NotFound("Share link not found"))
+		return
+	}
+
+	h := w.Header()
+	h.Del("X-Frame-Options")
+	h.Set("Content-Security-Policy", views.HTMLReportContentSecurityPolicy)
+	h.Set("Content-Type", "text/html; charset=utf-8")
+	// Same reasoning as the share page: a bounded-lifetime document must not be
+	// cached anywhere.
+	h.Set("Cache-Control", "no-store, must-revalidate")
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, resolution.Report.Content)
 }
 
 // ---------------------------------------------------------------------------

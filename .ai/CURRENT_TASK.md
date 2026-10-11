@@ -1,33 +1,59 @@
 # Current task
 
-**Status:** ✅ 无未完成的改动 · 工作区干净 · **线上 `f609f8a`** · **Updated:** 2026-10-11
-**下一步：** 做 **HTML 渲染** —— 但**先问用户一句**澄清（见下）
+**Status:** ⏳ **`format:"html"` 原样渲染已实现并本地验证完毕，尚未提交、尚未部署** ·
+**线上仍是 `f609f8a`** · **Updated:** 2026-10-11
+**下一步：** 问用户是否 **提交 + 部署**（改动同时动了 Go 与 `web/src/`，必须重发二进制）
 
 > 本文件是**当前状态**，不是流水账。每一轮的完整叙事在
 > `.ai/sessions/*-handoff.md` 与 `.ai/decisions/`、`.ai/pitfalls/` 里。
 
 ---
 
+## 本轮：HTML 渲染（用户选了 A，并明确豁免安全顾虑）
+
+用户原话：「就是 ai 自己写 HTML 的代码以及样式 JS 逻辑 就不用太考虑那些安全问题
+毕竟我都是给自己用」。裁决与代价见
+**`.ai/decisions/2026-10-11-html-report-rendering.md`**（✅ ACCEPTED），
+踩到的三个「默认值挡路」见
+**`.ai/pitfalls/cases/2026-10-11-framed-report-blocked-by-defaults.md`**。
+
+**做法**：分享页对 `format:"html"` 的报告放一个同源 `<iframe class="report-frame">`，
+`src` 指向**新端点** `GET /s/{token}/html`；该端点把 `report.content` **逐字节**返回，
+不净化、不加 nonce。子文档有独立 CSP（`views.HTMLReportContentSecurityPolicy`）；
+分享页 CSP 只加了 `frame-src 'self'`，`script-src` 仍是 `'self'`。
+`views.HTMLMountEnabled` 已删除，换成 `views.HTMLReportsRenderVerbatim = true`。
+
+**已知并接受的代价**：报告里的 JS 与面板同源 —— 读不到 HttpOnly 的 `teleport_session`，
+但能带凭据请求 `/api/admin/*`（以查看者身份）。想隔离就设
+`views.HTMLReportSandbox`，但必须同时把高度测量从「同源读 `contentDocument`」
+换成 `postMessage`（沙箱 iframe 是 opaque origin）。
+
+**本地已验证（真 Chromium，非仅类型检查）**：
+- `GET /s/{token}/html` 正文与提交字节**完全一致**（1845 B）；markdown 报告在该路径 **404**
+- 分享页响应头 `frame-src 'self'` + `X-Frame-Options: DENY`；子文档**无** `X-Frame-Options`
+- Chromium 实测：iframe 高度被 `share.js` 写成 `379px`（证明同源测量生效）；
+  子页内联脚本、同源 `fetch`、`localStorage` 三项全部成功（截图里三项均为绿色 ✓、红色 0）
+- markdown 回归：无 iframe、Mermaid 仍渲染出 `<svg>`、`<script>` 仍被替换为 `raw HTML omitted`
+- 反证 **8 条**：删 `h.Del("X-Frame-Options")` / 转义正文 / 给子资源记一次浏览 /
+  去掉 `frame-src` / 放行 markdown 走该端点 / 默认打开 `HTMLReportSandbox` /
+  aidoc 绊线的**正反两个方向** —— **每条都能让对应测试变红**
+
+**未做**：B 路线（TOC / 复制按钮 / 打印样式）**没做**，用户选的是 A。
+
+---
+
 ## 下一步（唯一一件）
 
-用户已定：「下一部分我们做 HTML 渲染」。开工前**必须先澄清指哪一件事**，
-两条路成本差一个量级：
+**问用户**：这批改动要不要 `git commit` + `pnpm run build:release` + 部署到 hcyj？
+（AGENTS.md 要求提交/推送/部署前先问人类。）
 
-| | A. 渲染 `format: "html"` 的报告 | B. 渲染增强（正文加 TOC/复制/打印） |
-| --- | --- | --- |
-| 主要成本 | 净化器 + nonce CSP，**与仓库硬约定冲突** | 纯前端 + CSS，无安全面变化 |
-| 建议 | 单独决策，先做 B | ✅ |
+部署后必须做的两件验证（见 `.ai/runbooks/deploy-teleport.md`）：
+1. 从**大陆观测点** curl 线上分享页与 `/s/{token}/html`，确认 200 且头正确；
+2. 用真实 Chromium 打开线上 html 报告，确认 iframe 真的渲染出内容
+   （iframe 被挡时**页面仍 200、日志 0 error**，只有控制台报错 —— 见上面那条 pitfall）。
 
-**要问的那句话**：「你要的是『能直接上报 HTML 并由分享页渲染』，
-还是『给现在的报告页加目录/复制按钮/打印样式』？」
-
-完整调研（含 9 条已核实事实、起手命令、验收方式）见
-**`.ai/sessions/2026-10-11-report-update-delete-to-html-rendering-handoff.md`**。
-
-**最重要的前置发现**：`markdown/render.go:89` 已有 `parser.WithAutoHeadingID()`，
-但**对中文标题基本没用** —— 实测纯中文标题产出 `id="heading"` / `id="heading-N"`
-（序号随全文标题数漂移），线上真实报告产出 `id="0-"`、`id="21-"`、`id="teleport-"`。
-**做 TOC 必须自己生成稳定 slug，不能依赖 goldmark 默认 id。**
+> ⚠️ 线上目前**没有** `format:"html"` 的报告（3 篇都是 markdown），
+> 所以部署后要**先发一篇测试报告**才能验证这条链路。
 
 ---
 
@@ -57,6 +83,8 @@
 | 追加③ | **密钥过期后 90 天宽限续签**：过期密钥**只能**调续期端点；续期不换 `key_id` 故归属连续；`GET /api/reports` 列出自己的报告；过期可见性响应头 | `0c33125` `711f194` |
 | 追加④ | **报告原地更新与删除**：`PATCH`/`DELETE /api/reports/{id}`（agent 归属限定）与 `/api/admin/reports/{id}`（面板）；未知字段/空 patch 一律 400 | `1917768` `f609f8a` |
 
+⏳ **未提交**：`format:"html"` 原样渲染（本轮）—— 见本文顶部「本轮」一节。
+
 **审计四条**（追加②，全部已部署，守卫名在代码里）：
 
 | # | 问题 | 修复 | 守卫 |
@@ -76,14 +104,15 @@
 
 ## 未做（按价值排序，都还没开工）
 
-1. **HTML 渲染** —— 见上，下一轮主题
-2. **轮换 admin 口令**：线上仍是部署时生成的随机值，从未轮换过（运维动作，不是代码）
-3. **密码保护分享链接**（链接语义要定：验证失败是 404 还是 401，未裁决）
-4. **面板批量拒绝**密钥申请（`KEY_MAX_PENDING=50` 是唯一兜底，
+1. ~~HTML 渲染~~ —— **A 路线本轮已完成（未提交/未部署）**；B 路线（TOC/复制/打印）**仍未做**
+2. **HTML 渲染的隔离档位**：打开 `views.HTMLReportSandbox` + `postMessage` 高度上报
+3. **轮换 admin 口令**：线上仍是部署时生成的随机值，从未轮换过（运维动作，不是代码）
+4. **密码保护分享链接**（链接语义要定：验证失败是 404 还是 401，未裁决）
+5. **面板批量拒绝**密钥申请（`KEY_MAX_PENDING=50` 是唯一兜底，
    50 个申请即可堵住公开入口最长 24h；续期端点无独立限流，批量拒绝是缓解手段）
-5. **登录限流**：`POST /api/admin/login` 无限流，PBKDF2 600000 轮在 2 vCPU 上是 CPU 耗尽面
-6. **SQLite 定时备份**（目前只有部署前的手工备份）；`CleanupExpired` 未排期
-7. **`SESSION_SECRET` 轮换与 agent 密钥的耦合**（轮换是否会让所有密钥失效？**未验证**）
+6. **登录限流**：`POST /api/admin/login` 无限流，PBKDF2 600000 轮在 2 vCPU 上是 CPU 耗尽面
+7. **SQLite 定时备份**（目前只有部署前的手工备份）；`CleanupExpired` 未排期
+8. **`SESSION_SECRET` 轮换与 agent 密钥的耦合**（轮换是否会让所有密钥失效？**未验证**）
 
 **需要向使用者交代的契约行为**：具名密钥**读不到**迁移前 root 发布的报告
 （`owner_key_id=''`，只有 root 与面板可见）。这是默认拒绝的正确方向，不是 bug。
@@ -92,9 +121,14 @@
 
 ## 长期约束（改动前必须知道）
 
-- **原始 HTML 不渲染**：goldmark 不加 `WithUnsafe`，`views.HTMLMountEnabled` 保持 `false`。
-  开启前必须先上净化器 + nonce CSP。**有一条既存绊线**：
-  `aidoc/aidoc_test.go:135` 断言 guide 的说法与 flag 一致，开启时必须在同一次改动里改 guide。
+- **markdown 报告永不渲染原始 HTML**：goldmark 不加 `WithUnsafe`，报告里的 `<script>`
+  一律被替换为 `<!-- raw HTML omitted -->`。这条不因下面那条而放宽。
+- **`format:"html"` 报告原样渲染**（2026-10-11 用户裁决）：正文由 `GET /s/{token}/html`
+  逐字节返回，分享页用同源 iframe 套住，**不净化、不加 nonce**。分享页 CSP 只多了
+  `frame-src 'self'`；子文档有独立 CSP。**绊线是双向的**：
+  `aidoc/aidoc_test.go` 的 `TestHTMLCaveatMatchesImplementation` 断言 guide 的说法
+  与 `views.HTMLReportsRenderVerbatim` 一致（任一方向漂移都会红）。
+  **改这条前先改决策记录。**
 - **`pnpm` only**；前缀只写一处（`ROUTE_PREFIX`）；Caddy 必须用 `handle` 不是 `handle_path`。
 - **时间一律 epoch 毫秒**，`expires_at = 0` = 永不过期。
 - **链接语义不许改**：未知 token 与已吊销都 **404**，仅过期 **410**。

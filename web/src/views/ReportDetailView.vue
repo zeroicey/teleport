@@ -403,7 +403,8 @@ const wasEdited = computed(
     <section class="card stack">
       <h2 style="margin: 0; font-size: 1.05rem">正文</h2>
       <p class="muted" style="margin: 0; font-size: 12px">
-        此处显示原始源文。分享页面由 Worker 服务端渲染，Markdown 与 Mermaid 将在此渲染管线中处理。
+        此处显示原始源文（只读，不执行）。Markdown 由 Go 服务端渲染；
+        <code>html</code> 格式的正文在分享页里<strong>原样执行</strong> —— 下面看到的脚本真的会跑。
       </p>
       <pre class="content">{{ report.content }}</pre>
     </section>

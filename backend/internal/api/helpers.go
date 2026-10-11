@@ -98,5 +98,9 @@ func renderSharePage(s *Server, resolution *domain.Resolution) string {
 		Report:       *resolution.Report,
 		Share:        *resolution.Share,
 		AssetBaseURL: s.cfg.AssetBaseURL,
+		// Same origin as the page itself, so the frame satisfies the page's
+		// `frame-src 'self'`. Built from the same helper that produces
+		// `data.share.url`, so the two can never disagree about the prefix.
+		HTMLReportURL: s.cfg.ShareURL(resolution.Share.Token) + "/html",
 	})
 }

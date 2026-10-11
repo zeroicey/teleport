@@ -457,6 +457,184 @@ func TestSharePageRendering(t *testing.T) {
 	})
 }
 
+// TestHTMLReportRendersVerbatim covers the accepted decision that a
+// `format: "html"` body is rendered as-is (see
+// .ai/decisions/2026-10-11-html-report-rendering.md).
+//
+// The report is deliberately a full document containing markup the markdown
+// path is required to strip. If the payload ever stopped reaching the browser
+// unescaped, the "verbatim" assertions below fail — that is the point of
+// asserting on exact bytes rather than on "the string appears somewhere".
+func TestHTMLReportRendersVerbatim(t *testing.T) {
+	h, cfg := testServer(t)
+
+	content := "<!DOCTYPE html>\n<html><head><style>body{background:#000}</style></head>\n" +
+		"<body><h1>仪表盘</h1><script>document.title='ran:'+('a'<'b')</script></body></html>"
+
+	body, _ := json.Marshal(map[string]any{
+		"title": "HTML 报告", "format": "html", "content": content, "autoShareHours": 24,
+	})
+	created := do(t, h, http.MethodPost, testPrefix+"/api/reports", string(body), agentHeaders())
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", created.Code, created.Body.String())
+	}
+	_, data, _ := decodeEnvelope(t, created)
+	token := data["share"].(map[string]any)["token"].(string)
+
+	htmlPath := testPrefix + "/s/" + token + "/html"
+	wantFrameSrc := cfg.ShareURL(token) + "/html"
+
+	t.Run("share page frames the report instead of splicing it", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, testPrefix+"/s/"+token, "", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		page := rec.Body.String()
+
+		if !strings.Contains(page, `<iframe class="report-frame" src="`+wantFrameSrc+`"`) {
+			t.Errorf("share page does not frame %s", wantFrameSrc)
+		}
+		if !strings.Contains(page, `<div class="wrap wrap-wide">`) {
+			t.Error("html report should get the wider layout column")
+		}
+		if strings.Contains(page, "HTML 渲染尚未启用") {
+			t.Error("the old 'not rendered' notice is still in the page")
+		}
+		// The body belongs to the sub-resource; this page must not carry it.
+		if strings.Contains(page, "<h1>仪表盘</h1>") {
+			t.Error("report body was spliced into the share page rather than framed")
+		}
+		// The outer page keeps the strict script policy: only the frame was
+		// added, so the page itself still has nowhere to run report script.
+		csp := rec.Header().Get("Content-Security-Policy")
+		if !strings.Contains(csp, "script-src 'self'") || strings.Contains(csp, "unsafe-inline' 'unsafe-eval'") {
+			t.Errorf("outer CSP must stay script-src 'self': %s", csp)
+		}
+		if !strings.Contains(csp, "frame-src 'self'") {
+			t.Errorf("outer CSP needs frame-src 'self' to allow the report frame: %s", csp)
+		}
+	})
+
+	t.Run("sub-resource is the bytes that were posted", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, htmlPath, "", nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+		}
+		if got := rec.Body.String(); got != content {
+			t.Errorf("body was altered\n got: %q\nwant: %q", got, content)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+			t.Errorf("Content-Type = %q", ct)
+		}
+		if csp := rec.Header().Get("Content-Security-Policy"); csp != views.HTMLReportContentSecurityPolicy {
+			t.Errorf("CSP = %q\nwant %q", csp, views.HTMLReportContentSecurityPolicy)
+		}
+		if cc := rec.Header().Get("Cache-Control"); !strings.Contains(cc, "no-store") {
+			t.Errorf("Cache-Control = %q, want no-store", cc)
+		}
+	})
+
+	// The global middleware sets X-Frame-Options: DENY on every response, so a
+	// frame that forgot to clear it renders as a blank browser error rather
+	// than as the report. Assert the header's absence directly.
+	t.Run("frame is not blocked by X-Frame-Options", func(t *testing.T) {
+		rec := do(t, h, http.MethodGet, htmlPath, "", nil)
+		if xfo := rec.Header().Get("X-Frame-Options"); xfo != "" {
+			t.Errorf("X-Frame-Options = %q, want it removed for the framed document", xfo)
+		}
+		// The share page itself keeps the hardened default.
+		page := do(t, h, http.MethodGet, testPrefix+"/s/"+token, "", nil)
+		if xfo := page.Header().Get("X-Frame-Options"); xfo != "DENY" {
+			t.Errorf("share page X-Frame-Options = %q, want DENY", xfo)
+		}
+	})
+
+	// One visit is the page plus the frame it loads; the counter must see one.
+	t.Run("loading the frame does not count as a second view", func(t *testing.T) {
+		_, before, _ := decodeEnvelope(t, do(t, h, http.MethodGet, testPrefix+"/api/share/"+token, "", nil))
+		viewsBefore := before["share"].(map[string]any)["view_count"].(float64)
+
+		if rec := do(t, h, http.MethodGet, htmlPath, "", nil); rec.Code != http.StatusOK {
+			t.Fatalf("frame request: %d", rec.Code)
+		}
+
+		_, after, _ := decodeEnvelope(t, do(t, h, http.MethodGet, testPrefix+"/api/share/"+token, "", nil))
+		viewsAfter := after["share"].(map[string]any)["view_count"].(float64)
+
+		// Both reads above count a view themselves, so the only increment
+		// allowed is that pair; the frame in between must add nothing.
+		if viewsAfter != viewsBefore+1 {
+			t.Errorf("view_count went %v → %v across one read + one frame load", viewsBefore, viewsAfter)
+		}
+	})
+}
+
+// TestShareHTMLLinkSemantics pins the sub-resource to the same link semantics
+// as the share page: it is the same capability, so it must not leak a state the
+// page hides, and a markdown report has no such representation at all.
+func TestShareHTMLLinkSemantics(t *testing.T) {
+	h, _ := testServer(t)
+
+	created := do(t, h, http.MethodPost, testPrefix+"/api/reports",
+		`{"title":"t","format":"html","content":"<p>hi</p>","autoShareHours":24}`, agentHeaders())
+	_, data, _ := decodeEnvelope(t, created)
+	token := data["share"].(map[string]any)["token"].(string)
+
+	md := do(t, h, http.MethodPost, testPrefix+"/api/reports",
+		`{"title":"t","content":"# md","autoShareHours":24}`, agentHeaders())
+	_, mdData, _ := decodeEnvelope(t, md)
+	mdToken := mdData["share"].(map[string]any)["token"].(string)
+
+	cases := []struct {
+		name string
+		path string
+		want int
+	}{
+		{"unknown token", testPrefix + "/s/aaaaaaaaaaaaaaaaaaaaaa/html", http.StatusNotFound},
+		{"malformed token", testPrefix + "/s/short/html", http.StatusNotFound},
+		{"markdown report has no html body", testPrefix + "/s/" + mdToken + "/html", http.StatusNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := do(t, h, http.MethodGet, tc.path, "", nil)
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d: %s", rec.Code, tc.want, rec.Body.String())
+			}
+			// Even a 404 here must stay in the JSON envelope: the frame's
+			// caller is a browser, but the contract is the same everywhere.
+			if _, _, code := decodeEnvelope(t, rec); code != "not_found" {
+				t.Errorf("error code = %q, want not_found", code)
+			}
+		})
+	}
+
+	t.Run("revoked is 404, expired is 410", func(t *testing.T) {
+		session := login(t, h)
+		revoked := do(t, h, http.MethodPost, testPrefix+"/api/share/"+token+"/revoke", "", agentHeaders())
+		if revoked.Code != http.StatusOK {
+			t.Fatalf("revoke: %d %s", revoked.Code, revoked.Body.String())
+		}
+		if rec := do(t, h, http.MethodGet, testPrefix+"/s/"+token+"/html", "", nil); rec.Code != http.StatusNotFound {
+			t.Errorf("revoked: status = %d, want 404", rec.Code)
+		}
+
+		second := do(t, h, http.MethodPost, testPrefix+"/api/reports",
+			`{"title":"t","format":"html","content":"<p>x</p>","autoShareHours":24}`, agentHeaders())
+		_, secondData, _ := decodeEnvelope(t, second)
+		secondToken := secondData["share"].(map[string]any)["token"].(string)
+
+		patched := do(t, h, http.MethodPatch, testPrefix+"/api/admin/shares/"+secondToken,
+			`{"expiresAt":1}`, map[string]string{"Cookie": session})
+		if patched.Code != http.StatusOK {
+			t.Fatalf("patch: %d %s", patched.Code, patched.Body.String())
+		}
+		rec := do(t, h, http.MethodGet, testPrefix+"/s/"+secondToken+"/html", "", nil)
+		if rec.Code != http.StatusGone {
+			t.Errorf("expired: status = %d, want 410", rec.Code)
+		}
+	})
+}
+
 // TestExpiredSharePageIs410 covers the 410 branch end to end.
 func TestExpiredSharePageIs410(t *testing.T) {
 	h, _ := testServer(t)

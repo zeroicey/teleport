@@ -1,11 +1,13 @@
 /**
  * Share-page client bootstrap.
  *
- * Only two jobs, and both are deliberately lazy:
+ * Only three jobs, and each is deliberately lazy:
  *
  *   1. Copy the "expires at" countdown (cheap, no dependencies).
  *   2. If — and only if — the document contains a Mermaid diagram, dynamically
  *      import Mermaid and render it.
+ *   3. If — and only if — the document frames a `format: "html"` report, grow
+ *      that frame to the height of the report.
  *
  * Mermaid is ~5 MB of source. Statically importing it would put that cost on
  * every report view, including the (common) text-only ones. The dynamic import
@@ -25,7 +27,8 @@
  *
  * Note that `strict` does NOT wrap the diagram in an iframe (only
  * `securityLevel: 'sandbox'` does), which is what makes it compatible with the
- * share page's `default-src 'none'` CSP that deliberately has no `frame-src`.
+ * share page's `default-src 'none'` CSP whose only `frame-src` allowance is the
+ * report frame this same page creates.
  */
 async function renderDiagrams(): Promise<void> {
   const nodes = Array.from(document.querySelectorAll<HTMLElement>('.mermaid'));
@@ -77,6 +80,59 @@ async function renderDiagrams(): Promise<void> {
   }
 }
 
+/**
+ * Grow a `format: "html"` report's frame to fit the report.
+ *
+ * The frame is same-origin (see `views.HTMLReportSandbox`, which is empty), so
+ * the document inside can simply be measured. That is the whole reason the
+ * frame is not sandboxed: a sandboxed frame is an opaque origin, its
+ * `contentDocument` is unreachable, and the page would be stuck at a fixed
+ * height with an inner scrollbar.
+ *
+ * `min-height: 70vh` in the server-rendered CSS keeps the page readable when
+ * this script never runs, so failure here is a cosmetic regression only.
+ */
+function fitReportFrames(): void {
+  const frames = Array.from(document.querySelectorAll<HTMLIFrameElement>('iframe.report-frame'));
+  if (frames.length === 0) return;
+
+  const fit = (frame: HTMLIFrameElement): void => {
+    // Cross-origin access throws; a frame the page did not create is not ours.
+    let doc: Document | null = null;
+    try {
+      doc = frame.contentDocument;
+    } catch {
+      return;
+    }
+    if (!doc?.documentElement) return;
+
+    const height = Math.max(
+      doc.documentElement.scrollHeight,
+      doc.body?.scrollHeight ?? 0,
+      // Never shrink below the CSS fallback, or a short report would collapse.
+      Math.round(window.innerHeight * 0.7),
+    );
+    frame.style.height = `${height}px`;
+  };
+
+  for (const frame of frames) {
+    frame.addEventListener('load', () => fit(frame));
+    // Already loaded before this module ran (module scripts are deferred).
+    fit(frame);
+    // Late layout inside the report (fonts, charts, images) changes its height.
+    try {
+      const doc = frame.contentDocument;
+      if (doc?.documentElement) {
+        new ResizeObserver(() => fit(frame)).observe(doc.documentElement);
+      }
+    } catch {
+      /* cross-origin frame: the load handler above is the best we can do */
+    }
+  }
+
+  window.addEventListener('resize', () => frames.forEach(fit));
+}
+
 /** Live countdown for the expiry badge, so a long-open tab stays accurate. */
 function startExpiryCountdown(): void {
   const el = document.querySelector<HTMLElement>('[data-expires-at]');
@@ -109,3 +165,4 @@ function startExpiryCountdown(): void {
 
 renderDiagrams();
 startExpiryCountdown();
+fitReportFrames();

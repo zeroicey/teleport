@@ -10,30 +10,80 @@ import (
 	"github.com/zeroicey/teleport/backend/internal/markdown"
 )
 
-// ContentSecurityPolicy is the CSP for the share page.
+// ContentSecurityPolicy is the CSP for the share page itself.
 //
 // `default-src 'none'` is the baseline: everything not explicitly allowed is
-// blocked, and there is deliberately no `frame-src`, so no iframe can be
-// created.
+// blocked. The script policy stays `'self'` — the page never needs inline
+// script, because an HTML report's own JavaScript runs in a *sub-document*
+// with its own policy (HTMLReportContentSecurityPolicy), not here.
 //
-// The one relaxation is `style-src 'unsafe-inline'`: Mermaid injects <style>
-// into the SVG it renders at runtime, and those styles are generated per
-// diagram so they cannot be hashed ahead of time. Style injection cannot execute
-// script, so this does not open an XSS path.
+// Two relaxations, both deliberate:
+//
+//   - `style-src 'unsafe-inline'`: Mermaid injects <style> into the SVG it
+//     renders at runtime, and those styles are generated per diagram so they
+//     cannot be hashed ahead of time. Style injection cannot execute script.
+//   - `frame-src 'self'`: the one iframe this page may create is the report
+//     body of a `format: "html"` report, served same-origin at
+//     `/s/{token}/html`. Without an explicit `frame-src`, `default-src 'none'`
+//     would block the frame.
 const ContentSecurityPolicy = "default-src 'none'; " +
 	"script-src 'self'; " +
 	"style-src 'self' 'unsafe-inline'; " +
 	"img-src 'self' data:; " +
 	"font-src 'self'; " +
 	"connect-src 'self'; " +
+	"frame-src 'self'; " +
 	"base-uri 'none'; " +
 	"form-action 'none'; " +
 	"frame-ancestors 'none'; " +
 	"upgrade-insecure-requests"
 
-// HTMLMountEnabled gates raw HTML rendering. It stays off: enabling it without
-// a sanitizer and a nonce-based CSP would be an XSS hole.
-const HTMLMountEnabled = false
+// HTMLReportContentSecurityPolicy is the CSP for the report *body* of a
+// `format: "html"` report, served at `/s/{token}/html`.
+//
+// This is the one place in the application that renders raw, unsanitized
+// HTML/CSS/JS, by explicit decision of the owner: the report author is the
+// user's own AI and writes whatever the report needs. See
+// `.ai/decisions/2026-10-11-html-report-rendering.md`.
+//
+// Concretely: inline script and eval are allowed, and remote resources of any
+// origin may be loaded, because a report is a page rather than a fragment.
+// `frame-ancestors 'self'` is the single restriction kept: only this service's
+// own share page may frame the document.
+const HTMLReportContentSecurityPolicy = "default-src 'none'; " +
+	"script-src 'unsafe-inline' 'unsafe-eval' * data: blob:; " +
+	"style-src 'unsafe-inline' * data:; " +
+	"img-src * data: blob:; " +
+	"font-src * data:; " +
+	"connect-src *; " +
+	"media-src * data: blob:; " +
+	"frame-src * data: blob:; " +
+	"worker-src blob: data:; " +
+	"base-uri 'self'; " +
+	"form-action 'self'; " +
+	"frame-ancestors 'self'"
+
+// HTMLReportsRenderVerbatim records the accepted decision above so that the
+// documentation tripwire in internal/aidoc has something truthful to assert
+// against: `format: "html"` reports are rendered, byte-for-byte, in an iframe.
+const HTMLReportsRenderVerbatim = true
+
+// HTMLReportSandbox is the `sandbox` attribute applied to the report iframe.
+//
+// Empty on purpose: the AI-authored report is trusted to be a normal page, so
+// it keeps `localStorage`, cookies and same-origin access to its own frame —
+// which is what "AI writes the HTML, CSS and JS" means in practice.
+//
+// Setting this to e.g. "allow-scripts allow-popups allow-forms" isolates the
+// report in an opaque origin at the cost of those APIs, and requires the
+// height reporter in web/src/share/main.ts to fall back to postMessage (a
+// sandboxed frame cannot be measured from its parent).
+//
+// A `var`, not a `const`: the sandboxed branch is only reachable when this is
+// non-empty, and a const would make that branch compile-time dead code that no
+// test could exercise (see TestReportFrameSandboxKnob). Production never
+// assigns to it.
+var HTMLReportSandbox = ""
 
 // SharePageOptions carries everything the share template needs.
 type SharePageOptions struct {
@@ -49,6 +99,10 @@ type SharePageOptions struct {
 	// backend-origin access and remains same-origin (satisfying the
 	// `script-src 'self'` policy) on the normal path.
 	AssetBaseURL string
+	// HTMLReportURL is the absolute URL of the report *body* for a
+	// `format: "html"` report, i.e. `.../s/{token}/html`. Only used for that
+	// format; markdown reports ignore it.
+	HTMLReportURL string
 }
 
 // RenderSharePage renders the public share page.
@@ -57,12 +111,25 @@ func RenderSharePage(opts SharePageOptions) string {
 	share := opts.Share
 	neverExpires := share.ExpiresAt == 0
 	assetBase := strings.TrimRight(opts.AssetBaseURL, "/")
+	isHTMLReport := report.Format == domain.FormatHTML
 
-	bodyHTML := `<p class="notice">此报告为 HTML 格式，但 HTML 渲染尚未启用。</p>`
-	if report.Format == domain.FormatMarkdown {
-		bodyHTML = markdown.New().Render(report.Content).HTML
-	} else if HTMLMountEnabled {
-		bodyHTML = `<p class="notice">HTML 渲染尚未启用。</p>`
+	// An HTML report is a whole document, so it gets a frame of its own rather
+	// than being spliced into this page: a full document inside a <div> is not
+	// valid DOM (browsers hoist <style>, drop <head>), and this page's own
+	// typography would fight the report's CSS.
+	bodyHTML := markdown.New().Render(report.Content).HTML
+	wrapClass := "wrap"
+	if isHTMLReport {
+		sandbox := ""
+		if HTMLReportSandbox != "" {
+			sandbox = ` sandbox="` + markdown.Escape(HTMLReportSandbox) + `"`
+		}
+		bodyHTML = `<iframe class="report-frame" src="` + markdown.Escape(opts.HTMLReportURL) +
+			`" title="` + markdown.Escape(report.Title) + `"` +
+			` referrerpolicy="no-referrer"` + sandbox + `></iframe>`
+		// Report pages are laid out by their author, so give them more room
+		// than the 820px reading column markdown reports use.
+		wrapClass = "wrap wrap-wide"
 	}
 
 	var b strings.Builder
@@ -97,6 +164,7 @@ func RenderSharePage(opts SharePageOptions) string {
     -webkit-text-size-adjust:100%;
   }
   .wrap { max-width: 820px; margin: 0 auto; padding: 48px 20px 96px; }
+  .wrap-wide { max-width: 1100px; }
 
   .eyebrow { display:flex; gap:8px; align-items:center; flex-wrap:wrap; font-size:13px; color:var(--fg-muted); margin-bottom:14px; }
   .badge { border:1px solid var(--border); border-radius:999px; padding:2px 10px; font-size:12px; white-space:nowrap; }
@@ -180,17 +248,21 @@ func RenderSharePage(opts SharePageOptions) string {
   }
   .mermaid[data-processed] svg { max-width:100%; height:auto; }
 
-  .notice {
-    border:1px solid var(--border); border-left:3px solid var(--accent);
-    border-radius:6px; padding:12px 16px; color:var(--fg-muted);
+  /* format:"html" reports: the body is its own document (see sharepage.go). */
+  /* The old .notice rule went with the "HTML rendering is not enabled"
+     placeholder; nothing emits that class any more. */
+  .report-frame {
+    display:block; width:100%; min-height:70vh;
+    border:1px solid var(--border); border-radius:10px; background:var(--bg);
   }
+  .raw-link { color:var(--accent); }
 
   footer { margin-top:64px; font-size:12px; color:var(--fg-muted); border-top:1px solid var(--border); padding-top:16px; }
   footer p { margin:.3em 0; }
 </style>
 </head>
 <body>
-<div class="wrap">
+<div class="` + wrapClass + `">
   <header>
     <div class="eyebrow">
       <span class="badge">`)
@@ -236,7 +308,16 @@ func RenderSharePage(opts SharePageOptions) string {
 
   <footer>
     <p>由 Teleport 发布 · 此链接具有时效性，可能随时失效。</p>
-    <p>Published via Teleport. This link expires and may be revoked at any time.</p>
+    <p>Published via Teleport. This link expires and may be revoked at any time.</p>`)
+	if isHTMLReport {
+		// The frame is convenient on a share page but cramped for a report
+		// that is really an application; offer the document on its own.
+		b.WriteString(`
+    <p><a class="raw-link" href="`)
+		b.WriteString(markdown.Escape(opts.HTMLReportURL))
+		b.WriteString(`" target="_blank" rel="noopener">在新窗口打开原页面 / Open the report page on its own</a></p>`)
+	}
+	b.WriteString(`
   </footer>
 </div>
 <script type="module" src="`)

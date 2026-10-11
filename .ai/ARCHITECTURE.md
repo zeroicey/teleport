@@ -86,9 +86,14 @@ Cookie 是**第一方**的（不受 Safari ITP / Chrome 第三方 Cookie 淘汰�
 4. **JS 语义校验**：`title` 长度按 **UTF-16 code unit** 计（不是字节、不是码点），`trim()`
    用 ECMAScript 空白集合（**不含 U+0085 NEL**）。这是从 TS 版逐条复刻来的，有专门的
    `UTF16Len`/`JSTrim` 与 emoji 测试。**Enforced**：`internal/validate`。
-5. **原始 HTML 永不渲染**：goldmark 不加 `WithUnsafe`；`views.HTMLMountEnabled = false`；
-   分享页 `default-src 'none'` + `script-src 'self'`。开启 `format:'html'` 前必须先上
-   DOMPurify + nonce CSP。
+5. **markdown 报告永不渲染原始 HTML**：goldmark 不加 `WithUnsafe`；分享页
+   `default-src 'none'` + `script-src 'self'` + `frame-src 'self'`。
+   **例外（2026-10-11 用户裁决）**：`format:"html"` 的报告**逐字节原样**由
+   `GET /s/{token}/html` 返回、被分享页同源 iframe 套住，不净化、不加 nonce；
+   子文档有独立 CSP（`views.HTMLReportContentSecurityPolicy`）。
+   代价与隔离开关见 `decisions/2026-10-11-html-report-rendering.md`。**Enforced**：
+   `api/router_test.go` 的 `TestHTMLReportRendersVerbatim` / `TestShareHTMLLinkSemantics`
+   + `aidoc` 的双向绊线。
 6. **零 cgo**：`modernc.org/sqlite` 是纯 Go；`store.go` 里的 `_ "modernc.org/sqlite"`
    **空导入不能删**（删掉仍编译、仍过 vet，运行时才 `unknown driver`）。**Enforced**：
    `CGO_ENABLED=0` 发布构建 + 见 §6。

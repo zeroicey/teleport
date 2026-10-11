@@ -30,7 +30,7 @@ Node、不需要 Go、也没有任何需要与二进制同步的静态目录。
 | 内容渲染 | Markdown **服务端渲染**（Go + goldmark + Chroma）+ Mermaid 客户端懒加载 |
 | 管理面板 | Vue 3 SPA，登录后查看报告、管理分享链接、复制 / 调期 / 禁用 |
 | 密钥自助申请 | agent 提交申请 → 面板批准 → agent 一次性领取明文密钥（服务端只存哈希） |
-| 安全 | 原始 HTML 不渲染、严格 CSP、常量时间鉴权比较、失效链接语义化 404/410 |
+| 安全 | markdown 报告不渲染原始 HTML、严格 CSP、常量时间鉴权比较、失效链接语义化 404/410；`format: "html"` 报告按用户裁决原样渲染（见「安全模型」） |
 
 ---
 
@@ -78,7 +78,7 @@ teleport/
         ├── styles.css            # 轻量样式（亮/暗色，无 CSS 框架）
         ├── router/index.ts       # /dashboard 路由 + 登录守卫
         ├── share/
-        │   └── main.ts           # 分享页客户端：Mermaid 懒加载 + 过期倒计时
+        │   └── main.ts           # 分享页客户端：Mermaid 懒加载 + 过期倒计时 + iframe 高度自适应
         └── views/
             ├── LoginView.vue     # 密码登录
             ├── ReportsView.vue   # 报告列表 + 客户端搜索
@@ -99,6 +99,7 @@ teleport/
                   Go(:8788, 仅监听 docker 网桥) ─> SQLite
                         ├─ /api/*        JSON API
                         ├─ /s/{token}    服务端渲染的分享页
+                        ├─ /s/{token}/html  html 报告的正文（逐字节原样，供分享页 iframe）
                         └─ 其余         内嵌的 Vue SPA（客户端路由回退）
 ```
 
@@ -126,6 +127,7 @@ teleport/
 | `GET` | `/api/share/:token` | 公开 | 只读获取报告；失效/过期分别返回 404 / 410 |
 | `POST` | `/api/share/:token/revoke` | Bearer | 手动禁用链接（幂等；按报告归属判定，别人的返回 404） |
 | `GET` | `/s/:token` | 公开 | 服务端渲染的分享页面 |
+| `GET` | `/s/:token/html` | 公开 | **仅 `format: "html"` 报告**：正文逐字节原样返回（分享页 iframe 的 src；不计浏览数）。markdown 报告在此返回 404 |
 | `GET` | `/api/health` | 公开 | 健康检查 |
 | `POST` | `/api/admin/login` | 口令 | 登录并下发签名 Session Cookie |
 | `POST` | `/api/admin/logout` | 公开 | 清除 Session |
@@ -328,7 +330,7 @@ curl -X POST https://api.hcyj.xyz/yeciorez/teleport/api/reports \
 | `id` | TEXT PK | UUID v4 |
 | `title` | TEXT | 标题 |
 | `category` | TEXT | `pentest` / `architecture` / `progress` / ... 默认 `general` |
-| `format` | TEXT | `markdown`（默认）或 `html` |
+| `format` | TEXT | `markdown`（默认）或 `html`（原样渲染，见「安全模型」） |
 | `content` | TEXT | 正文（含 Markdown / Mermaid） |
 | `metadata` | TEXT | JSON（`CHECK json_valid`） |
 | `created_at` / `updated_at` | INTEGER | 毫秒时间戳 |
@@ -534,16 +536,19 @@ handle /yeciorez/teleport* {
 
 ---
 
-## 渲染管线（Markdown + Mermaid）
+## 渲染管线（Markdown + Mermaid + 原样 HTML）
 
 分享页 `GET /s/:token` 采用**混合渲染**：Markdown 与代码高亮在 Go 服务端渲染，
 Mermaid 在客户端懒加载。这个划分由体积决定。
+`format: "html"` 的报告走另一条路：正文不经过任何渲染或净化，原样作为一个
+**独立文档**交给 iframe。
 
 | 环节 | 位置 | 原因 |
 |---|---|---|
 | Markdown → HTML | **Go 服务端** | goldmark 体积小，且默认不放行原始 HTML，是整条链路最关键的 XSS 防线 |
 | 代码语法高亮 | **Go 服务端** | Chroma 只需精选语言子集，避免引入全部语言定义 |
 | Mermaid 图表 | **客户端懒加载** | Mermaid 打包后仍有数 MB 分块；只在文档真的含图时才 `import()` |
+| `format: "html"` 正文 | **服务端原样透传 + iframe** | 报告作者写的是完整页面，拼接进 `<div>` 是非法 DOM；iframe 让它拥有自己的文档、CSS 与 JS |
 
 实测产物：`assets/share.js` 仅约 **2.4 KB**，Mermaid 拆成独立分块
 （最大 `elk` 455 KB gzip、`cytoscape` 137 KB gzip），纯文字报告完全不加载它们。
@@ -564,20 +569,52 @@ Mermaid 在客户端懒加载。这个划分由体积决定。
 - 仅当页面存在 `.mermaid` 元素时才 `import('mermaid')`。
 - `securityLevel: 'strict'` —— 禁用 `click` 指令与脚本执行。报告内容是**不可信输入**，
   这一项不是可选项。（注：`strict` 并**不**创建 iframe，只有 `'sandbox'` 才会；
-  因此分享页 CSP 无需 `frame-src`。）
+  分享页 CSP 里的 `frame-src 'self'` 只服务于下面那种报告 iframe。）
 - 用 `Promise.allSettled` 逐个渲染：单个图表语法错误不会导致整页白屏。
+
+### 原样 HTML 报告（`format: "html"`）
+
+2026-10-11 的用户裁决：AI 直接上报 HTML/CSS/JS，平台原样呈现。实现分三段：
+
+1. 分享页对 `format: "html"` 的报告不再输出「尚未启用」提示，而是放一个
+   `<iframe class="report-frame">`，`src` 指向 `.../s/{token}/html`，
+   并把阅读栏从 820px 放宽到 1100px（版式由报告作者决定）。
+2. `GET /s/{token}/html`（`api/router.go: handleShareHTML`）把 `report.content`
+   **逐字节**写回，`Content-Type: text/html`，**不做任何净化、不加 nonce**。
+   链接语义与分享页完全一致（未知/已吊销 404、过期 410；markdown 报告 404），
+   但**不计浏览数** —— 一次访问是「页面 + 它的 frame」，计两次就是错的。
+3. `assets/share.js` 在页面存在 `.report-frame` 时，同源读取
+   `contentDocument.documentElement.scrollHeight` 并把 iframe 撑到该高度
+   （外加 `ResizeObserver`），使报告读起来仍像一整页。脚本没跑时靠
+   `min-height: 70vh` 兜底，最坏情况是出现内滚动条。
+
+子文档有**独立于分享页的 CSP**（`views.HTMLReportContentSecurityPolicy`）：
+放行内联/远程脚本、`eval`、任意来源的图片与字体。`frame-ancestors 'self'`
+是保留的唯一限制。
+
+⚠️ **两点代价，是知情选择而非疏漏**（见 `.ai/decisions/2026-10-11-html-report-rendering.md`）：
+
+- 报告里的脚本与面板**同源**。它读不到 HttpOnly 的 `teleport_session`，
+  但可以带凭据请求 `/api/admin/*`，即以**查看者身份**操作面板。
+  单用户自用场景下用户已明确接受；想隔离就把 `views.HTMLReportSandbox` 设为
+  `allow-scripts allow-popups allow-forms`，同时把高度测量换成 `postMessage`
+  （沙箱 iframe 是 opaque origin，父页读不到它的 `contentDocument`）。
+- 分享链接是**能力凭据**：拿到链接的人执行发布者写的一切。
 
 ### 内容安全策略（CSP）
 
 ```
 default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline';
-img-src 'self' data:; font-src 'self'; connect-src 'self';
+img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-src 'self';
 base-uri 'none'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-requests
 ```
 
 - **`script-src 'self'` 且页面内零内联脚本** —— 无需维护 nonce。
-- 唯一的放宽是 `style-src 'unsafe-inline'`：Mermaid 运行时会把 `<style>` 注入它生成的 SVG。
+  报告正文的脚本跑在**子文档**里，用的是子文档自己的 CSP，不靠放宽这一条。
+- `style-src 'unsafe-inline'`：Mermaid 运行时会把 `<style>` 注入它生成的 SVG。
   这**不能**执行脚本。
+- `frame-src 'self'`：唯一允许的 frame 就是上面那个同源报告 iframe。
+  `default-src 'none'` 会让 `frame-src` 回退成 `'none'`，所以必须显式写。
 - `img-src 'self' data:` 让报告里的图片只能来自本站或 data URI，无法用作外链追踪像素。
 
 ### 安全响应头与缓存策略
@@ -763,13 +800,22 @@ CF 官方的大陆加速（China Network）需要企业版 + 域名 ICP 备案�
   而不是先给 200 再由前端报错。
 - **分享页面不缓存**：`Cache-Control: no-store`，防止已吊销链接残留在中间缓存。
   另加 `X-Robots-Tag: noindex` 与 `X-Frame-Options: DENY`。
+  唯一的例外是 `GET /s/:token/html`：它要能被本服务的分享页框住，
+  所以显式删掉 `X-Frame-Options`，换成 CSP 的 `frame-ancestors 'self'`
+  （限制强度相同：只允许同源 frame）。
 - **静态资源缓存分层**：`/assets/*` 由 Vite 内容哈希命名，发
   `immutable` + 一年；`index.html` 与 `share.js` 是稳定文件名，发 `no-cache`，
   保证部署后立刻生效、不会把客户端钉在旧构建上。
 - **路径穿越防护**：SPA 处理器用 `path.Clean` 折叠 `..`，并且 `fs.FS` 自身
   也会拒绝跳出根目录；测试里覆盖了 `../`、`%2e%2e`、`....//` 等写法。
-- **XSS**：Markdown 渲染时**不**放行原始 HTML；`format: 'html'` 目前**关闭**
-  （`HTMLMountEnabled = false`）。将来开启必须先接入净化库 + 严格 CSP。
+- **XSS**：两条路，边界不同，别混为一谈。
+  - **markdown 报告**：渲染时**不**放行原始 HTML，危险 URL 协议被拦截，
+    CSP 里 `script-src 'self'` 且页面零内联脚本。这是默认路径。
+  - **`format: "html"` 报告**：**原样渲染，不净化**（2026-10-11 用户裁决）。
+    正文作为独立文档由 `/s/:token/html` 逐字节返回，分享页用同源 iframe 套住。
+    已知代价：报告脚本与面板同源，可带凭据调用 `/api/admin/*`（读不到 HttpOnly
+    session，但能以查看者身份操作）；隔离开关是 `views.HTMLReportSandbox`。
+    详见 `.ai/decisions/2026-10-11-html-report-rendering.md`。
 - **管理面板**：HttpOnly + Secure + SameSite=Lax 的签名 Cookie（HMAC-SHA256），
   口令使用 PBKDF2-HMAC-SHA256（默认 600,000 次迭代，本地计算无运行时上限，
   校验时兼容旧的低迭代次数哈希）。也可用 Cloudflare Access 前置，
@@ -804,7 +850,8 @@ systemctl restart teleport && systemctl is-active teleport
 
 ## 后续路线
 
-1. **HTML 安全渲染**：接入净化库 + nonce CSP 后开启 `format: 'html'`。
+1. **HTML 渲染的隔离档位**：把 `views.HTMLReportSandbox` 打开（opaque origin），
+   并给分享页加 `postMessage` 高度上报，取代同源测量。当前默认不隔离，是知情选择。
 2. **运维**：给 `share_tokens` 的过期清理加定时任务（当前已有 `CleanupExpired` 逻辑，
    尚未挂调度）。
 3. **面板增强**：报告删除、分页、按分类筛选服务端化、新建报告入口。
@@ -845,6 +892,8 @@ systemctl restart teleport && systemctl is-active teleport
 | `POST /api/reports` 无令牌 | 401 |
 | `GET /api/share/:token` | 200，内容完整回读 |
 | `GET /s/:token` | 200，服务端渲染 |
+| `GET /s/:token/html`（`format:"html"` 报告） | 200，正文逐字节回读；`X-Frame-Options` **不存在**，CSP 为子文档策略 |
+| `GET /s/:token/html`（markdown 报告 / 未知 token） | 404（JSON 封套） |
 | 分享页响应头 | `Content-Security-Policy: default-src 'none'...`、`Cache-Control: no-store`、`X-Robots-Tag: noindex`、`X-Frame-Options: DENY` |
 | `GET /s/未知token` | 404 |
 | `GET /s/已吊销token` | 404（与未知一致，不泄漏状态） |

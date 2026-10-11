@@ -97,7 +97,7 @@ func TestGuideDocumentsTheContract(t *testing.T) {
 		{"revoked/unknown-link status", "404"},
 		{"unauthorized status", "401"},
 		{"markdown is the working format", `"markdown"`},
-		{"html format caveat", "HTML 渲染尚未启用"},
+		{"html format is rendered verbatim", `"html"`},
 		{"epoch-milliseconds convention", "UNIX epoch 毫秒"},
 		{"skill-authoring section", "变成你自己的 skill"},
 	} {
@@ -128,12 +128,33 @@ func TestGuideContainsNoSecret(t *testing.T) {
 	}
 }
 
-// The guide tells agents to use markdown because HTML is not rendered. If that
-// ever changes, the caveat must change with it — this test is the tripwire.
+// The guide's promise about `format: "html"` and the implementation must move
+// together, in either direction — this test is the tripwire.
+//
+// It used to assert the opposite (guide says disabled while the mount flag is
+// on). When the owner accepted verbatim HTML rendering the flag was replaced by
+// views.HTMLReportsRenderVerbatim, and the caveat was rewritten; a one-way check
+// would have let the two drift apart on the way back.
 func TestHTMLCaveatMatchesImplementation(t *testing.T) {
 	got := Markdown(testFacts())
-	if strings.Contains(got, "HTML 渲染尚未启用") && views.HTMLMountEnabled {
-		t.Error("guide still says HTML rendering is disabled, but HTMLMountEnabled is true")
+	// The sentence the guide used while HTML was stored-but-discarded.
+	saysDisabled := strings.Contains(got, "服务端不渲染 HTML")
+
+	switch {
+	case views.HTMLReportsRenderVerbatim && saysDisabled:
+		t.Error("guide still says HTML reports are not rendered, but HTMLReportsRenderVerbatim is true")
+	case !views.HTMLReportsRenderVerbatim && !saysDisabled:
+		t.Error("guide says HTML reports are rendered, but HTMLReportsRenderVerbatim is false")
+	}
+
+	// The promised behaviour has to be described, not merely not-denied: an
+	// agent has to know its HTML/CSS/JS runs and that nothing sanitizes it.
+	if views.HTMLReportsRenderVerbatim {
+		for _, want := range []string{"原样", "iframe"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("guide does not explain HTML rendering (missing %q)", want)
+			}
+		}
 	}
 }
 

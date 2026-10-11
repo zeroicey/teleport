@@ -82,6 +82,10 @@
 
 ## Next step：HTML 渲染
 
+> **⚠️ 本节已过时（2026-10-11 后续）：用户选了 A 并豁免安全顾虑，功能已实现。**
+> 当时的调研事实仍然有效，但"先做 B""建议 markdown"等结论**已被推翻**；
+> 现状与裁决见 `.ai/decisions/2026-10-11-html-report-rendering.md` 与 `.ai/CURRENT_TASK.md`。
+
 ### 先澄清"HTML 渲染"指哪一件事（两条路，成本差一个量级）
 
 | | A. 渲染 `format: "html"` 的报告 | B. 渲染增强（markdown 报告的表现力） |

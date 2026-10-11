@@ -50,8 +50,14 @@ Go 工具链：`go 1.26` 模块在 `backend/`，本机 `go` 在 `/usr/local/go/b
 - **前缀只写一处。** `/yeciorez/teleport` 由 `ROUTE_PREFIX` 推导，Go 路由、`vite.config.ts`
   的 `base`、`web/src/api.ts` 的 `BASE_URL`、分享链接全部从它来。Caddy 必须用 `handle`
   而不是 `handle_path` —— 前缀必须**保留**给后端。
-- **原始 HTML 不渲染。** goldmark 不加 `WithUnsafe`；`views.HTMLMountEnabled` 保持 `false`。
-  开启前必须先上 DOMPurify + nonce CSP。
+- **markdown 报告永不渲染原始 HTML。** goldmark 不加 `WithUnsafe`，报告里的
+  `<script>` 一律被替换为 `<!-- raw HTML omitted -->`。这条不因为下面那条而放宽。
+- **`format: "html"` 报告原样渲染**（2026-10-11 用户裁决，见
+  `.ai/decisions/2026-10-11-html-report-rendering.md`）：正文**逐字节**作为独立文档
+  由 `GET /s/{token}/html` 返回，分享页用一个同源 iframe 套住它；**不净化、不加 nonce**。
+  代价（已知并接受）：报告里的 JS 与面板同源，可以对 `/api/admin/*` 以查看者身份发请求。
+  想隔离就设 `views.HTMLReportSandbox`，但要同时改分享页的高度测量方式。
+  **改这条之前先改决策记录，两个文件的说法必须一致。**
 - **时间一律 epoch 毫秒**（`*_at` 列），`expires_at = 0` 表示永不过期。
 - **链接语义不许改**：未知 token 与已吊销都返回 **404**（不泄漏状态），仅过期返回 **410**。
 - **响应封套不许改**：`{ok:true,data,requestId}` / `{ok:false,error:{code,message},requestId}`。
