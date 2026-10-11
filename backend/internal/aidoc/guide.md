@@ -66,11 +66,14 @@ export TELEPORT_BASE='{{APP_BASE}}'
 密钥是**自助申请**的：你提交申请，人类在面板批准，然后你凭申请时拿到的
 `claim_secret` 轮询，取回明文密钥。**整个过程不需要人类把密钥复制给你。**
 
+> 🔑 **如果人类直接给了你一条链接或一段提示词**，说明他已经预先批准好了：你**不需要**
+> 再提交申请，也不要等他点任何东西 —— 直接跳到 2.7「人类已批准」一节。
+
 | 项 | 说明 |
 | --- | --- |
 | 名称 | Agent 密钥（自助申请得到的一把独立密钥；不是 `AGENT_SECRET_KEY`） |
 | 形式 | 一个不透明的字符串（服务端保证 256 位熵） |
-| 获取方式 | **自助申请**：`POST /api/agent-keys/applications` → 轮询 → 一次性领取 `key.token` |
+| 获取方式 | **自助申请**：`POST /api/agent-keys/applications` → 轮询 → 一次性领取 `key.token`；**或**人类预批准后给你一条交接链接/提示词（见 2.7） |
 | 传递方式 | 通过 `Authorization: Bearer <AGENT_KEY>` 请求头发送 |
 | 适用接口 | `POST /api/reports` · `GET /api/reports`（列自己的）· `GET /api/reports/{id}` · `PATCH /api/reports/{id}`（改自己的）· `DELETE /api/reports/{id}`（删自己的）· `POST /api/share/{token}/revoke` · `GET /api/agent-keys/me` · `POST /api/agent-keys/renewals` |
 | 不适用 | `/api/admin/*`（那是浏览器会话 Cookie 的地盘） |
@@ -82,7 +85,7 @@ export TELEPORT_BASE='{{APP_BASE}}'
 | 步骤 | 方法 | 路径 | 认证 | 用途 |
 | --- | --- | --- | --- | --- |
 | 1 | `POST` | `{P}/api/agent-keys/applications` | 无（公开，限流） | 提交密钥申请，成功 `201` |
-| 2 | `GET` | `{P}/api/agent-keys/applications/{id}` | 头 `X-Teleport-Claim: <claim_secret>` | 轮询状态；批准后**一次性**领取 `key.token` |
+| 2 | `GET` | `{P}/api/agent-keys/applications/{id}` | 头 `X-Teleport-Claim: <claim_secret>` | 轮询状态；批准后**一次性**领取 `key.token`（人类预批准时也走这个端点，见 2.7） |
 | 3 | `GET` | `{P}/api/agent-keys/me` | `Authorization: Bearer` | 查自身状态、有效期、用量 |
 | 4 | `GET` | `{P}/api/reports` | `Authorization: Bearer` | **列出你自己发布的报告**（见 2.5.1） |
 | 5 | `PATCH` | `{P}/api/reports/{id}` | `Authorization: Bearer` | **原地更新**自己的报告（见 2.5.2），成功 `200` |
@@ -480,6 +483,42 @@ curl -sS -X DELETE "$TELEPORT_BASE/api/reports/$REPORT_ID" \
 - 未拿到密钥时，**只读的公开接口仍然可用**（见第 4 节），不要为此去尝试绕过鉴权。
 - 不要猜测 / 爆破密钥、申请单 id、`claim_secret`：所有失败都统一成 401 / 404，
   爆破只会触发限流。
+
+### 2.7 人类已批准：用交接链接直接换取密钥
+
+人类（管理员）可以在面板上**一步生成**一条交接链接，然后直接把它或一段提示词发给你。
+这意味着**他已经替你批准了**：你不需要提交申请，也不需要等他再做任何确认。
+
+你会收到两种形态之一（内容是等价的）：
+
+| 形态 | 长什么样 | 你怎么处理 |
+| --- | --- | --- |
+| 提示词（推荐给 AI） | 一段文字，里面有 `id` 和 `claim_secret`，以及一条 `curl` | 直接执行那段 `curl`（等价于 2.3 的领取步骤） |
+| 链接（推荐给人类） | `{{APP_BASE}}/k/<id>#<claim_secret>` | 用浏览器打开、点「领取密钥」；**AI 读不到 `#` 后面的内容**，所以 AI 请向人类索取提示词版本 |
+
+用 `id` + `claim_secret` 换取密钥（和 2.3 的领取调用**完全同一个端点**）：
+
+```bash
+export HANDOFF_ID='<交接链接里的 id>'
+export HANDOFF_CLAIM='<交接链接 # 后面那段 / 提示词里的 claim_secret>'
+
+curl -sS "$TELEPORT_BASE/api/agent-keys/applications/$HANDOFF_ID" \
+  -H "X-Teleport-Claim: $HANDOFF_CLAIM" | tee handoff.json
+
+# 成功时：data.status == "approved"，data.key.token 就是你的密钥
+TELEPORT_KEY=$(jq -r '.data.key.token // empty' handoff.json)
+[ -n "$TELEPORT_KEY" ] || { echo "没拿到密钥，先看 handoff.json 里的 error"; exit 1; }
+```
+
+> ⚠️ **这段只值一次。** 领取成功的一瞬间这条交接凭证就被消耗掉了：再调一次返回
+> **404**（服务端刻意与「id 不存在」不区分）。所以：
+>
+> - 拿到 `TELEPORT_KEY` 后**立刻**存好（环境变量 / 600 权限的文件），别只留在终端 scrollback 里。
+> - 链接本身也有有效期（服务端当前配置 `{{KEY_APPLICATION_TTL}}`，见响应里的
+>   `link_expires_at`）；过期后 `GET /k/{id}` 页面会说明情况，凭据变成 **410**。
+> - 链接里的 `#` 之后那段**等价于密码**：不要贴进公开频道、不要写进报告、不要提交进仓库。
+>   如果它泄漏或已经被人领走，让人类在面板上重新生成一条（旧的可以撤销）。
+> - 人类仍然可以撤销/调整这把密钥，和自助申请的密钥一样（见 2.6）。
 
 ---
 

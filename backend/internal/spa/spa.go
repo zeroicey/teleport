@@ -132,8 +132,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Never let an API or share path fall through to the SPA shell.
-	if strings.HasPrefix(rel, "api/") || strings.HasPrefix(rel, "s/") {
+	// 3. Never let an API, share or key hand-off path fall through to the SPA
+	// shell.
+	//
+	// The router registers these more specifically, so this is the second
+	// layer: a path under one of these prefixes that no route matched is a
+	// miss, not a client-side route. `/k/` earns a place here because a
+	// truncated hand-off link must render an explanation rather than an app
+	// shell that silently does nothing.
+	if strings.HasPrefix(rel, "api/") || strings.HasPrefix(rel, "s/") ||
+		strings.HasPrefix(rel, "k/") || rel == "k" {
 		http.NotFound(w, r)
 		return
 	}

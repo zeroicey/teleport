@@ -186,6 +186,14 @@ agent **不再向人类索取密钥**：自己提交申请 → 人类在面板�
 轮询、一次性取回明文密钥。决策与冻结契约见
 [`.ai/decisions/2026-10-10-agent-self-service-keys.md`](.ai/decisions/2026-10-10-agent-self-service-keys.md)。
 
+**管理员一步交接（免去第二次面板操作）**：面板「密钥 → 生成交接链接」把*批准*与*交接*合并成
+一次操作 —— 管理员拿到一条链接（或一段提示词）转发出去，对方自助领取，管理员**不需要**再回面板
+确认。裁决见 [`.ai/decisions/2026-10-11-one-step-key-handoff.md`](.ai/decisions/2026-10-11-one-step-key-handoff.md)。
+关键设计：链接形如 `{APP_BASE}/k/{id}#{claim_secret}`，凭证在 **fragment** 里（fragment 不发给
+服务器，因此不进访问日志、不进 Referer）；领取**一次性**，窗口复用 `KEY_APPLICATION_TTL`（默认 24h）；
+服务端仍只存 `sha256(claim_secret)`，明文密钥只在领取那一刻派生。收件人是 AI 时用同一响应里的
+`prompt` 字段（AI 读不到 `#` 后面的内容）。
+
 **字段命名约定**：**请求体 camelCase**（`label`、`purpose`、`requestedHours`、`expiresInHours`），
 **响应 snake_case**（`claim_secret`、`created_at`、`expires_at`、`token_prefix`）。下表所有响应形状
 都是响应字段。
@@ -195,8 +203,9 @@ agent **不再向人类索取密钥**：自己提交申请 → 人类在面板�
 | 方法 | 路径 | 认证 | 说明 |
 |---|---|---|---|
 | `POST` | `/api/agent-keys/applications` | 无 | 体 `{label, purpose?, requestedHours?}`；**201** 返回 `{id, claim_secret, status, created_at, expires_at, poll_interval_seconds}` |
-| `GET` | `/api/agent-keys/applications/:id` | 头 `X-Teleport-Claim: <claim_secret>` | 轮询状态；批准后**首次**领取返回明文 `key.token` 并把申请单转 `claimed`。`pending`/`rejected` 为 200 且无 `key`；二次领取 → 404；申请单过期或领取窗口关闭 → **410 `gone`**；活跃密钥满 → 409 `too_many_active_keys` |
+| `GET` | `/api/agent-keys/applications/:id` | 头 `X-Teleport-Claim: <claim_secret>` | 轮询状态；批准后**首次**领取返回明文 `key.token` 并把申请单转 `claimed`。`pending`/`rejected` 为 200 且无 `key`；二次领取 → 404；申请单过期或领取窗口关闭 → **410 `gone`**；活跃密钥满 → 409 `too_many_active_keys`。**管理员预批准（交接链接）走的也是这个端点** |
 | `GET` | `/api/agent-keys/renewals/:id` | 头 `X-Teleport-Claim: <claim_secret>` | 查续期结果：`{id, key_id, requested_hours, status, created_at, decided_at, granted_expires_at}` |
+| `GET` | `/k/:id` | 无 | 交接链接落地的**服务端渲染页面**（`no-store`、`noindex`，与分享页同一套 CSP）。只按申请单状态渲染「可领取 / 已领取 / 已过期 / 无效」四种说明，**页面里没有任何密钥**；领取由浏览器脚本带着 fragment 调上面那个公开端点完成。`/k/` 也注册，避免被截断的链接掉进 SPA |
 
 **agent 自有（`Authorization: Bearer <自己的密钥>`）**
 
@@ -214,6 +223,7 @@ agent **不再向人类索取密钥**：自己提交申请 → 人类在面板�
 | `POST` | `/api/admin/key-applications/:id/reject` | 体 `{reason?}`；返回更新后的申请单 |
 | `GET` | `/api/admin/keys` | 全部密钥（`domain.AgentKey` 数组，**绝不含 `token_hash` 与明文**） |
 | `POST` | `/api/admin/keys` | 体 `{name, expiresInHours?, note?}`；手动转交路径，**201** 返回 `{token, key}`（`token` 明文仅此一次） |
+| `POST` | `/api/admin/key-handoffs` | 体 `{label, expiresInHours?, note?}`；**一步交接**：直接建一条 `approved` 申请单（**不经过 `pending` 队列，也不受 `KEY_MAX_PENDING` 限制**），**201** 返回 `{id, label, claim_secret, url, link_expires_at, key_expires_in_hours, prompt}`。`url` 的 fragment 带 claim secret；`prompt` 是可粘贴给 AI 的说明。此时**还没有密钥行**，对方领取时才派生 |
 | `PATCH` | `/api/admin/keys/:id` | 体 `{name?, expiresInHours?, revoked?, note?}`；改 `expiresInHours` 即用户直接续期（**重设**为 `now + 小时数` —— 这是显式**缩短**授权的唯一途径）；返回更新后的密钥 |
 | `GET` | `/api/admin/key-renewals?status=pending` | 续期申请列表 |
 | `POST` | `/api/admin/key-renewals/:id/approve` | 体 `{expiresInHours?}`；缺省则用申请里的 `requestedHours`；**在现有到期时间上叠加（只延长，见上）** |
@@ -674,7 +684,7 @@ Vite 的 `root` 指向 `web/`，`build.outDir` 直接输出到
 且 `router.push` 不会导航到应用之外。
 
 深链接可刷新的保证来自 `internal/spa`：任何未匹配到实体文件、且不属于
-`/api/`、`/s/` 的路径都会返回 `index.html`。
+`/api/`、`/s/`、`/k/` 的路径都会返回 `index.html`。
 
 ### 功能
 
@@ -683,6 +693,9 @@ Vite 的 `root` 指向 `web/`，`build.outDir` 直接输出到
 - 报告详情：元数据、正文源码、分享链接管理 ——
   新建（1 小时 / 6 小时 / 24 小时 / 7 天 / 30 天 / 永不过期）、复制链接、
   调整有效期、禁用 / 恢复、吊销。
+- 密钥管理：待批准申请队列、密钥列表（改名 / 调期 / 撤销）、续期队列，
+  以及**一步交接** —— 填个名字就生成一条「对方自助领取」的链接与提示词，
+  管理员不必再回面板确认。
 
 ### 前端安全边界
 

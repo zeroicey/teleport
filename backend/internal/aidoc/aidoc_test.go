@@ -303,3 +303,46 @@ func TestGuideDocumentsTheOwnReportList(t *testing.T) {
 		}
 	}
 }
+
+// TestGuideDocumentsTheKeyHandoff covers the path an agent takes when a human
+// has already approved it: without these facts the agent re-applies (burning a
+// rate-limited slot and creating a second, unrelated key) or waits forever for
+// an approval that already happened.
+func TestGuideDocumentsTheKeyHandoff(t *testing.T) {
+	got := Markdown(testFacts())
+
+	// The needles are deliberately section-unique. A first version of this test
+	// used "X-Teleport-Claim" and "/api/agent-keys/applications/{id}", both of
+	// which also appear in the endpoint table in 2.1 — so deleting the whole
+	// section left the test green. Falsification (F7) caught that; keep the
+	// anchors specific to 2.7.
+	for _, want := range []struct{ what, needle string }{
+		{"the hand-off section itself", "### 2.7"},
+		{"the human-facing name", "交接链接"},
+		{"no further approval is needed", "不需要"},
+		{"the link shape", "/k/<id>#<claim_secret>"},
+		{"the exchange command's own variable", "HANDOFF_CLAIM"},
+		{"the single-use warning", "只值一次"},
+		{"the link's own expiry field", "link_expires_at"},
+	} {
+		if !strings.Contains(got, want.needle) {
+			t.Errorf("guide omits %s (expected %q) from the pre-approved hand-off path",
+				want.what, want.needle)
+		}
+	}
+
+	// It must reuse the documented claim endpoint rather than inventing one.
+	if !strings.Contains(got, "X-Teleport-Claim") {
+		t.Error("guide's hand-off section does not use the existing claim header")
+	}
+	if !strings.Contains(got, "/api/agent-keys/applications/{id}") {
+		t.Error("guide does not document the claim endpoint the hand-off uses")
+	}
+
+	// The '#': a fragment never reaches the server, which is what keeps the
+	// secret out of access logs. If the guide stops saying so, a human will
+	// eventually paste the secret into the path instead.
+	if !strings.Contains(got, "fragment") && !strings.Contains(got, "`#`") {
+		t.Error("guide does not explain that the secret lives after '#'")
+	}
+}

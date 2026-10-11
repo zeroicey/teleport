@@ -94,6 +94,15 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	// unregistered sub-path would answer the iframe with JSON.
 	mux.HandleFunc("GET "+p+"/s/{token}/html", s.handleShareHTML)
 
+	// The one-step key hand-off page. Public by design: the link is forwarded to
+	// whoever should get the credential, and the thing that authorises the claim
+	// is the fragment, which the server never sees.
+	//
+	// The bare `/k/` pattern is registered too, so a truncated link renders the
+	// "this link is incomplete" page instead of falling through to the SPA shell.
+	mux.HandleFunc("GET "+p+"/k/{id}", s.handleKeyHandoffPage)
+	mux.HandleFunc("GET "+p+"/k/", s.handleKeyHandoffPage)
+
 	// -- machine-readable usage guide -----------------------------------------
 	//
 	// Served by this process, not the SPA, because an agent fetching a URL gets
@@ -148,6 +157,9 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	// all keys, and no agent credential reaches this surface at all.
 	mux.Handle("GET "+p+"/api/admin/keys", requireSession(http.HandlerFunc(s.handleAdminListKeys)))
 	mux.Handle("POST "+p+"/api/admin/keys", requireSession(http.HandlerFunc(s.handleAdminCreateKey)))
+	// One-step issuance: the administrator's decision is made here, when the
+	// link is generated, so the recipient never waits for a second action.
+	mux.Handle("POST "+p+"/api/admin/key-handoffs", requireSession(http.HandlerFunc(s.handleCreateKeyHandoff)))
 	mux.Handle("PATCH "+p+"/api/admin/keys/{id}", requireSession(http.HandlerFunc(s.handleAdminPatchKey)))
 	mux.Handle("GET "+p+"/api/admin/key-applications", requireSession(http.HandlerFunc(s.handleAdminListKeyApplications)))
 	mux.Handle("POST "+p+"/api/admin/key-applications/{id}/approve", requireSession(http.HandlerFunc(s.handleAdminApproveKeyApplication)))
@@ -327,6 +339,74 @@ func (s *Server) handleReadShare(w http.ResponseWriter, r *http.Request) {
 	_ = s.store.RecordView(token)
 
 	httpx.OK(w, r, sharePayload(resolution))
+}
+
+// handleKeyHandoffPage serves the page a one-step hand-off link opens.
+//
+// It is a page rather than a JSON endpoint because the link is meant to be
+// forwarded to a person. The claim secret is in the URL fragment, which never
+// reaches this handler — the page only reports the link's *state* from the
+// application row, which stores no secret, and the exchange itself happens in
+// the browser (see setupKeyHandoff in web/src/share/main.ts).
+//
+// Unknown, claimed and expired links all render 200 with an explanation. That
+// is not a leak: an application id is a 122-bit UUID and the page reveals no
+// more than "this id is not usable", which is exactly what the recipient needs
+// to read. Returning an error envelope here would show a person an API message
+// for a normal, expected outcome (a link used twice).
+func (s *Server) handleKeyHandoffPage(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	nowMS := store.NowMS()
+	s.expireApplications(nowMS)
+
+	opts := views.KeyHandoffOptions{
+		ID:           id,
+		State:        views.HandoffUnknown,
+		AppBaseURL:   s.cfg.AppBaseURL(),
+		AssetBaseURL: s.cfg.AssetBaseURL,
+		GuideURL:     s.cfg.AppBaseURL() + "/ai.md",
+	}
+
+	app, err := s.store.GetApplication(id)
+	if err != nil {
+		httpx.WriteError(w, r, httpx.Internal("Failed to load key handoff").WithCause(err))
+		return
+	}
+	if app != nil {
+		opts.Label = app.Label
+		opts.LinkExpiresAt = app.ClaimDeadline
+		opts.KeyLifetime = humanizeHours(app.ApprovedHours)
+		switch app.Status {
+		case domain.ApplicationApproved:
+			opts.State = views.HandoffOpen
+		case domain.ApplicationExpired:
+			opts.State = views.HandoffExpired
+		case domain.ApplicationClaimed:
+			opts.State = views.HandoffClaimed
+		default:
+			// Pending (never happens for a hand-off) and rejected both mean
+			// the link cannot produce a credential.
+			opts.State = views.HandoffUnknown
+		}
+	}
+
+	// Same policy as the share page: nothing here should outlive its window or
+	// be indexed.
+	h := w.Header()
+	h.Set("Cache-Control", "no-store, must-revalidate")
+	h.Set("Content-Security-Policy", views.ContentSecurityPolicy)
+	h.Set("Content-Type", "text/html; charset=utf-8")
+
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.WriteString(w, views.RenderKeyHandoffPage(opts))
+}
+
+// humanizeHours renders a granted lifetime the way the hand-off page words it.
+func humanizeHours(hours float64) string {
+	if hours == 0 {
+		return "不过期"
+	}
+	return strconv.FormatFloat(hours, 'f', -1, 64) + " 小时"
 }
 
 func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {

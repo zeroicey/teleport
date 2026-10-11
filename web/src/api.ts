@@ -178,6 +178,37 @@ export interface IssuedAgentKey {
   key: AgentKey | null;
 }
 
+/**
+ * Response of `POST /api/admin/key-handoffs`.
+ *
+ * `url` is the forwardable link (claim secret in the fragment, so the server
+ * never logs it); `prompt` is the same hand-off as plain text, because an AI
+ * reading a URL cannot see a fragment. Both are one-time: the credential is
+ * derived at claim time and only its hash is stored.
+ */
+export interface KeyHandoff {
+  id: string;
+  label: string;
+  claim_secret: string;
+  url: string;
+  link_expires_at: number;
+  key_expires_in_hours: number;
+  prompt: string;
+}
+
+function toKeyHandoff(data: unknown): KeyHandoff {
+  const raw = (data && typeof data === 'object' ? data : {}) as RawRecord;
+  return {
+    id: asString(raw.id),
+    label: asString(raw.label),
+    claim_secret: asString(raw.claim_secret),
+    url: asString(raw.url),
+    link_expires_at: asNumber(raw.link_expires_at),
+    key_expires_in_hours: asNumber(raw.key_expires_in_hours),
+    prompt: asString(raw.prompt),
+  };
+}
+
 function toAgentKey(raw: RawRecord): AgentKey {
   return {
     id: asString(raw.id),
@@ -422,6 +453,23 @@ export const api = {
   async createAgentKey(body: { name: string; expiresInHours: number }) {
     return toIssuedAgentKey(
       await request<unknown>('/api/admin/keys', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    );
+  },
+
+  /**
+   * One-step hand-off: the recipient gets a link (or a paste-ready prompt) and
+   * collects the credential themselves — no second approval step.
+   *
+   * `url` carries the claim secret in its fragment, so it must be forwarded
+   * as-is; `prompt` is the same thing in words, for an agent that cannot read a
+   * fragment.
+   */
+  async createKeyHandoff(body: { label: string; expiresInHours?: number; note?: string }) {
+    return toKeyHandoff(
+      await request<unknown>('/api/admin/key-handoffs', {
         method: 'POST',
         body: JSON.stringify(body),
       }),

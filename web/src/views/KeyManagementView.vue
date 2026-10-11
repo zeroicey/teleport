@@ -22,6 +22,7 @@ import {
   type AgentKey,
   type IssuedAgentKey,
   type KeyApplication,
+  type KeyHandoff,
   type KeyRenewal,
 } from '../api';
 import { copyText, formatDateTime, formatExpiry, relativeTime } from '../format';
@@ -322,6 +323,74 @@ async function copyIssued() {
   }
 }
 
+/**
+ * One-step hand-off.
+ *
+ * The administrator decides here — that is the whole point: no second visit to
+ * the approval queue. What comes back is a link whose *fragment* carries a
+ * one-time claim secret, so this panel never receives a usable credential and
+ * the server never logs one; the recipient exchanges the secret for the
+ * credential in their own browser, or uses the pasted prompt if the recipient
+ * is an agent that cannot read a fragment.
+ */
+const showHandoff = ref(false);
+const handoffForm = ref({ label: '', hours: 24, note: '' });
+const handoff = ref<KeyHandoff | null>(null);
+const handoffCopied = ref<'url' | 'prompt' | null>(null);
+
+function openHandoff() {
+  handoff.value = null;
+  handoffForm.value = { label: '', hours: 24, note: '' };
+  handoffCopied.value = null;
+  dialogError.value = '';
+  showHandoff.value = true;
+}
+
+function closeHandoff() {
+  showHandoff.value = false;
+  handoff.value = null;
+  handoffCopied.value = null;
+}
+
+async function submitHandoff() {
+  const label = handoffForm.value.label.trim();
+  if (!label) {
+    dialogError.value = '请填写收件人名称';
+    return;
+  }
+  const hours = parseHours(handoffForm.value.hours, dialogError);
+  if (hours === null) return;
+
+  busy.value = 'handoff';
+  try {
+    const body: { label: string; expiresInHours: number; note?: string } = {
+      label,
+      expiresInHours: hours,
+    };
+    const note = handoffForm.value.note.trim();
+    if (note) body.note = note;
+    handoff.value = await api.createKeyHandoff(body);
+    flash(`已生成给「${label}」的交接链接；对方领取后密钥才会出现在列表里`);
+  } catch (err) {
+    dialogError.value = apiMessage(err, '生成交接链接失败');
+  } finally {
+    busy.value = null;
+  }
+}
+
+async function copyHandoff(which: 'url' | 'prompt') {
+  if (!handoff.value) return;
+  const text = which === 'url' ? handoff.value.url : handoff.value.prompt;
+  if (await copyText(text)) {
+    handoffCopied.value = which;
+    window.setTimeout(() => {
+      if (handoffCopied.value === which) handoffCopied.value = null;
+    }, 1800);
+  } else {
+    dialogError.value = '复制失败，请手动选择并复制';
+  }
+}
+
 // -- key editing / revocation -------------------------------------------------
 function openEdit(key: AgentKey) {
   editTarget.value = key;
@@ -525,10 +594,12 @@ async function rejectRenewal(renewal: KeyRenewal) {
       <button class="primary" type="button" :disabled="busy === 'create'" @click="createKey">
         手动生成密钥
       </button>
+      <button type="button" @click="openHandoff">生成交接链接</button>
     </div>
 
     <p class="muted" style="margin: 0; font-size: 12px">
       文件名以 <span class="mono">token_prefix</span> 辨识；明文密钥只在生成时显示一次。
+      「生成交接链接」把授权和交接合并成一步：对方自己领取，你不需要再回来点批准。
     </p>
 
     <div v-if="keysLoading" class="empty"><span class="spin"></span> 正在加载密钥…</div>
@@ -789,6 +860,72 @@ async function rejectRenewal(renewal: KeyRenewal) {
         </button>
       </div>
     </form>
+  </div>
+
+  <!-- ---- one-step hand-off: generate, then forward ---- -->
+  <div v-if="showHandoff" class="modal-backdrop">
+    <form v-if="!handoff" class="card modal stack" @submit.prevent="submitHandoff">
+      <h2>生成交接链接</h2>
+      <p class="muted" style="margin: 0; font-size: 13px">
+        生成后把链接（或提示词）直接发给对方即可，<b>你不需要再做任何确认</b>。链接里的凭证
+        只能领取一次，领取时才会真正生成密钥。
+      </p>
+      <div v-if="dialogError" class="alert error">{{ dialogError }}</div>
+
+      <label>
+        收件人名称
+        <input v-model="handoffForm.label" type="text" placeholder="例如：A姐" maxlength="100" />
+      </label>
+      <label>
+        密钥有效期（小时，0 = 永不过期）
+        <input v-model.number="handoffForm.hours" type="number" min="0" step="1" />
+      </label>
+      <label>
+        备注（可选，只有你能看到）
+        <input v-model="handoffForm.note" type="text" placeholder="例如：月报发布用" maxlength="500" />
+      </label>
+
+      <div class="row" style="justify-content: flex-end">
+        <button class="primary" type="submit" :disabled="busy === 'handoff'">
+          {{ busy === 'handoff' ? '生成中…' : '生成' }}
+        </button>
+        <button type="button" @click="closeHandoff">取消</button>
+      </div>
+    </form>
+
+    <div v-else class="card modal stack">
+      <h2>交接链接已生成</h2>
+      <div class="alert ok" style="margin: 0">
+        把下面任意一项发给「{{ handoff.label }}」。<b>链接只能用一次</b>，领取后就失效；
+        链接有效期至 {{ formatExpiry(handoff.link_expires_at) }}。
+      </div>
+      <div v-if="dialogError" class="alert error">{{ dialogError }}</div>
+
+      <label>
+        转发链接（人打开后点「领取密钥」）
+        <div class="mono token-url">{{ handoff.url }}</div>
+      </label>
+      <button class="primary" type="button" @click="copyHandoff('url')">
+        {{ handoffCopied === 'url' ? '✓ 已复制链接' : '复制链接' }}
+      </button>
+
+      <label style="margin-top: 8px">
+        提示词（直接发给 AI 助手用）
+        <textarea class="mono" rows="6" readonly :value="handoff.prompt"></textarea>
+      </label>
+      <button type="button" @click="copyHandoff('prompt')">
+        {{ handoffCopied === 'prompt' ? '✓ 已复制提示词' : '复制提示词' }}
+      </button>
+
+      <p class="muted" style="margin: 0; font-size: 12px">
+        <span class="mono">#</span> 后面那一段就是一次性凭证，等价于密码：只通过可信渠道转发。
+        对方领取后，新密钥会出现在下面的密钥列表里。
+      </p>
+
+      <div class="row" style="justify-content: flex-end">
+        <button type="button" @click="closeHandoff">完成</button>
+      </div>
+    </div>
   </div>
 
   <!-- ---- one-time plaintext token dialog ---- -->

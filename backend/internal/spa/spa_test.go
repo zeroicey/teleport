@@ -286,6 +286,11 @@ func TestNeverServesShellForAPIOrSharePaths(t *testing.T) {
 		"/yeciorez/teleport/api/health",
 		"/yeciorez/teleport/api/admin/reports",
 		"/yeciorez/teleport/s/sometoken",
+		// A hand-off link with a truncated or mistyped path: the recipient must
+		// get an explanation, not an app shell that silently does nothing.
+		"/yeciorez/teleport/k/",
+		"/yeciorez/teleport/k",
+		"/yeciorez/teleport/k/some-id/extra",
 	} {
 		rec := get(h, path)
 		if rec.Code != http.StatusNotFound {

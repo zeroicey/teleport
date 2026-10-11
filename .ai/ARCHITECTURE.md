@@ -58,6 +58,7 @@ Teleport 是**个人 AI 报告展示与时效分享**平台。AI 在终端/工�
                   Go(:8788, 仅监听 docker 网桥 172.17.0.1) ─> SQLite(WAL)
                         ├─ /api/*      JSON API（统一封套）
                         ├─ /s/{token}  服务端渲染分享页（严格 CSP）
+                        ├─ /k/{id}     服务端渲染「一步交接」领取页（无 JS 时惰性）
                         ├─ /ai /ai.md /llms.txt   给 AI 的说明
                         └─ 其余        内嵌 Vue SPA（客户端路由回退）
 ```
@@ -74,6 +75,12 @@ Cookie 是**第一方**的（不受 Safari ITP / Chrome 第三方 Cookie 淘汰�
    返回三态 `ok|missing|gone` → `missing`=404（**未知与已吊销不可区分**）、`gone`=410。
 3. **面板登录**：`POST /api/admin/login` → PBKDF2 校验 → HMAC 签名 Cookie（`teleport_session`，
    12h，`Path=RoutePrefix`）→ 后续 `requireSession` 验签。
+4. **一步交接**：`POST /api/admin/key-handoffs`（Session）直接插一行 `approved` 申请 →
+   返回 `…/k/{id}#<claim_secret>`。**claim secret 只在 fragment 里**，因此从不进服务器日志、
+   `Referer` 或任何中间层；页面上的「领取」按钮默认 `hidden`，只有拿到 fragment 的浏览器
+   （即真人，不是聊天软件的预览机器人）才会显示它，**点击**才调
+   `GET /api/agent-keys/applications/{id}` + `X-Teleport-Claim` 换成真密钥。
+   密钥仍在**领取时**才存在（不变量 6 未变）。
 
 ## 5. Invariants
 
@@ -103,6 +110,11 @@ Cookie 是**第一方**的（不受 Safari ITP / Chrome 第三方 Cookie 淘汰�
 9. **`_`-前缀与 `_TEMPLATE.md` 是惰性的**：模板与示例，不被 dump/sync 视为记忆条目。
 10. **schema 不漂移**：`schema.sql` 与 `backend/internal/store/migrations/` 由
     `pnpm run db:check-schema` 强制一致。
+11. **一次性凭据只走 fragment，且页面无 JS 时是惰性的**：`/k/{id}#<secret>` 的 secret
+    永不进 query（会入访问日志）；页面的领取按钮默认 `hidden`，只有能读到 fragment 的
+    浏览器才显示它。**Enforced**：`TestKeyHandoffLinkCarriesTheSecretOnlyInTheFragment`
+    （fragment 不得含 `=`、URL 不得含 `?`）、`TestHandoffPageIsInertWithoutJavaScript`
+    （按钮必须带 `hidden`），反证 F1/F3/F9/F10。
 
 ## 6. Boundaries and known debts
 

@@ -197,6 +197,77 @@ func (s *Store) ExpireApplications(nowMS int64) (int64, error) {
 	return res.RowsAffected()
 }
 
+// HandoffInput is everything needed to open an already-approved application on
+// behalf of a named recipient.
+//
+// This is the admin-initiated path: the decision is made by the human at the
+// moment the hand-off link is generated, so there is no pending phase at all.
+type HandoffInput struct {
+	// Label is who the credential is for ("A姐"). It becomes the key's name.
+	Label string
+	// Note is the administrator's annotation, parked as approved_note.
+	Note string
+	// Hours is the granted key lifetime; 0 means "never expires" (the admin
+	// has to say so explicitly, exactly as on the approve endpoint).
+	Hours float64
+	// ClaimHash is sha256(hex) of the claim secret. The secret itself is
+	// returned once to the caller and never stored.
+	ClaimHash string
+	// RequesterIP is recorded for audit. It is the administrator's address,
+	// because the administrator is who initiated this.
+	RequesterIP string
+	UserAgent   string
+	// LinkTTL bounds how long the hand-off link stays claimable.
+	LinkTTL int64 // milliseconds
+}
+
+// CreateHandoffApplication inserts an application that is already approved and
+// immediately claimable, in one transaction.
+//
+// Two deliberate differences from CreateApplication:
+//
+//  1. No pending phase. The admin decided when generating the link; parking a
+//     pending row and then deciding it would leave a stray queue entry if the
+//     second write failed, and would make the admin look at a queue they do not
+//     have to act on.
+//  2. No KEY_MAX_PENDING check. That cap exists to bound the *public* endpoint
+//     against a flood; an authenticated administrator minting a link for a
+//     colleague is not the traffic it protects against, and being refused by it
+//     would be a confusing failure with no remedy in the UI.
+//
+// The claim deadline and the application expiry are both now+LinkTTL: this row
+// has no pending lifetime to speak of, so the link's validity is the only clock
+// that matters.
+func (s *Store) CreateHandoffApplication(in HandoffInput, nowMS int64) (*domain.KeyApplication, error) {
+	id, err := agentkey.NewID()
+	if err != nil {
+		return nil, err
+	}
+
+	a := &domain.KeyApplication{
+		ID: id, ClaimHash: in.ClaimHash, Label: in.Label,
+		Status:    domain.ApplicationApproved,
+		CreatedAt: nowMS, ExpiresAt: nowMS + in.LinkTTL,
+		DecidedAt:     nowMS,
+		ClaimDeadline: nowMS + in.LinkTTL,
+		RequesterIP:   in.RequesterIP, UserAgent: in.UserAgent,
+		ApprovedName: in.Label, ApprovedHours: in.Hours, ApprovedNote: in.Note,
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO key_applications
+		   (id, claim_hash, label, purpose, requested_hours, status, created_at,
+		    expires_at, decided_at, claim_deadline, issued_key_id, requester_ip,
+		    user_agent, approved_name, approved_hours, approved_note)
+		 VALUES (?, ?, ?, '', ?, 'approved', ?, ?, ?, ?, '', ?, ?, ?, ?, ?)`,
+		a.ID, a.ClaimHash, a.Label, in.Hours, a.CreatedAt, a.ExpiresAt,
+		a.DecidedAt, a.ClaimDeadline, a.RequesterIP, a.UserAgent,
+		a.ApprovedName, a.ApprovedHours, a.ApprovedNote,
+	); err != nil {
+		return nil, fmt.Errorf("insert handoff application: %w", err)
+	}
+	return a, nil
+}
+
 // DecideApplication records a human's approval or rejection.
 //
 // Approval parks the resulting name/TTL on the application instead of creating

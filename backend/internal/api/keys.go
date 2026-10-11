@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/zeroicey/teleport/backend/internal/agentkey"
@@ -539,6 +541,115 @@ func (s *Server) handleAdminListKeys(w http.ResponseWriter, r *http.Request) {
 		keys = []domain.AgentKey{}
 	}
 	httpx.OK(w, r, keys)
+}
+
+// handleCreateKeyHandoff issues a credential in one step: an application that is
+// already approved, plus a link the administrator can forward as-is.
+//
+// The decision is still a human's — it is simply made here, when the link is
+// generated, instead of later in the approval queue. Nothing about the
+// credential-at-rest story changes: only sha256(claim secret) is stored, and the
+// token is derived at claim time.
+//
+// The secret travels in the URL *fragment*. Fragments are never sent to a
+// server, so the secret stays out of access logs and out of the Referer header
+// of anything the page loads; it is read by the page's own script and sent as
+// the X-Teleport-Claim header of the claim request.
+func (s *Server) handleCreateKeyHandoff(w http.ResponseWriter, r *http.Request) {
+	body, err := readJSONObject(r, 1<<16)
+	if err != nil {
+		httpx.WriteError(w, r, err)
+		return
+	}
+
+	label, err := requireVisibleString(body["label"], "label", 1, 100)
+	if err != nil {
+		httpx.WriteError(w, r, err)
+		return
+	}
+	note := ""
+	if v, ok := body["note"]; ok && v != nil {
+		if note, err = requireVisibleText(v, "note", 0, 500); err != nil {
+			httpx.WriteError(w, r, err)
+			return
+		}
+	}
+
+	// Same rule as the approve endpoint: absent means the server default, and
+	// an explicit 0 means "never expires". The recipient does not get to pick
+	// its own lifetime, and neither does a blank field.
+	hours := float64(defaultApprovedKeyHours)
+	if v, ok := body["expiresInHours"]; ok && v != nil {
+		if hours, err = nonNegativeHours(v, "expiresInHours"); err != nil {
+			httpx.WriteError(w, r, err)
+			return
+		}
+	}
+
+	claimSecret, err := agentkey.NewClaimSecret()
+	if err != nil {
+		httpx.WriteError(w, r, httpx.Internal("Failed to generate claim secret").WithCause(err))
+		return
+	}
+
+	nowMS := store.NowMS()
+	s.expireApplications(nowMS)
+
+	app, err := s.store.CreateHandoffApplication(store.HandoffInput{
+		Label:       label,
+		Note:        note,
+		Hours:       hours,
+		ClaimHash:   agentkey.HashToken(claimSecret),
+		RequesterIP: httpx.ClientIP(r),
+		UserAgent:   truncate(r.UserAgent(), 512),
+		LinkTTL:     s.cfg.KeyApplicationTTL.Milliseconds(),
+	}, nowMS)
+	if err != nil {
+		writeKeyLifecycleError(w, r, err)
+		return
+	}
+
+	httpx.OK(w, r, map[string]any{
+		"id":                  app.ID,
+		"label":               label,
+		"claim_secret":        claimSecret,
+		"url":                 s.handoffURL(app.ID, claimSecret),
+		"link_expires_at":     app.ClaimDeadline,
+		"key_expires_in_hours": hours,
+		"prompt":              s.handoffPrompt(app, claimSecret),
+	}, http.StatusCreated)
+}
+
+// handoffURL is the link handed to the recipient. The secret is in the fragment.
+func (s *Server) handoffURL(id, claimSecret string) string {
+	return s.cfg.AppBaseURL() + "/k/" + id + "#" + claimSecret
+}
+
+// handoffPrompt renders the paste-ready instruction block.
+//
+// It exists because the human link is useless to an agent: a fragment never
+// leaves the browser, so an AI reading the URL cannot see the claim secret. The
+// prompt therefore spells out the exact call that exchanges the secret for the
+// credential, and points at the guide for everything after that.
+func (s *Server) handoffPrompt(app *domain.KeyApplication, claimSecret string) string {
+	base := s.cfg.AppBaseURL()
+	linkDeadline := time.UnixMilli(app.ClaimDeadline).UTC().Format(time.RFC3339)
+	keyLifetime := fmt.Sprintf("%g 小时", app.ApprovedHours)
+	if app.ApprovedHours == 0 {
+		keyLifetime = "不过期"
+	}
+	return fmt.Sprintf(`Teleport 发布权限已开通，无需任何人再确认。请自助领取密钥并使用：
+
+1) 领取密钥（只能领一次；返回的 data.key.token 就是发布密钥）：
+   curl -sS -H "X-Teleport-Claim: %s" %s/api/agent-keys/applications/%s
+   这条凭证的有效期至 %s（UTC）。
+
+2) 读 %s/ai.md 了解发布接口，然后带 Authorization: Bearer <token> 调用
+   POST %s/api/reports 发布报告。密钥有效期：%s。
+
+人类用户也可以直接打开 %s 点「领取密钥」。`,
+		claimSecret, base, app.ID, linkDeadline, base, base, keyLifetime,
+		s.handoffURL(app.ID, claimSecret))
 }
 
 // handleAdminCreateKey mints a credential outright, for handing one to an agent
