@@ -98,6 +98,8 @@
 数据库 `/data/services/teleport/teleport.db.bak-20261011-113817`（**先停服再拷**）。
 无 schema 变更、无数据迁移，回滚二进制即回到旧行为；子端点留着无害。
 
-**本地验证脚手架**（`bin/`，已 gitignore）：`bin/e2e/run.sh` 起本地实例，
-`payload-html.json` 是自检用 html 报告（内联脚本 / 同源 fetch / localStorage 三项），
-`shot-html-share.png`、`shot-online-html.png` 是分享页截图。
+**验证留痕**（`bin/e2e/`，已 gitignore）：`payload-html.json` 是自检用 html 报告
+（内联脚本 / 同源 fetch / localStorage 三项）、`shot-html-share.png` 与
+`shot-online-html.png` 是本地/线上分享页截图、`dom-online*.html` 是 Chromium 的 DOM dump。
+起本地实例的 `run.sh` 用完已删（里面写着本地开发用的密钥与口令哈希，不适合长期留存；
+重建方式：`go build` 后设 `LISTEN_ADDR`/`DB_PATH`/`STATIC_DIR`/三个密钥即可）。
