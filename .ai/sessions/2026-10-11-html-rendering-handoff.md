@@ -1,6 +1,6 @@
 # `format:"html"` 原样渲染 —— 已实现并本地验证，未提交未部署 — handoff
 
-**Date:** 2026-10-11 · **Branch/Commit:** `main @ a5fbd1d` + 未提交改动 · **线上:** `f609f8a`（未变）
+**Date:** 2026-10-11 · **Branch/Commit:** `main @ adc2be3` · **线上:** `adc2be3`（已部署并实测）
 
 ## Where we ended
 
@@ -12,7 +12,8 @@
 
 于是实现了 A：`format:"html"` 的正文**逐字节原样**渲染。B 路线（TOC/复制/打印）**没做**。
 
-**代码完成、本地全绿、真 Chromium 验过；未提交、未部署。** 下一步就是问用户是否提交部署。
+**代码完成、闸门全绿、真 Chromium 本地验过 → 已提交（`adc2be3`）并部署到 hcyj，线上实测通过。**
+用户下一轮选择「先看实际效果再说」，所以**没有排新功能**。
 
 ## What changed
 
@@ -45,9 +46,13 @@
       `<script>` 仍变 `raw HTML omitted`
 - [x] 头核对：分享页 `frame-src 'self'` + `XFO: DENY`；子文档**无 XFO**、有独立 CSP；
       正文与提交字节**完全一致**（1845 B）
-- [ ] **未验证：线上**。改动同时动了 Go 与 `web/src/`，必须重发二进制。
-      且线上 3 篇报告**都是 markdown**，部署后要先发一篇 html 报告才能验这条链路
-- [ ] **未验证：大陆观测点**（境外观测点不算数）
+- [x] **线上（2026-10-11 11:38 部署 `adc2be3`）**：本地与线上 sha256 一致
+      （`bd60a4a1…`）；线上发测试报告 → 正文 sha256 跨线一致（`4035aecd…`）；
+      分享页 `frame-src 'self'` + `XFO: DENY`、子资源无 XFO；Chromium 实测 iframe `379px`、
+      子页三项 JS 自检全绿；markdown 回归（`QDE56Dvt4kRsvCQjyJ6DRA`）无 iframe 且 Mermaid 正常；
+      部署后日志 `error|panic|fatal` = 0；测试报告已删除，计数回到 3/4/1，零孤儿
+- [x] **大陆观测点**：koma（腾讯云 `124.221.144.97`）视角两个 URL 均 200 且头正确
+- [ ] **未验证：北京观测点 `bjbuwe`**（只用了 koma + hcyj 本机）
 - [ ] **未验证：Safari / 移动端**。iframe 同源测量在 `file://` 或跨源时才会退化，
       本部署同源，理论上没问题，但没在真实移动浏览器上打开过
 - [ ] **未验证：报告自带 `X-Frame-Options`/CSP 时** —— 那是子文档自己的响应头，
@@ -86,7 +91,13 @@
 
 ## Next step
 
-问用户：**提交 + `pnpm run build:release` + 部署**？（AGENTS.md：提交/推送/部署前先问人类。）
-部署后：发一篇 html 测试报告 → 大陆观测点 curl 两个 URL 的头 → 真实 Chromium 打开确认
-iframe 真的渲染出内容。回滚只需把 `sharepage.go` 的 iframe 分支改回提示（无 schema 变更、
-无数据迁移，子端点留着无害）。
+**已部署，无待办。** 用户要自己发几篇 html 报告试手感，再决定下一轮
+（候选：B 路线 TOC/复制/打印、隔离档位、密码保护链接、登录限流）。
+
+回滚材料：二进制 `/data/services/teleport/teleport.prev-20261011-113817`、
+数据库 `/data/services/teleport/teleport.db.bak-20261011-113817`（**先停服再拷**）。
+无 schema 变更、无数据迁移，回滚二进制即回到旧行为；子端点留着无害。
+
+**本地验证脚手架**（`bin/`，已 gitignore）：`bin/e2e/run.sh` 起本地实例，
+`payload-html.json` 是自检用 html 报告（内联脚本 / 同源 fetch / localStorage 三项），
+`shot-html-share.png`、`shot-online-html.png` 是分享页截图。

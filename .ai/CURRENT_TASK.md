@@ -1,8 +1,8 @@
 # Current task
 
-**Status:** ⏳ **`format:"html"` 原样渲染已实现并本地验证完毕，尚未提交、尚未部署** ·
-**线上仍是 `f609f8a`** · **Updated:** 2026-10-11
-**下一步：** 问用户是否 **提交 + 部署**（改动同时动了 Go 与 `web/src/`，必须重发二进制）
+**Status:** ✅ **`format:"html"` 原样渲染已上线并线上实测** · 工作区干净 · **线上 `adc2be3`** ·
+**Updated:** 2026-10-11
+**下一步：** 用户要**先自己发几篇 html 报告试手感**，有反馈再排下一轮（B 路线 TOC/复制/打印 仍未做）
 
 > 本文件是**当前状态**，不是流水账。每一轮的完整叙事在
 > `.ai/sessions/*-handoff.md` 与 `.ai/decisions/`、`.ai/pitfalls/` 里。
@@ -28,6 +28,26 @@
 `views.HTMLReportSandbox`，但必须同时把高度测量从「同源读 `contentDocument`」
 换成 `postMessage`（沙箱 iframe 是 opaque origin）。
 
+**线上状态（2026-10-11 11:38 部署，`adc2be3`）**：
+
+| 项 | 值 |
+| --- | --- |
+| 二进制 sha256 | `bd60a4a1c3aa7a6418c7bdd100ce4ab1141d40b21d913079d970fef83300e8f1`（本地=线上） |
+| 回滚二进制 | `/data/services/teleport/teleport.prev-20261011-113817`（= 旧 `f609f8a`） |
+| 数据库备份 | `/data/services/teleport/teleport.db.bak-20261011-113817` |
+| 库内容 | 3 reports / 4 share_tokens / 1 agent_key，`integrity_check` = ok，零孤儿 |
+
+**线上实测（大陆观测点 koma 腾讯云 + 本机真 Chromium）**：
+- 线上发了一篇 html 测试报告，正文 sha256 与本地 payload **跨线一致**（`4035aecd…`）；
+  Chromium 实测 iframe 被撑到 `379px`、子页三项 JS 自检全绿
+  （截图 `bin/e2e/shot-online-html.png`：深色底 48429 采样、绿 ✓ 371、红 ✗ 0）
+- 分享页响应头 `frame-src 'self'` + `XFO: DENY`；子资源**无 XFO**、独立 CSP；
+  正文端点 200 且 `content-type: text/html`
+- markdown 回归：既有报告 `QDE56Dvt4kRsvCQjyJ6DRA` 线上无 iframe、Mermaid 出 `<svg>`、
+  `raw HTML omitted` 仍在；koma 视角 200
+- 部署后 10 分钟日志 `error|panic|fatal` = **0**
+- 测试数据已复原：删除测试报告 → 分享页与正文端点双双 **404**，计数回到 3/4/1
+
 **本地已验证（真 Chromium，非仅类型检查）**：
 - `GET /s/{token}/html` 正文与提交字节**完全一致**（1845 B）；markdown 报告在该路径 **404**
 - 分享页响应头 `frame-src 'self'` + `X-Frame-Options: DENY`；子文档**无** `X-Frame-Options`
@@ -44,16 +64,11 @@
 
 ## 下一步（唯一一件）
 
-**问用户**：这批改动要不要 `git commit` + `pnpm run build:release` + 部署到 hcyj？
-（AGENTS.md 要求提交/推送/部署前先问人类。）
+等用户试用手感，**当前无代码工作待办**。候选（按之前讨论）：B 路线 TOC/代码复制/打印样式、
+隔离档位、密码保护链接、登录限流。
 
-部署后必须做的两件验证（见 `.ai/runbooks/deploy-teleport.md`）：
-1. 从**大陆观测点** curl 线上分享页与 `/s/{token}/html`，确认 200 且头正确；
-2. 用真实 Chromium 打开线上 html 报告，确认 iframe 真的渲染出内容
-   （iframe 被挡时**页面仍 200、日志 0 error**，只有控制台报错 —— 见上面那条 pitfall）。
-
-> ⚠️ 线上目前**没有** `format:"html"` 的报告（3 篇都是 markdown），
-> 所以部署后要**先发一篇测试报告**才能验证这条链路。
+> 想试手感就直接 `POST /api/reports` 带 `"format":"html"` + 一段完整 HTML 页面，
+> 拿 `data.share.url` 打开即可；分享页底部有「在新窗口打开原页面」用于全屏看。
 
 ---
 
@@ -83,7 +98,7 @@
 | 追加③ | **密钥过期后 90 天宽限续签**：过期密钥**只能**调续期端点；续期不换 `key_id` 故归属连续；`GET /api/reports` 列出自己的报告；过期可见性响应头 | `0c33125` `711f194` |
 | 追加④ | **报告原地更新与删除**：`PATCH`/`DELETE /api/reports/{id}`（agent 归属限定）与 `/api/admin/reports/{id}`（面板）；未知字段/空 patch 一律 400 | `1917768` `f609f8a` |
 
-⏳ **未提交**：`format:"html"` 原样渲染（本轮）—— 见本文顶部「本轮」一节。
+| 追加⑤ | **`format:"html"` 报告原样渲染**：同源 iframe + 新端点 `GET /s/{token}/html` 逐字节回源；markdown 路径未放宽 | `adc2be3` |
 
 **审计四条**（追加②，全部已部署，守卫名在代码里）：
 
