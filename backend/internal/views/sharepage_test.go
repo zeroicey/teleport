@@ -130,6 +130,24 @@ func TestOuterCSPKeepsScriptsStrict(t *testing.T) {
 		t.Error("outer CSP must not carry the report document's script relaxation")
 	}
 
+	// The page links the self-hosted webfont stylesheet, so its policy has to
+	// permit both halves of that: `style-src` for the <link>, and `font-src` for
+	// the @font-face fetches the stylesheet triggers. Either one missing is
+	// silent — the page renders and quietly falls back to a system face. This
+	// exact mistake shipped on the /ai page, which is why both are pinned here
+	// as well as in the aidoc package.
+	for _, want := range []string{"style-src 'self'", "font-src 'self'"} {
+		if !strings.Contains(ContentSecurityPolicy, want) {
+			t.Errorf("ContentSecurityPolicy missing %q but the page links the webfont stylesheet", want)
+		}
+	}
+
+	// ...and the relaxation must not extend to scripts.
+	if !strings.Contains(ContentSecurityPolicy, "script-src 'self'") ||
+		strings.Contains(ContentSecurityPolicy, "script-src 'self' 'unsafe-inline'") {
+		t.Error("font/style relaxation must not have widened script-src")
+	}
+
 	// The report document is the only place inline/remote script is allowed.
 	if !strings.Contains(HTMLReportContentSecurityPolicy, "unsafe-inline") {
 		t.Error("report document CSP should allow inline script")

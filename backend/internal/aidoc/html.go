@@ -14,11 +14,25 @@ const ContentTypeMarkdown = "text/markdown; charset=utf-8"
 // CSP for the human-readable HTML rendering.
 //
 // Stricter than the share page's policy: this page loads no scripts at all, so
-// `default-src 'none'` needs only the inline-style relaxation that the embedded
-// stylesheet requires. There is no `script-src`, so even a future mistake that
-// injected a <script> tag would be blocked.
+// there is deliberately no `script-src` — even a future mistake that injected a
+// <script> tag would be blocked by `default-src 'none'`.
+//
+// `style-src` and `font-src` both have to allow `'self'` for the self-hosted
+// webfonts. Two separate mistakes are possible here and only one of them is
+// obvious:
+//
+//   - `style-src` without `'self'` blocks the `<link rel=stylesheet>` outright,
+//     so the page never even sees an `@font-face` to fetch;
+//   - `style-src 'self'` alone is still not enough, because `@font-face` fetches
+//     are governed by `font-src`, which falls back to `default-src 'none'`.
+//
+// Missing either one degrades silently: the page renders, the console shows a
+// CSP violation, and the text quietly falls back to a system face. That is
+// exactly what shipped in the first cut of this change, because the local
+// verification harness served no CSP header at all.
 const CSP = "default-src 'none'; " +
-	"style-src 'unsafe-inline'; " +
+	"style-src 'self' 'unsafe-inline'; " +
+	"font-src 'self'; " +
 	"img-src 'self' data:; " +
 	"base-uri 'none'; " +
 	"form-action 'none'; " +

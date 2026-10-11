@@ -146,3 +146,52 @@ func TestLLMSTxtHasNoSecret(t *testing.T) {
 		}
 	}
 }
+
+// TestCSPAllowsExactlyWhatThePageLoads is the guard for a defect that reached
+// production.
+//
+// The self-hosted webfonts were linked from this page while its CSP still said
+// `style-src 'unsafe-inline'` with no `font-src`. `default-src 'none'` then
+// blocked both the stylesheet and the font fetch. Nothing failed: the page
+// rendered, the response was 200, and the text silently fell back to a system
+// face. It shipped because the local harness served no CSP header at all, so
+// only a real browser against the real server could see it.
+//
+// The rule this pins: every external resource the page references must be
+// permitted by the policy the page is served with. Asserting the two sides
+// against each other is what makes the next such addition fail loudly.
+func TestCSPAllowsExactlyWhatThePageLoads(t *testing.T) {
+	got := HTML(testFacts())
+
+	// The page links a stylesheet and an icon; both are same-origin.
+	refs := map[string]string{
+		"stylesheet": `rel="stylesheet"`,
+		"icon":       `rel="icon"`,
+	}
+	for what, marker := range refs {
+		if !strings.Contains(got, marker) {
+			t.Fatalf("page no longer declares a %s; update this test with the change", what)
+		}
+	}
+
+	// A same-origin stylesheet needs style-src 'self'; the @font-face fetches it
+	// triggers need font-src 'self'. Neither is implied by 'unsafe-inline'.
+	if !strings.Contains(CSP, "style-src 'self'") {
+		t.Error("CSP lacks style-src 'self' but the page links a stylesheet; the link will be blocked")
+	}
+	if !strings.Contains(CSP, "font-src 'self'") {
+		t.Error("CSP lacks font-src 'self' but the linked stylesheet declares @font-face; the fonts will be blocked")
+	}
+	if !strings.Contains(CSP, "img-src 'self'") {
+		t.Error("CSP lacks img-src 'self' but the page links an icon")
+	}
+
+	// ...and the relaxation must stay scoped. This page is script-free by
+	// design; granting script-src would give up that property for nothing.
+	if strings.Contains(CSP, "script-src") {
+		t.Error("CSP grants script-src; this page has no scripts and must not permit any")
+	}
+	if !strings.Contains(CSP, "default-src 'none'") {
+		t.Error("CSP must keep denying by default")
+	}
+}
