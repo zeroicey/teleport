@@ -1,8 +1,8 @@
 # Current task
 
-**Status:** 🚧 **P0 ✅ / P1 ✅（附一处更正）/ P2 待批** —— 契约已钉住（243 → 247 个测试）；
-PostgreSQL 库、角色、基线迁移、快照与漂移守卫都已就位。**P2 的测试策略已写成 ADR 提案，
-等人类裁决**（`.ai/decisions/2026-10-16-p2-test-strategy.md`）。
+**Status:** 🚧 **P0 ✅ / P1 ✅（附更正）/ P2 🚧 进行中** —— 已交付：每测一个 schema 的 PG 测试
+夹具 + 两层闸门（`scripts/test-pg.sh`）；已用**确定性实验**证实「计数—插入」在上限上的竞态
+在 PG 里真的存在，并验证了替代它的 advisory lock。store 本体（pgx + sqlc）尚未开写。
 **Updated:** 2026-10-16
 **目标：** 把 teleport 重写到 Gin + pgx/sqlc + PostgreSQL，**在野契约逐字节不变**，
 然后部署到 hpcore（本机），让 hcyj 只剩转发。
@@ -39,7 +39,10 @@ PostgreSQL 库、角色、基线迁移、快照与漂移守卫都已就位。**P
 | **P0** | ✅ 清点完成 + 补上缺口：审计发现 **agentkey 的三个派生标签零测试覆盖**（最危险的一条），已加 4 个守卫（标签字面量 + 黄金字节 + 独立重算 + 续期域分离），并做了两次反证确认会变红。剩下的 11 项契约已由现有测试钉住（见下） | 重写期间的每一次"绿"必须是同一个判据下的绿 |
 | **P1** | ✅ 完成（**附更正，见下**）：库/角色 `teleport`（非超级用户）、`migrations_pg/0001_init.sql`（合并式基线）、生成的 `schema.pg.sql`、`MigratePG` 运行器、8 个新测试（在真库 `teleport_test` 上验证 4 处**必须改对**的转换）、两道漂移守卫 | schema 是后面一切的接口 |
 | **P1.1** | ✅ 更正：P1 记的「在真库上验证」当时**已经不成立** —— `teleport_test` 是**未提交的中间版本**建的库，合并式基线按文件名记录、永不重放，于是库里留着 `CHECK ((metadata)::json IS NOT NULL)` 而文件里是 `CHECK (metadata IS JSON)`，`TestPGMetadataCheckRejectsInvalidJSON` 实际是红的（期望 23514，得到 22P02）。已 DROP/CREATE 重建 `teleport_test` 并复跑 → 8/8 绿。两道漂移守卫是**文件对文件**，看不到真库。见 pitfall `2026-10-16-merged-baseline-hides-a-stale-test-db.md`。生产意图库 `teleport` 当时仍是空的，P5/P6 未受影响 | 「绿」必须真的对应当前文件；否则后面每一次绿都不可信 |
-| P2 | `internal/store/` 逐函数换成 pgx + sqlc（每换一个跑一遍现有 store 测试）—— **注意：SQLite 的单写者保证在 PG 里消失，待批准上限/密钥上限/分享链接计数这三处必须显式加锁**。**开工前先定测试策略**（见 ADR 提案） | 存储语义最容易在不知不觉中变 |
+| P2 | `internal/store/` 逐函数换成 pgx + sqlc（每换一个跑一遍现有 store 测试）—— **注意：SQLite 的单写者保证在 PG 里消失，计数—插入式的上限必须显式加锁** | 存储语义最容易在不知不觉中变 |
+| ↳ **P2.1** | ✅ 测试夹具 + 闸门：`internal/store/storetest`（每测一个 schema，`search_path` 锁定，用完即拆）、`scripts/test-pg.sh`（无 DSN 拒绝运行 + 自检守卫）、`check.sh` 在跳过 PG 时大声提醒。7 个新测试（3 个夹具守卫 + 3 个上限锁验证 + 1 个旧真库测试改用夹具） | 没有可信的夹具，后面每一次「绿」都不可信 |
+| ↳ **P2.2** | ✅ 锁定设计已验证：`pg_advisory_xact_lock` 的三个键（`pg.go`）。确定性实验证明 READ COMMITTED 下 cap=1 能落 2 行（不是假设）；锁能把第二个事务真的擋住并使 cap 精确，24 竞争者×5 轮 → 每轮恰好 3 个赢 | 先有靶子再改实现，否则锁加错地方也看不出来 |
+| ↳ **P2.3** | ⛔ 待做：`internal/store/`（`queries.go` + `keys.go`）逐个换成 pgx，方法签名尽量不变；三处上限改用上面的锁；`schema_migrations` 记录内容哈希以杀死「文件改了但库不变」 | P2 的主体，也是最大的一块 |
 | P3 | `internal/httpx` → Gin 中间件；`internal/api` 移植 | 封套与状态码必须逐条对齐 |
 | P4 | 全链路起新版（Gin + pgx），243 测试 + 浏览器验证 | 切换前的最后一道闸 |
 | P5 | SQLite → PG 的数据搬运脚本 + 行数核对（5 报告 / 2 密钥 / 全部分享链接） | 切换当天不能靠猜 |
@@ -50,8 +53,14 @@ PostgreSQL 库、角色、基线迁移、快照与漂移守卫都已就位。**P
 
 ## 未做 / 需要人类
 
-- **P2 的测试策略等裁决**：`.ai/decisions/2026-10-16-p2-test-strategy.md`（建议 B：每测一个 schema，从内嵌迁移现建现拆）。P2 的任何代码都排在这个裁决之后。
-- 本仓库在 GitHub 上还不存在（本地目录 `/data/dev/teleport-gin`）。
+- **P2 测试策略已裁决**（`.ai/decisions/2026-10-16-p2-test-strategy.md`）：B —— 每测一个 schema，
+  从内嵌迁移现建现拆；闸门两层（`check.sh` 可跳过 DB，`test-pg.sh` 强制）。
+- **更正交接文档里的一处计数**：需要显式加锁的「计数—插入」实际上有 **3 处**，不是文档写的
+  「待批准上限 / 密钥上限 / 分享链接计数」：① `CreateApplication` 的 `KEY_MAX_PENDING`，
+  ② `ClaimApplication` 与 `CreateManualKey` 共用的 `KEY_MAX_ACTIVE`，③ `CreateRenewal` 的
+  「每把密钥至多一个待批续期」。**分享链接没有任何数量上限**（`RecordView` 只是
+  `view_count = view_count + 1`，在 PG 里本来就是原子的），照字面找会白找。
+- 本仓库在 GitHub 上还不存在（本地目录 `/data/dev/teleport`，remote 名为 `teleport`）。
 - 线上仍是旧版（hcyj，SQLite + net/http），用户裁决「等重写版就绪再切」。
 - 与 clip 共享的基础设施改动要**同时想两边**（hcyj 的 Caddyfile 同时服务两个站点）。
 
@@ -66,3 +75,7 @@ PostgreSQL 库、角色、基线迁移、快照与漂移守卫都已就位。**P
 - **限流桶键必须用 `httpx.ClientIP`**，绝不用任何 RealIP 式实现。
 - **markdown 报告永不渲染原始 HTML**；`format:"html"` 的原样渲染是**唯一的例外**，有双向绊线测试。
 - 大陆可达性是硬约束；验证必须用大陆观测点。
+- **Postgres 实例是与 clip / registry / serenique 共享的**（`max_connections = 100` 是所有人
+  共用的），不是 teleport 的预算。任何夹具/脚本/压测都不得按「整台实例都是我的」来开连接：
+  一个循环里开连接池会瞬间吃掉 100 个槽位，把别人的服务弄成「连不上」而不是「测试失败」。
+  见 pitfall `2026-10-16-test-harness-exhausted-shared-postgres-connections.md`。

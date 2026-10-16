@@ -79,11 +79,46 @@ verification once.
   private schema.
 - **New invariant:** the role in `TEST_PG_DSN` must be able to `CREATE SCHEMA` in the test
   database. For `teleport_test` it is the owner, so this is already true.
-- **Gate change:** `scripts/check.sh` gains a Postgres-backed step (a `scripts/test-pg.sh`
-  mirroring clip's), because a green gate that skips the database is exactly the green that
-  misled us on 2026-10-16.
+- **New invariant:** connection budgets are small on purpose (1 admin, 4 per test) because
+  the instance's `max_connections` of 100 is shared with clip, registry and serenique. A test
+  that needs an empty database twice truncates; it does not open another pool. Measured
+  peak across a full `internal/store` run after the fix: 14 total connections, ~5 of them
+  teleport's.
+- **Gate change:** `scripts/check.sh` reports loudly when it skips the Postgres tests, and
+  `scripts/test-pg.sh` is the two-tier gate from the decision above — it refuses to run
+  without a DSN, and self-checks that the harness still refuses a non-test database.
 - The three locking sites get their concurrency tests written against the **real** new store
   first, so the lock is introduced to satisfy a failing invariant rather than on faith.
+  (Done early, in `cap_lock_pg_test.go` — see below.)
+
+## Evidence recorded for P2.3 (the store port)
+
+Written after the decision, before the store rewrite, so that the locking work is driven by a
+measured hazard rather than by a prediction. `cap_lock_pg_test.go`:
+
+- **The hazard is real, and proven deterministically.** Two overlapping transactions, each
+  `SELECT COUNT(*)` of pending applications (both observe 0 against a cap of 1), each then
+  inserting: **two rows land past a cap of 1**, and nothing reports an error. The
+  interleaving is forced rather than raced, because a statistical test would "pass" on the
+  rounds where the race did not fire and read as "no problem".
+- **A statistical run confirms the magnitude and the flakiness**: 24 racers for a cap of 3,
+  20 rounds — most rounds landed on exactly 3, while rounds 0, 5 and 8 landed on 4, 5 and 4.
+  A cap that holds 15 times out of 20 is exactly the "looks like it is limiting, actually
+  is not" outcome this decision is about.
+- **`pg_advisory_xact_lock` removes it.** The second transaction demonstrably blocks while
+  the first holds the key, then observes the first one's insert and refuses; and 24 racers ×
+  5 rounds against a cap of 3 yields exactly 3 winners every round, with zero callers getting
+  a raw error instead of a clean refusal.
+- `SELECT ... FOR UPDATE` was rejected: it cannot lock rows that do not exist yet, so it does
+  not constrain a count over a set that new rows can join (a phantom).
+
+**Correction to the handoff's list of sites.** The handoff names three: pending cap, key cap,
+"share-link counting". The actual sites, verified by grepping every `COUNT(*)` in
+`internal/store`, are: (1) `CreateApplication`'s `KEY_MAX_PENDING`; (2) `KEY_MAX_ACTIVE`,
+shared by `ClaimApplication` **and** `CreateManualKey`, so both must take the same key;
+(3) `CreateRenewal`'s "at most one pending renewal per key". There is **no share-link
+quota** anywhere — `RecordView` is a single `view_count = view_count + 1`, which is already
+atomic in PostgreSQL — so a search for one wastes time.
 
 ## Revisit when
 
