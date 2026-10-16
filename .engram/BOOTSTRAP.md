@@ -15,9 +15,9 @@ A fact below is a *starting point*, not a source of truth. It may be stale, or w
 detector does not know your conventions. Correct anything that does not match the repository.
 
 - Project name: `teleport`
-- Root: `/data/dev/teleport`
+- Root: `/data/dev/teleport-gin`
 - Detected stack: `node`, `node >=20.0.0`, `typescript`, `vue`, `vite`
-- Top-level directories: `backend/`, `bin/`, `scripts/`, `web/`, `.ai/`
+- Top-level directories: `backend/`, `scripts/`, `web/`
 - npm scripts: `build`, `build:release`, `dev`, `dev:web`, `typecheck`, `backend:build`, `backend:hash-password`, `backend:test`, `backend:vet`, `check`, `db:check-schema`
 - Git repository: yes
 - No AI rule file exists yet: create them.
@@ -96,21 +96,38 @@ For **each** tool section below, write or update that tool's rule file(s) so tha
 6. **Every path you cite must exist.** Do not reference a script, directory or `.ai/` file you
    have not read or listed. A pointer that does not resolve is worse than no pointer.
 
-### `dsh` — DeepSeek Harness (dsh)
+### `agents` — AGENTS.md (Codex, OpenCode, Cline, Amp, Zed, Aider …)
 
 Write:
-   - `AGENTS.md`
-     Purpose: dsh-agent-instructions loads the project AGENTS.md/CLAUDE.md chain from the repo root down to the session cwd.
+   - `AGENTS.md` (also read by: pi)
+     Purpose: The vendor-neutral contract honoured by most non-Anthropic agents.
 
 Skill carrier:
-- `.agents/skills/` — one `SKILL.md` per skill (dsh scans `.agents/skills` (rank 200) for `<name>/SKILL.md`; the model loads a skill with the `skill` tool and a human invokes it as `/name`.)
+- `.agents/skills/` — one `SKILL.md` per skill (Agent Skills standard directory — portable, recognised by several agents.)
 
 Style rules for this tool:
-- dsh loads `AGENTS.md` (then `CLAUDE.md`) from the repo root down to the session cwd under a byte budget (65,536 by default in `dsh-base`); keep the root file short and put depth in `.ai/`.
-- There is no `@path` import syntax: name the `.ai/` file and the trigger ("before changing architecture, read `.ai/ARCHITECTURE.md`") instead of importing it.
-- Skill frontmatter is strict: `name` must be kebab-case, `description` is required and is the whole routing signal the model sees; say what the skill does *and* when it applies.
-- Skills are discovered one level deep only — `<name>/SKILL.md` or `<name>.md` directly under a scanned root; never nest a skill deeper.
-- State the sandbox and approval model explicitly: which commands dsh may run unattended, which need a human, and what must never be committed.
+- Imperative, second-person-free prose. "Run `npm test`, do not skip typecheck."
+- Order by frequency: build/run/test commands first, then conventions, then workflows.
+- Reference real paths and real commands. Never describe code you have not read.
+- Keep it under ~200 lines. Long documents are skimmed; short ones are followed.
+- Scope narrowing is done by adding `AGENTS.md` files in subdirectories, not by growing the root file.
+
+### `pi` — Pi (earendil-works)
+
+Write:
+   - `AGENTS.md` (also read by: agents)
+     Purpose: The vendor-neutral contract honoured by most non-Anthropic agents.
+
+Skill carrier:
+- `.pi/prompts/` — one `.md` slash command per skill (Prompt templates become /<name> slash commands.)
+
+Style rules for this tool:
+- AGENTS.md is the context file, loaded from the agent directory, the cwd and its parents (not
+  discovered on demand downwards, unlike Codex); subdirectory files apply only when Pi runs there.
+- Skills: frontmatter `name` + `description` (max 1024 chars) decides when the model loads them — say what it does *and* when it applies.
+- Prefer bundled references over long instructions; Pi loads SKILL.md only when routed to.
+- Skills live in the shared `.agents/skills/` dir; Pi reads that alongside `.pi/skills/`, so never add a second copy of the same skill name under `.pi/skills/`.
+- Project trust gates project resources (`.agents/skills/`, `.pi/prompts/`); mention this to humans, not to the model.
 
 ## Method
 

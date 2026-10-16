@@ -76,6 +76,8 @@ Go 工具链：`go 1.26` 模块在 `backend/`，本机 `go` 在 `/usr/local/go/b
 3. 涉及线上行为时，从**大陆观测点**验证（境外观测点无法检测大陆封锁，见 `.ai/pitfalls/`）。
 4. 行为、决策、陷阱的变更在**同一次改动**里写回 `.ai/`。
 
+_Read by: pi._
+
 <!-- engram:managed -->
 
 <!-- engram:contract:start v1 -->

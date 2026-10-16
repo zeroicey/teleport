@@ -1,6 +1,7 @@
 {
   "version": 1,
   "tools": [
-    "dsh"
+    "agents",
+    "pi"
   ]
 }
