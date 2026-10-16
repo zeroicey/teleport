@@ -2,11 +2,15 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -91,6 +95,15 @@ func OpenPG(ctx context.Context, dsn string, maxConns int32) (*pgxpool.Pool, err
 // same transaction as the DDL it describes. A crash between the two is therefore
 // impossible, and "recorded" always means "applied".
 //
+// Each applied migration's **content hash** is recorded alongside its name, and
+// a database whose recorded hash no longer matches the embedded file is refused
+// rather than served. That check exists because its absence produced a false
+// claim of verification: the baseline is a single merged file, so a database
+// created from one revision of it silently keeps that revision's DDL forever
+// (the version is recorded; the file is never replayed), and the file-to-file
+// snapshot guard cannot see a live database at all. See
+// .ai/pitfalls/cases/2026-10-16-merged-baseline-hides-a-stale-test-db.md.
+//
 // The migrations are the schema's single source of truth: `schema.pg.sql` at the
 // repository root is a generated snapshot, and TestPGSnapshotMatchesMigrations
 // fails if the two disagree.
@@ -102,9 +115,18 @@ func MigratePG(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version    TEXT   PRIMARY KEY,
-			applied_at BIGINT NOT NULL
+			applied_at BIGINT NOT NULL,
+			checksum   TEXT   NOT NULL DEFAULT ''
 		)`); err != nil {
 		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+	// Databases created before checksums existed get the column with the empty
+	// default, which is treated below as "cannot be verified" rather than as
+	// "matches".
+	if _, err := pool.Exec(ctx,
+		`ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum TEXT NOT NULL DEFAULT ''`,
+	); err != nil {
+		return fmt.Errorf("add schema_migrations.checksum: %w", err)
 	}
 
 	names, err := pgMigrationNames()
@@ -113,19 +135,32 @@ func MigratePG(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 
 	for _, name := range names {
-		var applied bool
-		if err := pool.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, name,
-		).Scan(&applied); err != nil {
-			return fmt.Errorf("read schema_migrations: %w", err)
-		}
-		if applied {
-			continue
-		}
-
 		body, err := pgMigrationFS.ReadFile("migrations_pg/" + name)
 		if err != nil {
 			return fmt.Errorf("read migration %s: %w", name, err)
+		}
+		want := migrationChecksum(body)
+
+		var recorded string
+		err = pool.QueryRow(ctx,
+			`SELECT checksum FROM schema_migrations WHERE version = $1`, name).Scan(&recorded)
+		switch {
+		case err == nil:
+			if recorded == "" {
+				return fmt.Errorf("migration %s was applied by a migrator that did not record a "+
+					"checksum, so the live schema cannot be shown to match the file. The baseline is "+
+					"merged rather than incremental, so there is nothing to replay: recreate the "+
+					"database (or, for a test database, drop and recreate it)", name)
+			}
+			if recorded != want {
+				return fmt.Errorf("migration %s has changed since it was applied: the database "+
+					"holds schema from a different revision of that file (recorded %s, file %s). "+
+					"Editing a merged baseline is not a migration — add a new migration file, or "+
+					"recreate the database", name, recorded[:12], want[:12])
+			}
+			continue
+		case !errors.Is(err, pgx.ErrNoRows):
+			return fmt.Errorf("read schema_migrations: %w", err)
 		}
 
 		tx, err := pool.Begin(ctx)
@@ -137,8 +172,8 @@ func MigratePG(ctx context.Context, pool *pgxpool.Pool) error {
 			return fmt.Errorf("apply migration %s: %w", name, err)
 		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO schema_migrations (version, applied_at) VALUES ($1, $2)`,
-			name, time.Now().UnixMilli(),
+			`INSERT INTO schema_migrations (version, applied_at, checksum) VALUES ($1, $2, $3)`,
+			name, time.Now().UnixMilli(), want,
 		); err != nil {
 			_ = tx.Rollback(ctx)
 			return fmt.Errorf("record migration %s: %w", name, err)
@@ -148,6 +183,16 @@ func MigratePG(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 	}
 	return nil
+}
+
+// migrationChecksum is the hex sha256 of a migration's exact bytes.
+//
+// Content, not filename, because the filename is what the database already
+// records — and a filename that still matches while the content has changed is
+// precisely the failure this guards.
+func migrationChecksum(body []byte) string {
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:])
 }
 
 // pgMigrationNames lists the embedded migrations in application order.
