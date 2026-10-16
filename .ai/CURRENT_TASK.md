@@ -39,10 +39,11 @@
 | **P0** | ✅ 清点完成 + 补上缺口：审计发现 **agentkey 的三个派生标签零测试覆盖**（最危险的一条），已加 4 个守卫（标签字面量 + 黄金字节 + 独立重算 + 续期域分离），并做了两次反证确认会变红。剩下的 11 项契约已由现有测试钉住（见下） | 重写期间的每一次"绿"必须是同一个判据下的绿 |
 | **P1** | ✅ 完成（**附更正，见下**）：库/角色 `teleport`（非超级用户）、`migrations_pg/0001_init.sql`（合并式基线）、生成的 `schema.pg.sql`、`MigratePG` 运行器、8 个新测试（在真库 `teleport_test` 上验证 4 处**必须改对**的转换）、两道漂移守卫 | schema 是后面一切的接口 |
 | **P1.1** | ✅ 更正：P1 记的「在真库上验证」当时**已经不成立** —— `teleport_test` 是**未提交的中间版本**建的库，合并式基线按文件名记录、永不重放，于是库里留着 `CHECK ((metadata)::json IS NOT NULL)` 而文件里是 `CHECK (metadata IS JSON)`，`TestPGMetadataCheckRejectsInvalidJSON` 实际是红的（期望 23514，得到 22P02）。已 DROP/CREATE 重建 `teleport_test` 并复跑 → 8/8 绿。两道漂移守卫是**文件对文件**，看不到真库。见 pitfall `2026-10-16-merged-baseline-hides-a-stale-test-db.md`。生产意图库 `teleport` 当时仍是空的，P5/P6 未受影响 | 「绿」必须真的对应当前文件；否则后面每一次绿都不可信 |
-| P2 | `internal/store/` 逐函数换成 pgx + sqlc（每换一个跑一遍现有 store 测试）—— **注意：SQLite 的单写者保证在 PG 里消失，计数—插入式的上限必须显式加锁** | 存储语义最容易在不知不觉中变 |
+| P2 | `internal/store/` 换成 pgx + sqlc —— **注意：SQLite 的单写者保证在 PG 里消失，计数—插入式的上限必须显式加锁**。**做法已裁决为 B（一次性大爆炸）** | 存储语义最容易在不知不觉中变 |
 | ↳ **P2.1** | ✅ 测试夹具 + 闸门：`internal/store/storetest`（每测一个 schema，`search_path` 锁定，用完即拆）、`scripts/test-pg.sh`（无 DSN 拒绝运行 + 自检守卫）、`check.sh` 在跳过 PG 时大声提醒。7 个新测试（3 个夹具守卫 + 3 个上限锁验证 + 1 个旧真库测试改用夹具） | 没有可信的夹具，后面每一次「绿」都不可信 |
 | ↳ **P2.2** | ✅ 锁定设计已验证：`pg_advisory_xact_lock` 的三个键（`pg.go`）。确定性实验证明 READ COMMITTED 下 cap=1 能落 2 行（不是假设）；锁能把第二个事务真的擋住并使 cap 精确，24 竞争者×5 轮 → 每轮恰好 3 个赢 | 先有靶子再改实现，否则锁加错地方也看不出来 |
-| ↳ **P2.3** | ⛔ 待做：`internal/store/`（`queries.go` + `keys.go`）逐个换成 pgx，方法签名尽量不变；三处上限改用上面的锁；`schema_migrations` 记录内容哈希以杀死「文件改了但库不变」 | P2 的主体，也是最大的一块 |
+| ↳ **P2.2b** | ✅ 迁移内容哈希守卫：`schema_migrations` 记 sha256，库与文件不符就拒绝启动（含旧迁移器建的库）。4 个测试 + 端到端反证（改文件→拒绝，撤销→通过，文件与 HEAD 逐字节相同） | 把 2026-10-16 那次事故从「靠守卫事后发现」变成「源头不可能发生」 |
+| ↳ **P2.3** | ⛔ 待做：`internal/store/`（`queries.go` + `keys.go`）改成 pgx。**执行清单见 `.ai/sessions/2026-10-16-p2-harness-and-locks-handoff.md` 第三节**：方言差异表、13 处原始句柄、要删的 SQLite 残留、sqlc 计划、三处上锁 | P2 的主体，也是最大的一块 |
 | P3 | `internal/httpx` → Gin 中间件；`internal/api` 移植 | 封套与状态码必须逐条对齐 |
 | P4 | 全链路起新版（Gin + pgx），243 测试 + 浏览器验证 | 切换前的最后一道闸 |
 | P5 | SQLite → PG 的数据搬运脚本 + 行数核对（5 报告 / 2 密钥 / 全部分享链接） | 切换当天不能靠猜 |
@@ -55,6 +56,9 @@
 
 - **P2 测试策略已裁决**（`.ai/decisions/2026-10-16-p2-test-strategy.md`）：B —— 每测一个 schema，
   从内嵌迁移现建现拆；闸门两层（`check.sh` 可跳过 DB，`test-pg.sh` 强制）。
+- **P2.3 做法已裁决**（`.ai/decisions/2026-10-16-p2-store-port-technique.md`）：**B 一次性大爆炸**
+  （A「接口 + 双实现交叉验证」是 AI 的建议，用户选了 B）。B 必须做的 5 项缓解写在文件里，
+  其中最关键的一条是：**测试断言冻结、不许为了变绿而重写**。
 - **更正交接文档里的一处计数**：需要显式加锁的「计数—插入」实际上有 **3 处**，不是文档写的
   「待批准上限 / 密钥上限 / 分享链接计数」：① `CreateApplication` 的 `KEY_MAX_PENDING`，
   ② `ClaimApplication` 与 `CreateManualKey` 共用的 `KEY_MAX_ACTIVE`，③ `CreateRenewal` 的
