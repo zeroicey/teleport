@@ -451,7 +451,8 @@ func TestResolveAgentKeyWithinGrace(t *testing.T) {
 	}
 }
 
-func TestTouchAgentKeyCounts(t *testing.T) {	s := newTestStore(t)
+func TestTouchAgentKeyCounts(t *testing.T) {
+	s := newTestStore(t)
 	now := NowMS()
 	key, _, err := s.CreateManualKey("k", 1, "", 100, now)
 	if err != nil {

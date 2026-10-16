@@ -629,13 +629,13 @@ func (s *Server) handleCreateKeyHandoff(w http.ResponseWriter, r *http.Request) 
 	}
 
 	httpx.OK(w, r, map[string]any{
-		"id":                  app.ID,
-		"label":               label,
-		"claim_secret":        claimSecret,
-		"url":                 s.handoffURL(app.ID, claimSecret),
-		"link_expires_at":     app.ClaimDeadline,
+		"id":                   app.ID,
+		"label":                label,
+		"claim_secret":         claimSecret,
+		"url":                  s.handoffURL(app.ID, claimSecret),
+		"link_expires_at":      app.ClaimDeadline,
 		"key_expires_in_hours": hours,
-		"prompt":              s.handoffPrompt(app, claimSecret),
+		"prompt":               s.handoffPrompt(app, claimSecret),
 	}, http.StatusCreated)
 }
 

@@ -47,3 +47,6 @@ dist/
 package-lock.json
 npm-shrinkwrap.json
 yarn.lock
+
+# Tool session state (pi task output, session logs).
+/.pi/

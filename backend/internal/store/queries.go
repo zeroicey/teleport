@@ -286,7 +286,8 @@ func (s *Store) ListReports(category string, limit, offset int) ([]domain.Report
 // Owning something you cannot enumerate is not ownership.
 //
 // An empty ownerKeyID is a real value, not a wildcard: it selects the reports
-// published by the root credential, whose owner_key_id is ''. Callers wanting
+// published by the root credential, whose owner_key_id is the empty string.
+// Callers wanting
 // "everything" must use ListReports.
 func (s *Store) ListReportsByOwner(ownerKeyID, category string, limit, offset int) ([]domain.Report, error) {
 	base := `SELECT id, title, category, format, '' AS content, metadata, created_at, updated_at, owner_key_id
