@@ -169,7 +169,7 @@ The first pass treated "47 frozen tests green" as sufficient evidence. A differe
 review disagreed, correctly: it built the pre-Gin tree (`git archive HEAD`) and the ported
 tree, drove **57 requests × 2 fixtures = 114** through both, and diffed status, 15 headers
 and body. **12 of 57 cases differed in each fixture, and no frozen test covered any of
-them.** Three were real, and all three are now fixed and pinned by
+them.** Four were real, and all are now fixed and pinned by
 `TestServeMuxPathSemanticsArePreserved` (12 subtests, each value measured against the old
 tree, and falsified — disabling the three fixes fails 11 of the 12).
 
@@ -180,6 +180,7 @@ tree, and falsified — disabling the three fixes fails 11 of the 12).
 | `GET {p}/api`, `{p}/s`, `{p}/k` | 307 → trailing slash | 404 JSON | 307 → trailing slash |
 | `GET {p}/api%2Fhealth` | 404 | **200** (matched `/api/health`) | 404 |
 | `GET {p}/k/a/b` (truncated link) | 200 (subtree) | 404 | 200 |
+| `GET {p}?a=1&b=2` | 307, `Location` **keeps the query**, `text/html` + 67B body | 307, query **dropped**, no body | 307, query kept |
 
 - The bare prefix is the one with a user-visible effect: it is the **documented entry URL**,
   and hcyj's Caddy uses `handle /yeciorez/teleport*`, which matches the no-slash form. The
@@ -190,6 +191,12 @@ tree, and falsified — disabling the three fixes fails 11 of the 12).
 - `/k/` needed the subtree because a Gin route cannot carry both `:id` and a catch-all at the
   same position. NoRoute delegates, and the handler reads an empty id exactly as the old
   `{id}`-less subtree pattern did.
+- The redirect also **dropped the query string and the `Content-Type`/body**, which the first
+  fix's hand-written `Location` header did not reveal. `http.Redirect` — what ServeMux itself
+  calls, via `RedirectHandler` — fixes both, and the target is built with ServeMux's own
+  `urlFromEscaped(path, RawQuery)` trick so the query survives a path clean.
+  A dropped query is not cosmetic: `{p}?a=1` is a plausible SPA deep link, and the redirect
+  would land the user on the wrong view.
 
 **This is the general lesson of P3, and it is why the ADR's own verification section was
 wrong the first time:** the frozen tests were written against ServeMux, so they encode only

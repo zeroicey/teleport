@@ -32,6 +32,13 @@
 - [x] **差分复审**（`git archive HEAD` 旧树 vs 新树，57 请求 × 2 夹具 = 114 次，比对状态+15 个头+body）：
       发现 12/57 形状不同，其中 3 个是真回归，已修（见 ADR 那一节）。
 - [x] 新守卫全部**反证过会红**：删 HEAD 注册 → 2 个红；禁用三处修复 → 12 个子测试中 11 个红。
+- [x] **第二轮复审**（reviewer 子代理，只读）在已推的移植上又找出 1 个真 bug + 若干注释/文档漂移：
+      `redirect307` 手写 `Location` 头时**丢掉了查询串**（旧实现用 `http.Redirect` + `urlFromEscaped`
+      保留它，并带 `text/html` 与 67B body）。已改为照 `http.Redirect` 做，实测与旧实现逐字节一致；
+      查询串用例已进永久守卫。注释/ADR 漂移（HEAD 守卫的机制说法、39 处样板注释、ADR 的
+      `gin.WrapH` 与「外层链未变」）已一并修正。复审同时确认：路由表逐条无误、`c.Writer` 与旧 `w`
+      等价、没有 `go func` 持有 `*gin.Context`（无数据竞争）、四个 `applyReportPatch/Delete` 调用点
+      都不会传空 id、无死代码。
 - [x] Gin 不加任何响应头（逐个 header 检查）；`gin.New()` 确认没装它的 logger/recovery。
 - [x] 压缩仍生效（3289 → 1516 字节，`Content-Length` 正确丢弃，gzip 精确还原）；
       `c.Abort()` 真的挡住 handler（坏凭据 → 401 且 0 行写入）。
@@ -55,6 +62,9 @@
 
 ## 五、不要重复
 
+0. **手写重定向头会把查询串和 body 一起丢掉。** 用 `http.Redirect`（ServeMux 自己就是调它），
+   并且按 `urlFromEscaped(path, RawQuery)` 拼目标。对照旧实现实测：不只是状态码，
+   `Location`、`Content-Type`、body 长度都要比 —— 否则会在“看起来对”的地方留下真 bug。
 1. **换路由/framework 只跑测试套件是不够的。** 47 个测试全绿的同时，文档里的主入口 URL
    变成了 JSON 404、一个原本被拒的 `%2F` 请求变成了 200。测试是「前人想到过要断言的行为」的
    证据，不是语义的证明。**做法**：`git archive HEAD` 出旧树 → 同一个探针文件驱动两边 →
