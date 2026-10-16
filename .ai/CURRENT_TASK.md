@@ -153,7 +153,10 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   ③ `CreateRenewal` 的「每把密钥至多一个待批续期」。**分享链接没有任何数量上限**
   （`RecordView` 只是 `view_count = view_count + 1`，在 PG 里本来就是原子的），照字面找会白找。
   已落地为 `LockPendingApplications` / `LockActiveKeys` / `LockPendingRenewals`（`pg.go`）。
-- 本仓库在 GitHub 上还不存在（本地目录 `/data/dev/teleport`，remote 名为 `teleport`）。
+- 仓库在 GitHub 上（`git@github.com:zeroicey/teleport.git`，分支 **`main`**）。
+  2026-10-16 核实：当时记忆库里记着「还不存在」，是错的 —— remote 一直有，只是本地领先 7 个
+  未推提交；P2.3 已把这些连同本次改动一起推上去（`ddce6b2..e74ebf3`）。
+  **本地与远端的分支名是 `main`，不是 `master`**（早期交接文档写成 master，已改正）。
 - 线上仍是旧版（hcyj，SQLite + net/http）。**但旧版目前已停掉（disabled+inactive），公网入口 502** —— 用户裁决「等重写版就绪再切」。
 - 与 clip 共享的基础设施改动要**同时想两边**（hcyj 的 Caddyfile 同时服务两个站点）。
 

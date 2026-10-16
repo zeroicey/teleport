@@ -1,6 +1,6 @@
 # teleport —— P2 中途交接（store 换 pgx 尚未开始）
 
-**Date:** 2026-10-16 · **Branch/Commit:** `master @ 1315b08` · **Duration:** 一个会话
+**Date:** 2026-10-16 · **Branch/Commit:** `main @ 1315b08`（当时记成 master，实为 main） · **Duration:** 一个会话
 · **State:** P0 ✅ / P1 ✅（附更正）/ **P2.1 ✅ / P2.2 ✅ / P2.3 ⛔ 未开工**
 · **Gate:** `scripts/check.sh`（无库可跑）与 `scripts/test-pg.sh`（强制真库）**两档都绿**
 

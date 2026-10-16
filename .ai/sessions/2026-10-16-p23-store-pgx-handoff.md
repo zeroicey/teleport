@@ -1,6 +1,6 @@
 # teleport — P2.3 完成（store 已换成 pgx + sqlc）+ 四路复审
 
-**Date:** 2026-10-16 · **Branch/Commit:** `master`（工作区未提交，基于 `1315b08`）· **Duration:** 一个会话
+**Date:** 2026-10-16 · **Branch/Commit:** `main @ e74ebf3`（已推送；基于 `1315b08`）· **Duration:** 一个会话
 · **State:** P0 ✅ / P1 ✅ / **P2 ✅（P2.1–P2.3）**；**P3 ⛔ 未开工**；线上旧版仍 `disabled`，公网 502
 · **Gate:** `scripts/check.sh`（无库档）与 `scripts/test-pg.sh`（强制真库）**两档都绿**，`-race` 干净
 
