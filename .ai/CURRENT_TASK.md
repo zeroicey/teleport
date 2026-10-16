@@ -1,9 +1,9 @@
 # Current task
 
-**Status:** 🚧 **P0 ✅ / P1 ✅（附更正）/ P2 ✅（P2.1–P2.3）/ P3 ✅** —— store 已换成 **pgx + sqlc**，
-HTTP 层已换成 **Gin**（`internal/api` 路由表 + handler；`internal/httpx` 认证中间件经适配器
-接入 Gin）。**`internal/api` 的 47 个测试与 `internal/httpx` 全部零改动通过**；两档闸门对
-**真库**全绿，`-race` 干净。**P4（全链路 + 浏览器验证）未开工；线上仍是旧版且已停（502）。**
+**Status:** 🚧 **P0 ✅ / P1 ✅（附更正）/ P2 ✅（P2.1–P2.3）/ P3 ✅ / P4 ✅** —— store 是 **pgx + sqlc**，
+HTTP 层是 **Gin**，**全链路已在真二进制上验过**：HTTP 契约 **64/64** + 真实浏览器 **15/15**
+（`scripts/verify-p4.sh`，第三档闸门），并做了 **旧树 vs 新树的差分跑：108 请求只有 1 处已知差异**。
+三档闸门全绿。**P5（数据搬运）/ P6（切换）未做；线上仍是旧版且已停（502）。**
 
 **P2.3 交付物**：`internal/store/` 的 `queries.go` + `keys.go` 改为 pgx；新增
 `internal/store/queries/*.sql`（sqlc 源）+ `internal/store/storedb/`（生成物）+ `backend/sqlc.yaml` +
@@ -75,6 +75,32 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 - ⛔ **未做：P4 全链路（`cmd` 起 Gin+pgx 端到端）+ 真实浏览器 + 大陆观测点**。
   现在绿的是「冻结断言对新 HTTP 层绿」，仍**不是**「在野契约端到端绿」。
 
+**P4 交付物（全链路 + 浏览器）**：
+- `scripts/verify-p4.sh` —— 编排：在 `teleport_test` 建私有 schema `p4`（**不新建库**：`teleport`
+  角色 `rolcreatedb=false`，且实例与 clip/registry/serenique 共用，不值得为冒烟测试授 `CREATEDB`），
+  构建、起服务、跑两档验证、拆 schema。含**端口预检**（已被残留服务反证过会红）。
+- `scripts/verify-p4-contract.sh` —— 真 socket 上的 64 项冻结合同（信封/命名/404-410/所有权 404-not-403/
+  HEAD 405 + `Allow: GET`/一次性领取/`format:"html"` 逐字节/CSP/续期只延长/限流键）。
+- `scripts/verify-teleport-browser.cjs` —— 原始 CDP 驱动 headless Chromium，15 项：
+  Vue 真的执行、路由守卫、**真实登录**、作用域为前缀的 `teleport_session`、数据渲染、
+  分享页 SSR、**Mermaid 在真实 CSP 下渲染成 `<svg>`**、无意外 console/网络错误。
+- 新 pitfall `2026-10-16-verification-that-cannot-fail.md`。
+
+**P4 的关键证据（差分）**：用 `git archive 43cea51`（P3 之前的 net/http 树）构建旧二进制，
+与新版在**同一请求集**上逐条对比 → **108 请求，1 处差异**，且那处只是
+`GET {前缀}/api%2Fhealth` 的 **body** 不同（两版都是 404；新：JSON 信封，旧：net/http 纯文本）。
+这条证据同时**排除**了两个子代理候选发现：`/ai.md` 的 405 与 2 MB body 的 400 **两版相同**
+（既有行为，不是 P3 回归；超限的 *content 字段* 才是 413，有冻结测试盯着）。
+
+**P4 已实测 / 未实测**：
+- ✅ 三档闸门绿；环境干净（`teleport_test` 只剩 `public`；生产意图库 `teleport` 仍 **0 张表**；
+  clip 的 8790 未被碰；无残留进程）。
+- ⛔ **未做：大陆观测点**（P4 全程 loopback；ADR 验收第 4 条只能等 P6 之后）。
+- ⛔ **未做：截图未经人眼确认**（当前模型不支持看图；结论来自 DOM 断言，比截图强，但截图本身未目视）。
+- ⛔ **未做：`ENVIRONMENT=production` 的 Gin release 模式**；`format:"html"` 的字节比较用了 `$(...)`
+  （会吃掉尾部换行，需 `cmp` 才算字节级证据）；合同 14 只在 API 侧间接覆盖（DB 侧由
+  `TestNoPlaintextCollected` 盯着）。
+
 **Updated:** 2026-10-16
 **目标：** 把 teleport 重写到 Gin + pgx/sqlc + PostgreSQL，**在野契约逐字节不变**，
 然后部署到 hpcore（本机），让 hcyj 只剩转发。
@@ -136,7 +162,7 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 | ↳ **P2.2b** | ✅ 迁移内容哈希守卫：`schema_migrations` 记 sha256，库与文件不符就拒绝启动（含旧迁移器建的库）。4 个测试 + 端到端反证（改文件→拒绝，撤销→通过，文件与 HEAD 逐字节相同） | 把 2026-10-16 那次事故从「靠守卫事后发现」变成「源头不可能发生」 |
 | ↳ **P2.3** | ✅ 完成：`queries.go` + `keys.go` 改 pgx；sqlc 生成 `storedb`（两张动态 `SET` 列表用 `COALESCE(sqlc.narg(...))` + `CASE` 表达为单条静态语句——ADR 的 Revisit 条款担心的那点已被实测证明可行）；三处上限用已验证的 advisory lock；`SELECT ... FOR UPDATE` 未被采用（无法锁不存在的行）。断言未为了变绿而重写：唯一改断言机制的一处是 `TestNoPlaintextCollected` 的 `sqlite_master` → `information_schema`（PG 无 sqlite 元数据表），**被断言的性质（明文永不入库）原样保留** | P2 的主体 |
 | **P3** | ✅ 完成：Gin 路由表 + `gin.HandlerFunc` handler（`c.Param`）；`internal/httpx` 的认证中间件用 `httpx.GinMiddleware` 适配成 Gin 中间件；信封/session/principal 仍是框架无关的纯函数。**零测试改动**通过。决策与 gin 版本证据见 `2026-10-16-p3-gin-integration.md` | 封套与状态码逐条对齐 —— 已逐条验证 |
-| P4 | 全链路起新版（Gin + pgx），243 测试 + 浏览器验证 | 切换前的最后一道闸 |
+| **P4** | ✅ 完成：全链路起新版（Gin + pgx + 内嵌 SPA + 真 PG），HTTP 契约 **64/64** + 真实浏览器 **15/15**；另做**差分跑**（P3 之前的树 vs 新版，108 请求 / 1 处已知差异）。第三档闸门 `scripts/verify-p4.sh`。**未做：大陆观测点（要等 P6 切换后）** | 切换前的最后一道闸 —— 已过，但外部校验（P5/P6）仍在 |
 | P5 | SQLite → PG 的数据搬运脚本 + 行数核对（5 报告 / 2 密钥 / 全部分享链接） | 切换当天不能靠猜 |
 | P6 | 切到 hpcore（frpc 隧道 8788）。**hcyj 的 Caddy 需要改**：加 `teleport.hcyj.xyz` site block + 证书，并保留原有 `handle /yeciorez/teleport*`（见 `2026-10-16-teleport-own-hostname.md`）。两个入口都必须在同一窗口验证 | 用户要的最终形态：hcyj 只转发；且新域名不再挤在别人的路径下 |
 
