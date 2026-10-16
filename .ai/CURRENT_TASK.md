@@ -9,6 +9,24 @@
 
 ---
 
+## 线上现状（2026-10-16 实测）
+
+| 事实 | 值 |
+| --- | --- |
+| teleport 的公网入口 | 仍是 `https://api.hcyj.xyz/yeciorez/teleport`（hcyj 的 Caddy `handle /yeciorez/teleport*` → `172.17.0.1:8788`，前缀保留） |
+| 现在是什么状态 | **502**。hcyj 上 `teleport` unit ：`disabled` + `inactive`；frps 只监听 `8790`（clip），`8788` 无监听 |
+| `teleport.hcyj.xyz` | **不存在**。DNS 解析到同一个 IP，但 hcyj 的 Caddyfile 里**没有任何 site block**、也没有证书 → TLS 直接失败（`code=000`，`no peer certificate available`）。全仓库与记忆库里搜不到这个字符串 |
+| 有自己独立域名的那个是 | **clip**（`clip.hcyj.xyz`）。Caddyfile 注释里写着 `A whole host of its own, unlike teleport` —— 很可能就是这行造成了「teleport 也有自己的域名」的印象 |
+| `https://api.hcyj.xyz/` 的 200 | 那是 Caddy 的 fallback `handle` → `172.17.0.1:3000`（**别的服务**），不是 teleport。链路/TLS 健康不等于 teleport 可用 |
+
+要临时恢复旧版（让 8788 重新有服务）：`ssh hcyj 'systemctl enable --now teleport'`。
+**主意愿是「无人使用，等重写版就绪再切」，所以 502 是当前预期状态**，不是事故。
+
+若要真的把 teleport 挪到自己的域名，那是**冻结清单里「路由前缀 `/yeciorez/teleport/*`」的改动**，
+必须先改决策记录；而且 `expires_at=0` 的在野链接会**永久**失效，旧前缀必须继续保留。
+
+---
+
 ## 现在这个仓库是什么
 
 2026-10-16 从共用仓库里拆出来：用户裁决「分成两个仓库 不要塞在一个项目里面去了」。
@@ -65,7 +83,7 @@
   「每把密钥至多一个待批续期」。**分享链接没有任何数量上限**（`RecordView` 只是
   `view_count = view_count + 1`，在 PG 里本来就是原子的），照字面找会白找。
 - 本仓库在 GitHub 上还不存在（本地目录 `/data/dev/teleport`，remote 名为 `teleport`）。
-- 线上仍是旧版（hcyj，SQLite + net/http），用户裁决「等重写版就绪再切」。
+- 线上仍是旧版（hcyj，SQLite + net/http）。**但旧版目前已停掉（disabled+inactive），公网入口 502** —— 用户裁决「等重写版就绪再切」。
 - 与 clip 共享的基础设施改动要**同时想两边**（hcyj 的 Caddyfile 同时服务两个站点）。
 
 ## 长期约束（改动前必须知道）
