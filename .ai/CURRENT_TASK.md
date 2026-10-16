@@ -151,7 +151,7 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   `verify` —— 「目标 vs 源」变成了「A vs A」。已改为篡改**目标**、参照仍是原源。
 - 🟠 **`ownership_boundary_unchanged` 一项**（后加的检查）**没有任何反证用例** —— 后来才加的检查
   是这类漏洞的高发区，因为它天然没有历史对照。已补两个（root 报告被改归某把密钥、
-  密钥的报告被改成 root 报告）。现在 **20 项检查每一项都有对应的篡改用例**（Go 侧 15 个）。
+  密钥的报告被改成 root 报告）。现在 **20 项检查每一项都有对应的篡改用例**（Go 侧 18 个）。
 - 🟠 **`row_equality[key_renewals]` 是空绿**（真源里这张表 0 行）—— 现在 detail 直接写
   `0 rows — … this check compared nothing`，让空绿在日志里可见。
 - 🟠 **`TestVerifyDetectsEachKindOfTamper` 在无库档里是「空绿」**：父测试不 skip、只有子测试
@@ -174,25 +174,61 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 - **非有限值**：SQLite 能存 `9e999`（= Inf），而 `sqlite3 -json` 会打出**非法 JSON**（裸 `Inf`）
   → 导入**响亮失败**（不是静默写坏值）。这是已接受的行为（错误信息在 pitfall 里记了原因）。
 - 唯一的静默失败就是上面 🔴 那条超范围整数 —— **修好之后，本节的每一项都变成红或明确拒绝**。
-- 🔴 **`json.Number` 没被处理**：`sqlite3 -json` 把整数和实数都解码成 `json.Number`，而我的
-  `anyToInt64/anyToFloat64` 只认 `int64/float64/string` → 每一个值都会报错（幸好是响亮失败）。
-  同时把 `fmt.Sscanf("%d")` 换成 `strconv.ParseInt`：前者会把 `720.0` **静默截断成 720**。
-- 🟠 **`report_content` 摘要在真数据上「靠运气」通过**：源给的是原始 JSON 文本，store 给的是
-  解码后的 map 再编码，键序不同。真数据的每个 `metadata` 恰好都是字母序，所以它绿了。
-  已改成两侧都过 `canonicalJSON`。
-- 🟠 **负向对照第一版是重言式**：我把篡改施加在**源文件**上，然后又拿这个被篡改的文件当源去
-  `verify` —— 「目标 vs 源」变成了「A vs A」。已改为篡改**目标**、参照仍是原源。
-- 🟠 **`TestVerifyDetectsEachKindOfTamper` 在无库档里是「空绿」**：父测试不 skip、只有子测试
-  skip，`go test` 于是打印 `--- PASS` 而实际什么都没断言。已按 storetest 的文档在父测试开头
-  调 `SkipWithoutDatabase`。
-- 🟠 **`teleport_test.public` 里躺着一整套陈旧 schema**（P4 会话期间 18:08 某次没带
-  `search_path` 的迁移留下的），与 P4 交接里「环境干净」的说法不符 —— 那句话说的是
-  「只剩 `public` 这个 schema」，不是「它是空的」。已清掉（连同我手工实验留下的 `p5_scratch`）。
-- 🟠 **目标自省把视图当成表**：`information_schema.columns` 也描述视图，`v_live_shares` 于是被
-  报成「不认识的表」。已改成只读 `BASE TABLE`，并把期望的视图单列出来断言其存在。
+
+**P5 第二轮：一次独立审查（`subagent` reviewer）提出的 8 项，已逐条处理。**
+结论：无 BLOCKER，但其中两项是「20 项检查仍可能对**被改过的数据**报绿」的洞，必须在不可逆的
+生产搬运之前补掉 —— 已补。
+
+- 🟠 **文本比较的两侧出自同一条有损管道**（`sqlite3 -json` + `encoding/json`；Go 的 JSON 解码器会把
+  **非法 UTF-8 替换成 U+FFFD**），于是含非法字节的文本会被**两侧同样替换**、比较相等、报绿。
+  **已修**：`db_rendered_text` 升级为 **`db_hex_bytes`**，比的是**字节**
+  （源 `lower(hex(col))` vs 目标 `lower(encode(convert_to(col::text,'UTF8'),'hex'))`），
+  两侧都由各自的数据库产生。**实测真源 0 个文本格子含非法 UTF-8** —— 是潜在洞而非活洞。
+- 🟠 **DOUBLE PRECISION 完全没有独立检查**（原先故意把 REAL 排除在渲染比较之外），而且夹具里的
+  REAL 全是短位数（720.0/24.0/72.0/0），**闸门抓不到精度丢失**。审查者建议的修法
+  （`hex(col)` 取 IEEE754 字节）**实测不成立**：`hex(0.1)` 给的是 `302E31`（"0.1" 的文本字节），
+  不是 `3fb999999999999a`。**实际修法**：`source.go` 里 REAL 列改读 SQLite 自己的
+  `printf('%!.17g', col)`，并用 `CASE WHEN typeof(col)='real'` 保护（否则 `printf` 会把 TEXT
+  强转成数字：`'abc'`→`0.0`，那是自己引入的静默损坏）→ **JSON float 路径不再参与数据搬运**；
+  夹具换上一个真正需要 17 位的值 `0.30000000000000004`，新增 `TestImportPreservesRealPrecision`
+  （用 PG 的 `float8send` 比 IEEE754 字节）。顺带修正一处**我自己写错的注释**：原文称
+  「SQLite 的 CAST AS TEXT 用 15 位有效数字」—— 实测是**最短往返**的，见 pitfall 的更正文。
+- 🟠 **`beginTx` 的断言其实拦不住事务**：pgx v5 的 `Tx` 接口**自己就有 `Begin`**（伪嵌套事务 =
+  savepoint），所以 `Begin(ctx) (pgx.Tx, error)` 这个方法集 **`*pgxpool.Tx` 也满足**，于是「传事务
+  进来」会被接受并**静默开 savepoint**，而不是按注释说的失败。**已修**：显式断言
+  `*pgxpool.Pool`；新增 `TestImportRefusesATransactionNotAPool`，并**反证过**
+  （换回弱断言 → 该测试变红：「Import accepted a transaction」）。
+- 🟡 **`row_equality` 的列分隔符可被值伪造**：注释声称「控制字符不可能出现在这些列里」——
+  对 `content`/`note`/`purpose` 这类任意文本而言是**假的**；两行可能拼出同一个字符串而比较相等，
+  且失败信息会指错列。**已修**：改成**长度前缀**拼接（`len:cell`），不可伪造，
+  `firstDifference` 现在也能指出正确的列；新增 `TestJoinCanonicalRowCannotBeForgedByAValue`。
+- 🟡 **`metadata` 为 `'5'` / `'[1,2]'` 时 `report_content` 会对逐字节正确的副本报错**（两库的 CHECK
+  都只要求「合法 JSON」；store 的 `decodeMetadata` 一律降级成 `{}`，而 `canonicalJSON` 保留了
+  `'5'`）。**已修**：`canonicalJSON` 改为**完全镜像 store 的读法**；旧断言「非法 JSON 必须报错」
+  随之**显式改掉**（行为是故意改的，测试注释里写明了理由，row_equality 仍比原始字节）。
+- 🟡 **「空目标检查」的注释夸大了它做的事**：`SELECT count(*)` 只拿 `AccessShareLock`，
+  **不阻塞**并发写者，所以「并发写不可能插入」是假的；真正兜住的是提交前的重数，
+  而**保计数的**并发改动（删一条 + 插一条）根本发现不了。**已修**：注释改成事实，
+  并写明 target 必须是空闲的、刚迁移的库。
+- 🟡 **打印的 sha256 未必描述被导入的字节**（CLI 先哈希、`Import` 再读一次）。**已修**：
+  导入后**再哈希一次**，不一致就非零退出并提示用 `-replace -yes` 重来。
+- 🟡 **`scripts/verify-p5.sh` 四处**：① `P5_SKIP_NEGATIVE=1` 时仍打印「every check can fail」
+  → 已按实际情况措辞；② `P5_SCHEMA` 无守卫地插进 `DROP SCHEMA ... CASCADE`
+  （`P5_SCHEMA=public` 会删掉 `teleport_test.public`）→ 已加标识符与保留名校验；
+  ③ DSN 把口令放进 argv（共享主机上任何 `ps` 都看得到；且口令含 `@:/?#` 会静默拼出另一个 DSN）
+  → **已改成 DSN 不带口令 + `export PGPASSWORD`**（pgx 从环境读；两个方向都实测过：
+  有它则连上、无它则 28P01）；④ 「用了不同实现读源」的说法不成立（同一条 `sqlite3` 二进制）
+  → 措辞已改。
+- 🟡 `checkColumnsMatch` 只比列名（类型/可空性靠 `convertValue` 的未知类型拒绝间接兜住）——
+  检查名 `column_sets` 本身是准确的，已在注释里写明它**不比类型**。
+- ✅ 审查**确认无缺陷**的部分：int64 边界的开闭区间、NULL vs 空串从不混淆、事务形状与
+  FK/TRUNCATE 顺序、脚本的退出码纪律。**时钟**：`checkShareSemantics` 与 store 的 `ResolveShare`
+  用的是**同方向同边界**的比较（`expires_at <= now`），所以**不会假通过**；唯一的错误模式是
+  「恰好在这一毫秒过期」导致的**假失败**；`checkAgentKeys` 把同一个 `now` 传进 SQL 谓词，
+  **完全没有窗口**。
 
 **P5 已实测 / 未实测**：
-- ✅ 四档闸门：`check.sh`（无库，**152 项 SKIP** 并大声提示）、`test-pg.sh`（强制真库）、
+- ✅ 四档闸门：`check.sh`（无库，**154 项 SKIP** 并大声提示）、`test-pg.sh`（强制真库）、
   `verify-p4.sh`（未重跑，P4 之后 Go/前端未改）、`verify-p5.sh`（15/15 + 负向对照）。
 - ✅ 真源真库彩排：17 行、5 张表、`expires_at=0` 的 2 个、`is_active=0` 的 2 个，全部对上。
 - ✅ 负向对照：把目标里 2 个被吊销的链接改活、2 个永久链接加上过期时间 → 验证**按名字**变红

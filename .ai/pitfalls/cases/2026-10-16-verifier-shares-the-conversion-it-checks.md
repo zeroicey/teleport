@@ -83,11 +83,28 @@ SELECT id::text, created_at::text, ... FROM t;
 
 于是同一个坏值会渲成 `9.2233720368547758e+18`（源）vs `-9223372036854775808`（目标）→ **红**。
 
-只比整数列与文本列，**故意不比 REAL 列**：SQLite 的 `CAST AS TEXT` 用 15 位有效数字，
-PostgreSQL 的 `::text` 用最短往返表示，两者对**位完全相同**的 double 也会渲染出不同字符串——
-拿它们对比会产生假警报，而会喊狼来了的检查很快就会被无视。REAL 的保证来自另一条：
-`Float64()` 往返是位精确的（实测 0.1 / 最小次正规数 / 0.30000000000000004 / 最大有限 double
-全部位级一致），加上现在 `integral` 的范围拒绝。
+**第一版这里写错了，而且正是「把假设当事实」的又一次**：当时写的是「SQLite 的 `CAST AS TEXT`
+用 15 位有效数字」。实测（`sqlite3 :memory:`）：
+`CAST(0.30000000000000004 AS TEXT)` → `0.30000000000000004`，`CAST(5e-324 AS TEXT)` →
+`4.9406564584124654e-324`，`printf('%!.17g', 0.1)` → `0.1` —— SQLite 的 REAL→TEXT 是**最短往返**的，
+不是 15 位；`sqlite3 -json` 也一样。所以「渲染会丢位数」这个担心在**这个 shell 版本上不成立**，
+但**它无法被本工具发现**：比较两侧都走同一条 JSON float 管道，真的丢了位数也会一起丢、一起相等。
+
+修法因此改成**堵掉那条管道**，而不是去比渲染：`source.go` 里 REAL 列不再作为 JSON number 读，
+改读 SQLite 自己的 `printf('%!.17g', col)`（`CASE WHEN typeof(col)='real'` 才转，否则原样——
+否则 `printf` 会把 TEXT 强转成数字，`'abc'` → `0.0`，那是**自己引入**的静默损坏）。
+于是 REAL 的精度保证是结构性的：JSON float 路径不再参与，`Float64()` 只做 ParseFloat（精确），
+`integral` 的范围拒绝仍在。夹具里现在也有一个真正需要 17 位的值（`0.30000000000000004`）,
+`TestImportPreservesRealPrecision` 用 PG 的 `float8send` 比 IEEE754 字节。
+
+`db_rendered_text` 也因此改名并升级为 **`db_hex_bytes`**：比的是**字节**
+（源 `lower(hex(col))` vs 目标 `lower(encode(convert_to(col::text,'UTF8'),'hex'))`），
+因为文本渲染本身也要经过 `sqlite3 -json` + `encoding/json`，而 Go 的 JSON 解码器会把**非法 UTF-8
+替换成 U+FFFD** —— 那条路上一侧的替换会在另一侧同样发生，**比文本永远发现不了**。字节能发现。
+（实测真源：**0 个**文本格子含非法 UTF-8，所以这是个**潜在**洞而非活洞 —— 而这正是最便宜关闭它的时候。）
+只比整数列与文本列，REAL 仍然排除：`hex()` 对 REAL 给的是它的**文本**字节
+（实测 `hex(0.1)` = `302E31`，即 "0.1"，**不是** IEEE754 的 `3fb999999999999a`），
+而两库对整数的渲染本来就不同（`720.0` vs `720`），比它们只会产生假警报。
 
 ## Guard
 

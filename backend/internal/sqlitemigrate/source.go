@@ -99,12 +99,12 @@ type Reader interface {
 	MigrationVersions(ctx context.Context) ([]string, error)
 	// Tables returns every table in import order with all of its rows.
 	Tables(ctx context.Context) ([]Table, error)
-	// RenderedText returns each row's requested columns rendered to text by
-	// SQLite itself, keyed by the table's primary key. It exists so that one
-	// verification check can compare two renderings, neither of which was
+	// RenderedHex returns each row's requested columns as the exact bytes
+	// SQLite holds, keyed by the table's primary key. It exists so that one
+	// verification check can compare two byte strings, neither of which was
 	// produced by this package's own conversion; see
-	// Verifier.checkDatabaseRenderedText for why that matters.
-	RenderedText(ctx context.Context, table string, columns []string) (map[string][]RenderedValue, error)
+	// Verifier.checkDatabaseHexBytes for why that matters.
+	RenderedHex(ctx context.Context, table string, columns []string) (map[string][]RenderedValue, error)
 }
 
 // ErrSourceHasWAL means a SQLite sidecar file was found next to the source.
@@ -116,7 +116,8 @@ type Source struct {
 	bin  string
 }
 
-// RenderedValue is one column value rendered to text by a database.
+// RenderedValue is one column value rendered by a database: its bytes (as
+// lowercase hex) or SQL NULL.
 //
 // Null distinguishes SQL NULL from the empty string: they are different values in
 // both databases and must stay different here.
@@ -342,23 +343,30 @@ func (s *Source) Tables(ctx context.Context) ([]Table, error) {
 	return out, nil
 }
 
-// RenderedText renders the requested columns with SQLite's own CAST(col AS TEXT)
-// and returns them keyed by primary key.
+// RenderedHex renders the requested columns as SQLite's own lower(hex(col)) — the
+// exact bytes SQLite holds — and returns them keyed by primary key.
 //
 // The rendering is done by the database, not by Go. That is the entire point of
 // the method: it is the only place a value passing between the two databases can
 // be compared without going through this package's convertValue, which is the
-// code under test. See Verifier.checkDatabaseRenderedText.
-func (s *Source) RenderedText(ctx context.Context, table string, columns []string) (map[string][]RenderedValue, error) {
+// code under test. See Verifier.checkDatabaseHexBytes.
+//
+// Bytes rather than text because bytes are strictly stronger here. A text
+// rendering would itself arrive through this tool's `sqlite3 -json` + encoding/json
+// pipe, and Go's JSON decoder replaces invalid UTF-8 with U+FFFD — so a
+// substituted byte would appear on BOTH sides of the comparison and pass. hex()
+// returns the bytes as they are stored, and the target side compares them against
+// PostgreSQL's own bytes for the same value.
+func (s *Source) RenderedHex(ctx context.Context, table string, columns []string) (map[string][]RenderedValue, error) {
 	key := PrimaryKey[table]
 	selects := make([]string, 0, len(columns)+1)
 	selects = append(selects, "CAST("+quoteIdent(key)+" AS TEXT) AS k")
 	for _, c := range columns {
-		selects = append(selects, "CAST("+quoteIdent(c)+" AS TEXT) AS "+quoteIdent(c))
+		selects = append(selects, "lower(hex("+quoteIdent(c)+")) AS "+quoteIdent(c))
 	}
 	rows, err := s.query(ctx, "SELECT "+strings.Join(selects, ", ")+" FROM "+quoteIdent(table))
 	if err != nil {
-		return nil, fmt.Errorf("render source table %s as text: %w", table, err)
+		return nil, fmt.Errorf("read source table %s as hex: %w", table, err)
 	}
 
 	out := make(map[string][]RenderedValue, len(rows))
@@ -399,7 +407,7 @@ func (s *Source) readTable(ctx context.Context, name string) (*Table, error) {
 	}
 	names := make([]string, len(cols))
 	for i, c := range cols {
-		names[i] = quoteIdent(c.Name)
+		names[i] = selectExpression(c)
 	}
 	rows, err := s.query(ctx, "SELECT "+strings.Join(names, ", ")+" FROM "+quoteIdent(name))
 	if err != nil {
@@ -418,6 +426,49 @@ func (s *Source) readTable(ctx context.Context, name string) (*Table, error) {
 		table.Rows = append(table.Rows, values)
 	}
 	return table, nil
+}
+
+// selectExpression is the SELECT expression for one column.
+//
+// A REAL column is read through SQLite's own printf rather than as a JSON number.
+// Two reasons, both about precision:
+//
+//   - `sqlite3 -json` has to render a double as JSON, and the JSON number path is
+//     then re-parsed by encoding/json into a float64. That path happens to be
+//     round-trip exact in the shell version measured here, but nothing in this
+//     tool would notice if a different shell rendered fewer digits: the
+//     comparison in verify.go converts the source through the same parse, so a
+//     shortened rendering would agree with itself and pass. Reading the value as
+//     SQLite's own shortest-round-trip text takes the JSON float path out of the
+//     data path entirely.
+//   - `%!.17g` is SQLite's round-trip form (measured: 0.1 → "0.1",
+//     0.30000000000000004 → "0.30000000000000004", 5e-324 →
+//     "4.9406564584124654e-324", 1.7976931348623157e308 as written). Seventeen
+//     significant digits is the standard bound that uniquely identifies a
+//     binary64; the `!` flag asks SQLite for the shortest form that round-trips.
+//
+// The CASE guard is not decoration: printf() on a TEXT or NULL value in a
+// REAL-affinity column would coerce it ('9e999' → Inf, 'abc' → 0.0, NULL → NULL),
+// silently inventing a number where SQLite's dynamic typing holds something else.
+// Only a genuine `real` storage class is re-rendered; everything else is passed
+// through exactly as stored.
+func selectExpression(c Column) string {
+	if !hasRealAffinity(c.DeclType) {
+		return quoteIdent(c.Name)
+	}
+	name := quoteIdent(c.Name)
+	return "CASE WHEN typeof(" + name + ") = 'real' THEN printf('%!.17g', " + name + ") ELSE " + name + " END AS " + name
+}
+
+// hasRealAffinity reports whether a declared type gives a column REAL affinity.
+//
+// These are SQLite's own affinity rules (the declared type CONTAINS "REAL", "FLOA"
+// or "DOUB"), deliberately reimplemented rather than guessed: the tool has to know
+// which columns hold a double, and the declared type is the only place SQLite
+// says so.
+func hasRealAffinity(declType string) bool {
+	upper := strings.ToUpper(declType)
+	return strings.Contains(upper, "REAL") || strings.Contains(upper, "FLOA") || strings.Contains(upper, "DOUB")
 }
 
 // columns reads a table's column list from the database's own catalogue.

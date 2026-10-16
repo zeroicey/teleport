@@ -67,6 +67,18 @@ case "$DBNAME" in
   *) die "P5_DBNAME=$DBNAME does not contain \"test\". This script creates and drops a schema, so it must never point at the production database." ;;
 esac
 
+# The schema name is interpolated into DROP SCHEMA ... CASCADE below, so it is
+# validated the same way the database name is. Without this, P5_SCHEMA=public would
+# drop `teleport_test.public` — the one object in the test database that this
+# script is not allowed to touch, and the object an earlier session's stray tables
+# were hiding in.
+for candidate in "$SCHEMA" "$NEG_SCHEMA"; do
+  case "$candidate" in
+    *[!A-Za-z0-9_]*|"") die "P5_SCHEMA=\"$candidate\" is not a plain identifier; refusing to interpolate it into DROP SCHEMA" ;;
+    public|pg_*|information_schema) die "P5_SCHEMA=\"$candidate\" is a reserved schema name; refusing to drop it" ;;
+  esac
+done
+
 PGPW="${P5_PGPASSWORD:-}"
 if [ -z "$PGPW" ] && [ -r /data/services/teleport/.pgpassword.tmp ]; then
   PGPW="$(cat /data/services/teleport/.pgpassword.tmp)"
@@ -75,6 +87,13 @@ if [ -z "$PGPW" ] && sudo -n true 2>/dev/null; then
   PGPW="$(sudo -n cat /data/services/teleport/.pgpassword.tmp 2>/dev/null || true)"
 fi
 [ -n "$PGPW" ] || die "no PostgreSQL password. Set P5_PGPASSWORD."
+
+# Exported, not just passed to psql: the import tool is given a DSN with no
+# password in it (see DSN_FOR) and reads PGPASSWORD from the environment, which is
+# what keeps the credential out of the tool's argv. Probed both ways — with this
+# set the tool authenticates, with it unset it fails with 28P01 — so a missing
+# export cannot silently turn into "connected as someone else".
+export PGPASSWORD="$PGPW"
 
 # Unscoped, for CREATE/DROP SCHEMA.
 psql_admin() { # <sql>
@@ -95,7 +114,12 @@ psql_scoped() { # <schema> <sql>
   fi
 }
 
-DSN_FOR() { printf 'postgres://teleport:%s@127.0.0.1:5432/%s?sslmode=disable&search_path=%s' "$PGPW" "$DBNAME" "$1"; }
+# The DSN deliberately carries NO password: pgx reads PGPASSWORD from the
+# environment, and this string is passed on the tool's argv, where any local `ps`
+# on this shared host would otherwise expose the credential. It also removes the
+# class of bug where a password containing @ : / ? or # silently produces a
+# different DSN (which fails only by luck, and with a misleading message).
+DSN_FOR() { printf 'postgres://teleport@127.0.0.1:5432/%s?sslmode=disable&search_path=%s' "$DBNAME" "$1"; }
 
 CREATED_SCHEMAS=()
 cleanup() {
@@ -153,9 +177,12 @@ fi
 sq() { sqlite3 "file:$SOURCE?mode=ro&immutable=1" "$1"; }
 [ "$(sq 'PRAGMA integrity_check;')" = "ok" ] || die "the source failed PRAGMA integrity_check"
 
-# The source side of the inventory, read with the sqlite3 shell — a different
-# implementation from the one the importer uses, so a bug in either cannot make
-# both agree on the wrong answer.
+# The source side of the inventory. It goes through the SAME sqlite3 binary the
+# importer shells out to — so this is an independent SQL statement and an
+# independent arithmetic path, not an independent SQLite implementation. (An
+# earlier version of this comment claimed otherwise; the genuinely independent
+# cross-check is the Go tool's db_hex_bytes[...] comparison, where each database
+# renders its own bytes.)
 say "source inventory (read with the sqlite3 shell, independently of the import tool)"
 src_reports="$(sq 'SELECT count(*) FROM reports;')"
 src_shares="$(sq 'SELECT count(*) FROM share_tokens;')"
@@ -259,8 +286,10 @@ echo "  all counts match the source and the expected inventory"
 # which asks whether a target agrees with its own source — it does, so the control
 # passed on a broken database. It had to be fixed before it could produce a true
 # statement, which is exactly the failure mode this section exists to catch.
+NEGATIVE_RAN=0
 if [ "${P5_SKIP_NEGATIVE:-0}" = "1" ]; then
   say "negative control SKIPPED (P5_SKIP_NEGATIVE=1)"
+  echo "  NOTE: with P5_SKIP_NEGATIVE=1 this run has NOT shown that the checks can fail."
 else
   say "negative control: a tampered target must fail verification, by name"
   psql_admin "DROP SCHEMA IF EXISTS $NEG_SCHEMA CASCADE" >/dev/null || die "could not drop $NEG_SCHEMA"
@@ -293,12 +322,17 @@ means nothing."
     grep -q "FAIL $want" "$NEG_LOG" || die "the control failed, but not at $want — it may be failing for an unrelated reason. See ${NEG_LOG#$REPO/}"
   done
   echo "  verification failed as required, at both named checks (see ${NEG_LOG#$REPO/})"
+  NEGATIVE_RAN=1
 
   psql_admin "DROP SCHEMA IF EXISTS $NEG_SCHEMA CASCADE" >/dev/null
   CREATED_SCHEMAS=("$SCHEMA")
 fi
 
-say "P5 PASSED — the real source imports into the real schema and every check can fail"
+if [ "$NEGATIVE_RAN" = "1" ]; then
+  say "P5 PASSED — the real source imports into the real schema and every check can fail"
+else
+  say "P5 PASSED (WITHOUT THE NEGATIVE CONTROL) — the import and the checks are green, but this run has not shown that the checks can fail"
+fi
 echo "  source:    $SOURCE (sha256 $SOURCE_SHA)"
 echo "  schema:    $DBNAME.$SCHEMA (dropped on exit)"
 echo "  inventory: reports=$EXPECT_REPORTS share_tokens=$EXPECT_SHARES agent_keys=$EXPECT_KEYS key_applications=$EXPECT_APPS key_renewals=$EXPECT_RENEWALS"

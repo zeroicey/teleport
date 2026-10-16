@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -133,7 +134,7 @@ func (v *Verifier) run(ctx context.Context) error {
 	v.checkRowsEqual(ctx, byName, target)
 	v.checkReportContent(byName)
 	v.checkOwnershipBoundary(byName)
-	v.checkDatabaseRenderedText(ctx, byName, target)
+	v.checkDatabaseHexBytes(ctx, byName, target)
 	v.checkShareSemantics(byName)
 	v.checkAgentKeys(byName)
 	return nil
@@ -270,9 +271,8 @@ func (v *Verifier) checkReportContent(source map[string]*Table) {
 	v.add("report_content", ok, "%s", detail)
 }
 
-// checkDatabaseRenderedText compares each row's values as rendered by the SOURCE
-// database against the TARGET database's own rendering, and is the one check that
-// never calls convertValue.
+// checkDatabaseHexBytes compares each row's values as the exact bytes each
+// database holds, and is the one value check that never calls convertValue.
 //
 // That independence is the whole reason it exists. Every other value comparison
 // here converts the source through the same function the import uses, so a bug in
@@ -280,20 +280,26 @@ func (v *Verifier) checkReportContent(source map[string]*Table) {
 // wrong value is in the database. This is not hypothetical — a source value of
 // 9223372036854775808 (above int64's maximum, so SQLite stores it with REAL
 // affinity) reached int64(), wrapped to -9223372036854775808, was written to
-// PostgreSQL, and passed every check in this file. Rendering both sides with their
-// own database catches it, because SQLite says "9.2233720368547758e+18" and
-// PostgreSQL says "-9223372036854775808" and no Go code is involved in either
-// string.
+// PostgreSQL, and passed every check in this file.
 //
-// Only integer and text columns are compared. A REAL column is excluded on
-// purpose: SQLite's CAST to TEXT uses 15 significant digits while PostgreSQL's
-// ::text uses the shortest round-trip representation, so their renderings differ
-// for values that are bit-identical — a check that compares them would report a
-// difference where there is none, and a check that cries wolf gets ignored. For
-// REAL columns the assurance is the Float64 round-trip, which preserves the exact
-// IEEE754 bits (measured: 0.1, the smallest subnormal, 0.30000000000000004 and the
-// largest finite double all landed bit-exact), plus the range refusal in integral.
-func (v *Verifier) checkDatabaseRenderedText(ctx context.Context, source map[string]*Table, target *TargetSchema) {
+// Bytes, not text, because a text rendering would itself arrive through this
+// tool's `sqlite3 -json` + encoding/json pipe: Go's JSON decoder replaces invalid
+// UTF-8 with U+FFFD, so a substituted byte would appear on BOTH sides of the
+// comparison and agree with itself. SQLite's hex() returns the bytes as stored,
+// and PostgreSQL's convert_to(col::text,'UTF8') returns the bytes it stored, so a
+// substituted byte shows up as a difference. (Measured on the real source: zero
+// text cells contain invalid UTF-8, so this is a latent hole rather than a live
+// one — which is exactly when it is cheap to close.)
+//
+// Only integer and text columns are compared, and REAL is excluded on purpose:
+// SQLite's hex() of a REAL returns that REAL's TEXT bytes (measured:
+// hex(0.1) = 302E31, i.e. "0.1", not the IEEE754 bytes 3fb999999999999a), and the
+// two databases render whole numbers differently ("720.0" versus "720"), so
+// comparing them would report a difference where there is none. The REAL guarantee
+// is elsewhere: source.go reads a REAL column through SQLite's own shortest
+// round-trip form (printf('%!.17g')) rather than as a JSON number, which keeps the
+// value out of the JSON float path entirely.
+func (v *Verifier) checkDatabaseHexBytes(ctx context.Context, source map[string]*Table, target *TargetSchema) {
 	comparable := func(dataType string) bool {
 		return containsString(intTypes, dataType) || containsString(textTypes, dataType)
 	}
@@ -306,39 +312,40 @@ func (v *Verifier) checkDatabaseRenderedText(ctx context.Context, source map[str
 			}
 		}
 
-		sourceRendered, err := v.src.RenderedText(ctx, name, columns)
+		sourceHex, err := v.src.RenderedHex(ctx, name, columns)
 		if err != nil {
-			v.add("db_rendered_text["+name+"]", false, "%v", err)
+			v.add("db_hex_bytes["+name+"]", false, "%v", err)
 			continue
 		}
-		targetRendered, err := v.renderedTargetText(ctx, name, columns)
+		targetHex, err := v.renderedTargetBytes(ctx, name, columns)
 		if err != nil {
-			v.add("db_rendered_text["+name+"]", false, "%v", err)
+			v.add("db_hex_bytes["+name+"]", false, "%v", err)
 			continue
 		}
 
 		cells := len(columns) * len(source[name].Rows)
-		problems := compareRenderedText(columns, sourceRendered, targetRendered)
-		detail := fmt.Sprintf("%d cell(s) rendered by both databases", cells)
+		problems := compareRenderedBytes(columns, sourceHex, targetHex)
+		detail := fmt.Sprintf("%d cell(s) compared byte for byte", cells)
 		if cells == 0 {
 			detail = "0 cells — the source table is empty, so this check compared nothing"
 		}
-		v.add("db_rendered_text["+name+"]", len(problems) == 0, "%s%s", detail,
+		v.add("db_hex_bytes["+name+"]", len(problems) == 0, "%s%s", detail,
 			prefixIf(len(problems) > 0, " — "+strings.Join(problems, "; ")))
 	}
 }
 
-// renderedTargetText renders the same columns with PostgreSQL's own ::text.
-func (v *Verifier) renderedTargetText(ctx context.Context, table string, columns []string) (map[string][]RenderedValue, error) {
+// renderedTargetBytes renders the same columns with PostgreSQL's own byte
+// conversion, so neither side of the comparison is produced by Go.
+func (v *Verifier) renderedTargetBytes(ctx context.Context, table string, columns []string) (map[string][]RenderedValue, error) {
 	key := PrimaryKey[table]
 	exprs := make([]string, 0, len(columns)+1)
 	exprs = append(exprs, quoteIdent(key)+"::text")
 	for _, c := range columns {
-		exprs = append(exprs, quoteIdent(c)+"::text")
+		exprs = append(exprs, "lower(encode(convert_to("+quoteIdent(c)+"::text, 'UTF8'), 'hex'))")
 	}
 	rows, err := v.pool.Query(ctx, "SELECT "+strings.Join(exprs, ", ")+" FROM "+quoteIdent(table))
 	if err != nil {
-		return nil, fmt.Errorf("render target %s as text: %w", table, err)
+		return nil, fmt.Errorf("render target %s as bytes: %w", table, err)
 	}
 	defer rows.Close()
 
@@ -359,13 +366,13 @@ func (v *Verifier) renderedTargetText(ctx context.Context, table string, columns
 		out[id] = rendered
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("render target %s as text: %w", table, err)
+		return nil, fmt.Errorf("render target %s as bytes: %w", table, err)
 	}
 	return out, nil
 }
 
 // renderedFromDBValue adapts a pgx value to a RenderedValue. Only string and NULL
-// can appear, because every expression in the query above is a ::text cast.
+// can appear, because every rendering expression is a hex encoding.
 func renderedFromDBValue(v any) RenderedValue {
 	switch value := v.(type) {
 	case nil:
@@ -373,31 +380,31 @@ func renderedFromDBValue(v any) RenderedValue {
 	case string:
 		return RenderedValue{Text: value}
 	default:
-		// Not reachable while the query casts to text; returning the Go rendering
+		// Not reachable while the query hex-encodes; returning the Go rendering
 		// keeps the comparison honest rather than silently equal.
 		return RenderedValue{Text: fmt.Sprintf("%v", value)}
 	}
 }
 
-// compareRenderedText is the pure comparison behind the check, so that it can be
+// compareRenderedBytes is the pure comparison behind the check, so that it can be
 // tested without two databases.
-func compareRenderedText(columns []string, source, target map[string][]RenderedValue) []string {
+func compareRenderedBytes(columns []string, source, target map[string][]RenderedValue) []string {
 	var problems []string
 	for _, id := range sortedRenderedKeys(source) {
 		want := source[id]
 		got, ok := target[id]
 		if !ok {
-			problems = append(problems, fmt.Sprintf("%s=%s is missing from the target", "row", id))
+			problems = append(problems, fmt.Sprintf("row=%s is missing from the target", id))
 			continue
 		}
 		for i := range columns {
 			if i >= len(want) || i >= len(got) {
-				problems = append(problems, fmt.Sprintf("%s=%s rendered a different number of columns", "row", id))
+				problems = append(problems, fmt.Sprintf("row=%s rendered a different number of columns", id))
 				break
 			}
 			if renderedText(want[i]) != renderedText(got[i]) {
-				problems = append(problems, fmt.Sprintf("%s=%s column %s: source renders %s, target renders %s",
-					"row", id, columns[i], quotedRendered(want[i]), quotedRendered(got[i])))
+				problems = append(problems, fmt.Sprintf("row=%s column %s: source has %s, target has %s",
+					id, columns[i], describeBytes(want[i]), describeBytes(got[i])))
 			}
 		}
 	}
@@ -415,14 +422,36 @@ func renderedText(v RenderedValue) string {
 	if v.Null {
 		return "\x00null"
 	}
-	return "\x00s" + v.Text
+	return "\x00h" + v.Text
 }
 
-func quotedRendered(v RenderedValue) string {
+// describeBytes shows a hex rendering as hex, plus the text when the bytes are
+// valid UTF-8 — a diff of two hex strings is exact but unreadable, and this
+// message is what an operator has to act on.
+func describeBytes(v RenderedValue) string {
 	if v.Null {
 		return "NULL"
 	}
-	return strconv.Quote(v.Text)
+	shown := v.Text
+	if len(shown) > 120 {
+		shown = shown[:120] + "…"
+	}
+	decoded, err := hex.DecodeString(shown)
+	if err == nil && utf8.Valid(decoded) && isMostlyPrintable(string(decoded)) {
+		return strconv.Quote(string(decoded)) + " (hex " + shown + ")"
+	}
+	return "hex " + shown
+}
+
+// isMostlyPrintable guards describeBytes against turning a binary diff into a
+// terminal-filling mess of control characters.
+func isMostlyPrintable(s string) bool {
+	for _, r := range s {
+		if r < 0x20 && r != '\n' && r != '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 func sortedRenderedKeys(m map[string][]RenderedValue) []string {
@@ -709,7 +738,7 @@ func compareRows(ctx context.Context, q querier, source *Table, columns []Target
 		if _, dup := sourceRows[id]; dup {
 			return nil, fmt.Errorf("source has two rows with %s=%s", key, id)
 		}
-		sourceRows[id] = strings.Join(parts, rowSeparator)
+		sourceRows[id] = joinCanonicalRow(parts)
 	}
 
 	rows, err := q.Query(ctx, selectQuery(source.Name, columns))
@@ -742,7 +771,7 @@ func compareRows(ctx context.Context, q querier, source *Table, columns []Target
 		if err != nil {
 			return nil, fmt.Errorf("target %s %s: %w", source.Name, key, err)
 		}
-		targetRows[id] = strings.Join(parts, rowSeparator)
+		targetRows[id] = joinCanonicalRow(parts)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("read target %s: %w", source.Name, err)
@@ -768,10 +797,49 @@ func compareRows(ctx context.Context, q querier, source *Table, columns []Target
 	return bound(problems, 5), nil
 }
 
-// rowSeparator separates columns inside a canonical row. A control character
-// cannot appear in any of these columns' values, so no value can forge a
-// boundary and make two different rows look identical.
-const rowSeparator = "\x1f"
+// joinCanonicalRow concatenates a row's canonical cells, length-prefixing each one.
+//
+// The first version joined them with a separator byte and claimed "a control
+// character cannot appear in any of these columns' values". That claim is false:
+// reports.content, reports.title, key_applications.purpose and agent_keys.note
+// hold arbitrary agent- and human-supplied text, and a value containing the
+// separator followed by another cell's type tag could shift a cell boundary so
+// that two DIFFERENT rows produce the same string and compare equal. A NUL byte in
+// the tag makes that hard to hit accidentally, and "hard to hit" is not a property
+// worth relying on in the one check that decides whether the data moved correctly.
+//
+// A length prefix cannot be forged: the parse consumes a known number of bytes, so
+// a boundary can only fall where the writer put it. It also lets
+// firstDifference name the right column, which the separator form could not.
+func joinCanonicalRow(parts []string) string {
+	var b strings.Builder
+	for _, part := range parts {
+		b.WriteString(strconv.Itoa(len(part)))
+		b.WriteByte(':')
+		b.WriteString(part)
+	}
+	return b.String()
+}
+
+// splitCanonicalRow is the inverse of joinCanonicalRow, for diagnostics only. A
+// malformed tail is returned as-is rather than dropped, so a reporting bug cannot
+// silently hide a cell.
+func splitCanonicalRow(s string) []string {
+	var out []string
+	for len(s) > 0 {
+		colon := strings.IndexByte(s, ':')
+		if colon < 0 {
+			return append(out, s)
+		}
+		n, err := strconv.Atoi(s[:colon])
+		if err != nil || n < 0 || colon+1+n > len(s) {
+			return append(out, s)
+		}
+		out = append(out, s[colon+1:colon+1+n])
+		s = s[colon+1+n:]
+	}
+	return out
+}
 
 // canonicalValue renders a value so that two databases' representations of the
 // same value compare equal.
@@ -808,8 +876,8 @@ func canonicalValue(v any) string {
 
 // firstDifference names the first column whose canonical values disagree.
 func firstDifference(columns []TargetColumn, a, b string) string {
-	left := strings.Split(a, rowSeparator)
-	right := strings.Split(b, rowSeparator)
+	left := splitCanonicalRow(a)
+	right := splitCanonicalRow(b)
 	for i := range columns {
 		if i >= len(left) || i >= len(right) {
 			return "a different number of columns"
@@ -818,7 +886,7 @@ func firstDifference(columns []TargetColumn, a, b string) string {
 			return fmt.Sprintf("%s (%s vs %s)", columns[i].Name, display(left[i]), display(right[i]))
 		}
 	}
-	return "no column (the row separators differ)"
+	return "no column (the cells differ only in how they were delimited, which is a bug in this check)"
 }
 
 // display strips the type tag and shortens a value for a one-line message.
@@ -877,28 +945,26 @@ func mustJSON(v any) string {
 	return string(b)
 }
 
-// canonicalJSON re-encodes a JSON text so that two spellings of the same object
-// compare equal.
+// canonicalJSON re-encodes a JSON text the way the store's decodeMetadata reads
+// it, so that two spellings of the same object compare equal.
 //
-// The two sides of the comparison arrive in different shapes: the source hands
-// back the exact bytes the agent sent — key order and all — while the store
-// hands back a decoded map, which Go re-encodes in its own key order. Comparing
-// those spellings directly would fail for any report whose metadata keys were
-// not already alphabetical. It passed on the real data set only because every
-// metadata object in it happens to be sorted, which is luck, not a property.
+// The two sides arrive in different shapes: the source hands back the exact bytes
+// the agent sent — key order and all — while the store hands back a
+// map[string]any, which Go re-encodes in its own key order. Comparing those
+// spellings directly would fail for any report whose metadata keys were not
+// already alphabetical. It passed on the real data set only because every metadata
+// object in it happens to be sorted, which is luck, not a property.
 //
-// An empty column becomes {} because that is what the store's decodeMetadata
-// does with it, and the two sides must agree on that edge as well.
+// It also has to degrade exactly as the store does. decodeMetadata unmarshals into
+// map[string]any and yields {} for anything that is not an object, so a hand-edited
+// or legacy row holding '5' or '[1,2]' reads back as {} — both schema CHECKs accept
+// those values, because both only require *valid* JSON. A digest that instead
+// preserved '5' would report a metadata change for a byte-perfect copy and print a
+// message saying the content differs. row_equality still compares the raw column
+// bytes, so this only removes a false alarm; it cannot hide a real change.
 func canonicalJSON(raw string) (string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return "{}", nil
-	}
-	var value any
-	if err := json.Unmarshal([]byte(trimmed), &value); err != nil {
-		return "", fmt.Errorf("metadata is not valid JSON: %w", err)
-	}
-	if value == nil {
+	var value map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &value); err != nil || value == nil {
 		return "{}", nil
 	}
 	b, err := json.Marshal(value)

@@ -165,6 +165,24 @@ func runImport(ctx context.Context, args []string) int {
 		total += t.Inserted
 	}
 	fmt.Printf("\nimport committed: %d row(s) in one transaction\n", total)
+
+	// The hash above was taken before the rows were read, and Import reads the
+	// file again. On a frozen local copy nothing can change in between, but "the
+	// printed digest describes the imported bytes" is a claim this tool makes, so
+	// it verifies it rather than assuming it. The import has already committed at
+	// this point, which is why this is a loud, non-zero error and not a rollback:
+	// the operator needs to know the digest and the data may not correspond.
+	after, err := src.SHA256()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	if after != sum {
+		fmt.Fprintf(os.Stderr, "error: the source changed while it was being imported: it hashed to "+
+			"%s before and %s after. The rows just committed may not correspond to either digest. "+
+			"Re-import with -replace -yes once the file is stable.\n", sum, after)
+		return 1
+	}
 	return 0
 }
 

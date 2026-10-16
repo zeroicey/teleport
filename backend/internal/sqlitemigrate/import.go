@@ -7,6 +7,8 @@ import (
 	"math"
 	"strconv"
 	"strings"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // TableResult is the reconciliation of one table.
@@ -78,8 +80,19 @@ func Import(ctx context.Context, src Reader, q querier, replace bool) (*Report, 
 	// Rollback is a no-op after a successful Commit, so this needs no flag.
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	// The emptiness check runs inside the transaction so that a concurrent
-	// writer cannot slip rows in between the check and the inserts.
+	// The emptiness check runs inside the transaction, as its first statement, so
+	// that it and the inserts it guards are one unit of work.
+	//
+	// It is a decision, not a lock: `SELECT count(*)` takes only AccessShareLock,
+	// which does not conflict with the RowExclusiveLock an INSERT takes, so a
+	// concurrent writer is NOT blocked and can add rows between this count and the
+	// inserts. What catches an additive race is the re-count before the commit —
+	// and a count-preserving concurrent change (a delete plus an insert, or an
+	// UPDATE after the last count) is not detectable here at all. That is why the
+	// target is expected to be an idle, freshly migrated database, and why `verify`
+	// exists and runs immediately afterwards. An earlier version of this comment
+	// claimed the check made the race impossible; it does not, and the difference
+	// matters to anyone deciding whether to run this against a live database.
 	existing, err := countAll(ctx, tx)
 	if err != nil {
 		return nil, err
@@ -147,22 +160,26 @@ func Import(ctx context.Context, src Reader, q querier, replace bool) (*Report, 
 	return report, nil
 }
 
-// beginTx starts the import transaction.
+// beginTx starts the import transaction, and requires a POOL rather than
+// accepting anything that merely looks like one.
 //
-// q is a *pgxpool.Pool in production. The type assertion is written out rather
-// than hidden behind an interface method so that passing a transaction in by
-// mistake fails here instead of deadlocking: taking a transaction from a pool
-// while holding one is the exact bug that wedged this store during P2.3
+// "Merely looks like one" is not hypothetical: pgx v5's Tx interface itself has
+// Begin (pseudo-nested transactions are implemented as savepoints), so an
+// assertion on `Begin(ctx) (pgx.Tx, error)` is satisfied by a *pgxpool.Tx as well
+// as by a *pgxpool.Pool. The first version of this function asserted exactly that,
+// so passing a transaction in would have silently opened a savepoint instead of
+// failing. The concrete type is named here for that reason.
+//
+// A transaction must not be passed in anyway: taking one from the pool while
+// already holding one is the exact bug that wedged this store during P2.3
 // (.ai/pitfalls/cases/2026-10-16-store-nested-pool-acquire-deadlocks.md).
 func beginTx(ctx context.Context, q querier) (pgxTx, error) {
-	beginner, ok := q.(interface {
-		Begin(context.Context) (pgxTx, error)
-	})
+	pool, ok := q.(*pgxpool.Pool)
 	if !ok {
-		return nil, fmt.Errorf("import target is not a connection pool (got %T); the import needs a "+
-			"pool to open its transaction on", q)
+		return nil, fmt.Errorf("import target must be a *pgxpool.Pool (got %T); a transaction would "+
+			"make pgx open a savepoint instead of a transaction", q)
 	}
-	tx, err := beginner.Begin(ctx)
+	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin import transaction: %w", err)
 	}

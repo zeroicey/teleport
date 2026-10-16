@@ -2,6 +2,8 @@ package sqlitemigrate
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -70,8 +72,12 @@ INSERT INTO key_applications (id, claim_hash, label, purpose, requested_hours, s
   ('a-pending', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'newcomer', '',                   24.0,  'pending', 1791987376289, 1792073776289, 0,             0,              '',       '121.9.113.34', 'Mozilla/5.0', 'newcomer', 0,     '');
 
 INSERT INTO key_renewals (id, key_id, requested_hours, status, created_at, decided_at, granted_expires_at) VALUES
-  ('rn-approved', 'k-live',    72.0, 'approved', 1791992633782, 1791992633782, 4102444800000),
-  ('rn-pending',  'k-expired', 24.0, 'pending',  1791992633783, 0,             0);
+  -- 0.30000000000000004 needs all 17 significant digits to round-trip, which is
+  -- the point: every other REAL in this fixture (720.0, 24.0, 72.0, 0) renders
+  -- identically at 15 digits, so a precision loss anywhere in the float path would
+  -- go unnoticed. See TestImportPreservesRealPrecision.
+  ('rn-approved', 'k-live',    0.30000000000000004, 'approved', 1791992633782, 1791992633782, 4102444800000),
+  ('rn-pending',  'k-expired', 24.0,                'pending',  1791992633783, 0,             0);
 `
 
 // fixtureCounts is what the fixture above contains, per table.
@@ -321,6 +327,27 @@ func TestVerifyDetectsEachKindOfTamper(t *testing.T) {
 			sql:       []string{`ALTER TABLE reports RENAME COLUMN category TO kind`},
 			wantCheck: "column_sets",
 		},
+		{
+			// A REAL rounded to fewer digits: 0.30000000000000004 -> 0.3. Only
+			// detectable because the source reads REAL columns through SQLite's own
+			// shortest-round-trip form rather than through the JSON float path.
+			name:      "a double rounded to 15 digits",
+			sql:       []string{`UPDATE key_renewals SET requested_hours = 0.3 WHERE id = 'rn-approved'`},
+			wantCheck: "row_equality[key_renewals]",
+		},
+		{
+			// The byte-comparison check through the real path, so that it is not
+			// merely a unit-tested pure function: an integer cell changed in the
+			// target must make db_hex_bytes[...] fail.
+			name:      "a changed integer cell",
+			sql:       []string{`UPDATE key_applications SET decided_at = 0 WHERE id = 'a-claimed'`},
+			wantCheck: "db_hex_bytes[key_applications]",
+		},
+		{
+			name:      "a changed text cell",
+			sql:       []string{`UPDATE agent_keys SET note = 'different' WHERE id = 'k-revoked'`},
+			wantCheck: "db_hex_bytes[agent_keys]",
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := setupImported(t)
@@ -440,6 +467,62 @@ func TestVerifyDoesNotMigrate(t *testing.T) {
 	}
 	if report.TargetSchema != schema {
 		t.Errorf("reported target schema %q, want %q", report.TargetSchema, schema)
+	}
+}
+
+// TestImportRefusesATransactionNotAPool is the falsification of the guard that
+// beginTx's comment used to overstate.
+//
+// The first version asserted an interface with `Begin(ctx) (pgx.Tx, error)`, which
+// pgx v5's Tx interface ALSO satisfies (pseudo-nested transactions are savepoints),
+// so a transaction would have been accepted and the import would have opened a
+// savepoint instead of failing. This test passes a real transaction in and requires
+// a refusal.
+func TestImportRefusesATransactionNotAPool(t *testing.T) {
+	storetest.SkipWithoutDatabase(t)
+	path := fixture(t)
+	ctx := context.Background()
+	src, err := OpenSource(ctx, path)
+	if err != nil {
+		t.Fatalf("OpenSource: %v", err)
+	}
+	pool, _ := storetest.Schema(t, store.MigratePG)
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := Import(ctx, src, tx, false); err == nil {
+		t.Fatal("Import accepted a transaction; it would have opened a savepoint instead of a " +
+			"transaction, so the import would not have been all-or-nothing")
+	} else if !strings.Contains(err.Error(), "*pgxpool.Pool") {
+		t.Errorf("error %q does not say a pool is required", err)
+	}
+}
+
+// TestImportPreservesRealPrecision is the guard for the float path that the
+// byte-comparison check deliberately skips (see checkDatabaseHexBytes for why REAL
+// is excluded there).
+//
+// It asserts the value with the fewest ambiguities: PostgreSQL's own
+// float8send(col) must equal the eight IEEE754 bytes of the double the source
+// holds, computed here from the decimal literal SQLite stores. A path that
+// rounded to 15 significant digits would land on 0.29999999999999998 and fail.
+func TestImportPreservesRealPrecision(t *testing.T) {
+	f := setupImported(t)
+
+	var hexBytes string
+	if err := f.pool.QueryRow(f.ctx,
+		`SELECT encode(float8send(requested_hours), 'hex') FROM key_renewals WHERE id = 'rn-approved'`,
+	).Scan(&hexBytes); err != nil {
+		t.Fatalf("read float8send: %v", err)
+	}
+	want := fmt.Sprintf("%x", math.Float64bits(0.30000000000000004))
+	if hexBytes != want {
+		t.Errorf("requested_hours is %s, want %s (0.30000000000000004): the value lost precision "+
+			"somewhere in the float path", hexBytes, want)
 	}
 }
 

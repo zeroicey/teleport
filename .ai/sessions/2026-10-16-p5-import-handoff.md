@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-16 · **Branch/Commit:** `main`（基于 `de22443`，**P5 尚未提交**）· **Duration:** 一个会话
 · **State:** P0 ✅ / P1 ✅ / P2 ✅ / P3 ✅ / P4 ✅ / **P5 ✅**；**P6 ⛔（且必须先问人类）**；线上旧版仍 `disabled`，公网 502
-· **Gate:** 四档 —— `scripts/check.sh`（无库，**152 SKIP**）、`scripts/test-pg.sh`（强制真库）、
+· **Gate:** 四档 —— `scripts/check.sh`（无库，**154 SKIP**）、`scripts/test-pg.sh`（强制真库）、
 `scripts/verify-p4.sh`（未重跑，P4 之后 Go/前端未改）、**`scripts/verify-p5.sh`（新，15/15 + 负向对照）**
 
 ---
@@ -46,7 +46,7 @@ P5_SKIP_NEGATIVE=1 ...                         # 只跳过负向对照（**别�
 | 行为核对（`sqlitemigrate verify`） | **20 / 20**（含 5 项 `db_rendered_text[...]`：两个数据库各自渲染、共 157 个格子） |
 | 独立计数（`sqlite3` vs `psql`，对着人给的 5/6/2/4/0） | 全对上 |
 | 负向对照（篡改目标） | 按名字变红：`revoked_links_stay_404` + `permanent_links_stay_permanent` |
-| Go 侧篡改用例 | 15 个（含「多一列」「改列名」「删视图」「root 归属被改」这类**静默丢数据**形状）——**20 项检查每一项都有反证** |
+| Go 侧篡改用例 | 18 个（含「多一列」「改列名」「删视图」「root 归属被改」这类**静默丢数据**形状）——**20 项检查每一项都有反证** |
 | 对抗性夹具（自建） | 文本逐字节 / BIGINT 极值 / DOUBLE 位级 / Inf 拒绝 —— 见 CURRENT_TASK |
 
 用户的四条要求逐条落地：**报告数 5 / 密钥数 2 / 全部分享链接 6**（源侧 `sqlite3` 数、目标侧 `psql` 数、
@@ -71,7 +71,7 @@ P5_SKIP_NEGATIVE=1 ...                         # 只跳过负向对照（**别�
 
 ## 五、已验证 / 未验证
 
-- [x] 四档闸门全绿（`check.sh` 无库档打印 **152 SKIP** 并大声提示；`test-pg.sh` 真库 0 失败）。
+- [x] 四档闸门全绿（`check.sh` 无库档打印 **154 SKIP** 并大声提示；`test-pg.sh` 真库 0 失败）。
 - [x] `gofmt -l` 空、`go vet ./...` 干净。
 - [x] 源未被修改：hcyj 远端与本地副本 sha256 一致（`0b3855d7…beb24d`），**只读获取**。
 - [x] 环境干净：`teleport_test` 现在 **0 张表、只剩 `public`**（清掉了 P4 会话留在 `public` 里的整套陈旧 schema
@@ -88,7 +88,16 @@ P5_SKIP_NEGATIVE=1 ...                         # 只跳过负向对照（**别�
 
 - [ ] **P5 尚未提交**（7 个新文件 + 4 个 `.ai` 文件）。
 - [ ] `bin/import/` 与 `bin/e2e/` 都在 gitignore 里（生成物），但 `scripts/verify-p5.sh` **要提交**。
-- [ ] **P5 的独立复审没拿到，要如实知道这一点。** 四种尝试全部因**环境**失败（不是「没发现问题」）：
+- [x] **P5 拿到了一轮独立复审（`subagent` reviewer，会话末尾）**：8 项发现，无 BLOCKER，
+      两项「20 项检查仍可能对被改过的数据报绿」的洞已补（文本比较的有损 JSON 管道 → 改为
+      **字节**比较；DOUBLE PRECISION 无独立检查 → REAL 改走 SQLite 自己的 `printf('%!.17g')`，
+      JSON float 路径退出数据搬运）。**审查者建议的 `hex(col)` 取 IEEE754 字节实测不成立**
+      （`hex(0.1)` = `302E31` 即 "0.1" 的文本字节），改用了能成立的做法。另修：`beginTx` 的弱断言
+      （pgx 的 `Tx` 自己也有 `Begin`，所以 `*pgxpool.Tx` 满足弱断言 → 会静默开 savepoint；
+      已改为显式断言 `*pgxpool.Pool` 并反证）、`row_equality` 可被值伪造的分隔符（改长度前缀）、
+      `metadata='5'` 的假警报、空目标检查的夸大注释、sha256 未必描述被导入字节、脚本四处。
+      详见 `.ai/CURRENT_TASK.md` 的「P5 第二轮」小节。
+- [ ] **但前四种复审尝试全部因环境失败**，要如实知道： 四种尝试全部因**环境**失败（不是「没发现问题」）：
       - 两个 `bg_delegate` 只读子代理（数据路径正确性 / 夹具可证伪性）：
         各做了 35 次工具调用后被 **24 turn 上限**截断，**没有交出答案**
         （`child_turn_limit`）；

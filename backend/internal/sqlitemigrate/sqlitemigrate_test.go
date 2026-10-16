@@ -2,6 +2,7 @@ package sqlitemigrate
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math"
@@ -33,10 +34,10 @@ func (f *fakeReader) Tables(context.Context) ([]Table, error) {
 	return f.tables, f.tablesErr
 }
 
-// RenderedText is part of the Reader interface so that the verifier can compare
-// database renderings. The pure tests here never reach it; the integration tests
-// use the real *Source.
-func (f *fakeReader) RenderedText(context.Context, string, []string) (map[string][]RenderedValue, error) {
+// RenderedHex is part of the Reader interface so that the verifier can compare
+// the bytes each database holds. The pure tests here never reach it; the
+// integration tests use the real *Source.
+func (f *fakeReader) RenderedHex(context.Context, string, []string) (map[string][]RenderedValue, error) {
 	return nil, errors.New("fakeReader has no database to render with")
 }
 
@@ -221,8 +222,23 @@ func TestCanonicalJSON(t *testing.T) {
 		})
 	}
 
-	if _, err := canonicalJSON(`{"a":`); err == nil {
-		t.Error("invalid JSON must be refused rather than passed through")
+	// This assertion changed with the function, deliberately and visibly.
+	//
+	// The first version returned an error for invalid JSON and preserved any valid
+	// JSON verbatim. Both were wrong for the same reason: the digest's claim is
+	// "the store reads the same value back", and the store's decodeMetadata
+	// unmarshals into map[string]any and yields {} for anything that is not an
+	// object — including invalid JSON, and including storable non-objects like '5'
+	// and '[1,2]' (both schemas only require *valid* JSON). Preserving '5' made a
+	// byte-perfect copy report a metadata change. The assertion now pins the
+	// mirroring instead; row_equality still compares the raw column bytes, so
+	// nothing about the data is lost by degrading here.
+	got, err := canonicalJSON(`{"a":`)
+	if err != nil {
+		t.Fatalf("canonicalJSON on invalid JSON returned an error: %v", err)
+	}
+	if got != "{}" {
+		t.Errorf("canonicalJSON on invalid JSON = %q, want {} (what the store reads back)", got)
 	}
 }
 
@@ -315,60 +331,177 @@ func TestConvertValueRefusesIntegersOutsideInt64(t *testing.T) {
 	}
 }
 
-// TestCompareRenderedText is the falsification of the one check that does not go
+// TestCompareRenderedBytes is the falsification of the one check that does not go
 // through convertValue: it must report a difference, name the column, and treat
 // NULL as different from the empty string.
-func TestCompareRenderedText(t *testing.T) {
+//
+// The hex strings here are what the two databases actually produce for the values
+// named in the comments — see the measured probes in
+// .ai/pitfalls/cases/2026-10-16-verifier-shares-the-conversion-it-checks.md.
+func TestCompareRenderedBytes(t *testing.T) {
 	columns := []string{"created_at", "title"}
 
-	t.Run("identical renderings report nothing", func(t *testing.T) {
+	t.Run("identical bytes report nothing", func(t *testing.T) {
 		source := map[string][]RenderedValue{
-			"r1": {{Text: "1791563326606"}, {Text: "hi"}},
+			"r1": {{Text: "31373931353633333236363036"}, {Text: "6869"}},
 		}
 		target := map[string][]RenderedValue{
-			"r1": {{Text: "1791563326606"}, {Text: "hi"}},
+			"r1": {{Text: "31373931353633333236363036"}, {Text: "6869"}},
 		}
-		if got := compareRenderedText(columns, source, target); len(got) != 0 {
+		if got := compareRenderedBytes(columns, source, target); len(got) != 0 {
 			t.Errorf("got %v, want no problems", got)
 		}
 	})
 
-	t.Run("a differently rendered integer is reported with its column", func(t *testing.T) {
-		// Exactly the shape of the measured bug: SQLite renders the value SQLite
-		// actually holds, PostgreSQL renders the value PostgreSQL actually holds.
-		source := map[string][]RenderedValue{"r1": {{Text: "9.2233720368547758e+18"}, {Text: "hi"}}}
-		target := map[string][]RenderedValue{"r1": {{Text: "-9223372036854775808"}, {Text: "hi"}}}
-		got := compareRenderedText(columns, source, target)
+	t.Run("a wrapped integer is reported with its column", func(t *testing.T) {
+		// Exactly the shape of the measured bug: SQLite holds 2^63 (stored with
+		// REAL affinity, so hex() gives the text bytes of its rendering), and
+		// PostgreSQL holds the wrapped value.
+		source := map[string][]RenderedValue{
+			"r1": {{Text: hexOf("9.2233720368547758e+18")}, {Text: hexOf("hi")}},
+		}
+		target := map[string][]RenderedValue{
+			"r1": {{Text: hexOf("-9223372036854775808")}, {Text: hexOf("hi")}},
+		}
+		got := compareRenderedBytes(columns, source, target)
 		if len(got) != 1 {
 			t.Fatalf("got %v, want exactly one problem", got)
 		}
 		if !strings.Contains(got[0], "created_at") {
 			t.Errorf("problem %q does not name the column", got[0])
 		}
-		if !strings.Contains(got[0], "9.2233720368547758e+18") || !strings.Contains(got[0], "-9223372036854775808") {
-			t.Errorf("problem %q does not show both renderings", got[0])
+	})
+
+	t.Run("a substituted byte is reported", func(t *testing.T) {
+		// The invalid-UTF-8 shape: SQLite holds the byte 0xFF, the JSON pipe
+		// replaces it with U+FFFD, and the target therefore holds efbfbd. A text
+		// comparison could not see this, because both sides would have gone
+		// through the same substitution; byte comparison can.
+		source := map[string][]RenderedValue{"r1": {{Text: "31"}, {Text: "ff"}}}
+		target := map[string][]RenderedValue{"r1": {{Text: "31"}, {Text: "efbfbd"}}}
+		got := compareRenderedBytes(columns, source, target)
+		if len(got) != 1 || !strings.Contains(got[0], "title") {
+			t.Errorf("got %v, want one problem naming title", got)
 		}
 	})
 
 	t.Run("NULL and the empty string are different values", func(t *testing.T) {
 		source := map[string][]RenderedValue{"r1": {{Null: true}, {Text: ""}}}
 		target := map[string][]RenderedValue{"r1": {{Text: ""}, {Null: true}}}
-		if got := compareRenderedText(columns, source, target); len(got) != 2 {
+		if got := compareRenderedBytes(columns, source, target); len(got) != 2 {
 			t.Errorf("got %v, want two problems: NULL must never compare equal to the empty string", got)
 		}
 	})
 
 	t.Run("a missing row is reported", func(t *testing.T) {
-		source := map[string][]RenderedValue{"r1": {{Text: "1"}, {Text: "hi"}}}
-		if got := compareRenderedText(columns, source, map[string][]RenderedValue{}); len(got) != 1 {
+		source := map[string][]RenderedValue{"r1": {{Text: "31"}, {Text: "6162"}}}
+		if got := compareRenderedBytes(columns, source, map[string][]RenderedValue{}); len(got) != 1 {
 			t.Errorf("got %v, want one problem about the missing row", got)
 		}
 	})
 
 	t.Run("an extra row is reported", func(t *testing.T) {
-		target := map[string][]RenderedValue{"r9": {{Text: "1"}, {Text: "hi"}}}
-		if got := compareRenderedText(columns, map[string][]RenderedValue{}, target); len(got) != 1 {
+		target := map[string][]RenderedValue{"r9": {{Text: "31"}, {Text: "6162"}}}
+		if got := compareRenderedBytes(columns, map[string][]RenderedValue{}, target); len(got) != 1 {
 			t.Errorf("got %v, want one problem about the extra row", got)
 		}
 	})
+}
+
+// hexOf is the lower(hex()) rendering of a string's UTF-8 bytes, which is what
+// SQLite's hex() returns for a TEXT value.
+func hexOf(s string) string { return hex.EncodeToString([]byte(s)) }
+
+// TestJoinCanonicalRowCannotBeForgedByAValue is the guard for the separator
+// collision: two DIFFERENT rows must never produce the same canonical string.
+//
+// The first version joined cells with a 0x1f byte and claimed a control character
+// could not appear in these columns. reports.content and agent_keys.note hold
+// arbitrary text, so that claim was false, and the failure mode was the worst
+// kind: two different rows comparing equal in the check that decides whether the
+// data moved correctly.
+func TestJoinCanonicalRowCannotBeForgedByAValue(t *testing.T) {
+	// A value crafted to look like a cell boundary followed by another cell.
+	forged := "X\x1f\x00sY"
+
+	a := joinCanonicalRow([]string{"\x00s" + forged, "\x00sZ"})
+	b := joinCanonicalRow([]string{"\x00sX", "\x00sY\x1f\x00sZ"})
+	if a == b {
+		t.Errorf("two different rows produced the same canonical string %q: a value forged a cell "+
+			"boundary", a)
+	}
+
+	// And the round trip has to be exact, including empty cells, so that a
+	// diagnostic never mis-attributes a difference to the wrong column.
+	for _, parts := range [][]string{
+		{"\x00sabc", "\x00i1", "\x00null"},
+		{"", ""},
+		{"\x00s0:5x", "\x00s", ""},
+	} {
+		got := splitCanonicalRow(joinCanonicalRow(parts))
+		if len(got) != len(parts) {
+			t.Fatalf("round trip of %q produced %d cells, want %d: %q", parts, len(got), len(parts), got)
+		}
+		for i := range parts {
+			if got[i] != parts[i] {
+				t.Errorf("round trip of %q: cell %d is %q, want %q", parts, i, got[i], parts[i])
+			}
+		}
+	}
+}
+
+// TestCanonicalJSONMirrorsTheStore: the digest must read metadata exactly the way
+// the store's decodeMetadata does, or a byte-perfect copy reports a metadata
+// change. Both schema CHECKs require only *valid* JSON, so '5' and '[1,2]' are
+// storable; the store degrades both to {}.
+func TestCanonicalJSONMirrorsTheStore(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{"an object", `{"b":2,"a":1}`, `{"a":1,"b":2}`},
+		{"a bare number is not an object", `5`, `{}`},
+		{"an array is not an object", `[1,2]`, `{}`},
+		{"a bare string is not an object", `"x"`, `{}`},
+		{"null", `null`, `{}`},
+		{"an empty column", ``, `{}`},
+		{"an empty object", `{}`, `{}`},
+		{"invalid JSON", `{"a":`, `{}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := canonicalJSON(tc.raw)
+			if err != nil {
+				t.Fatalf("canonicalJSON(%q): %v", tc.raw, err)
+			}
+			if got != tc.want {
+				t.Errorf("canonicalJSON(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestHasRealAffinity pins SQLite's own affinity rules for the declared types this
+// tool has to recognise, because reading a REAL column the wrong way is exactly
+// the precision hole the printf path exists to close.
+func TestHasRealAffinity(t *testing.T) {
+	for _, tc := range []struct {
+		declType string
+		want     bool
+	}{
+		{"REAL", true},
+		{"real", true},
+		{"double precision", true},
+		{"DOUBLE", true},
+		{"FLOAT", true},
+		{"", false},
+		{"INTEGER", false},
+		{"TEXT", false},
+		{"BIGINT", false},
+		{"VARCHAR(20)", false},
+	} {
+		if got := hasRealAffinity(tc.declType); got != tc.want {
+			t.Errorf("hasRealAffinity(%q) = %v, want %v", tc.declType, got, tc.want)
+		}
+	}
 }
