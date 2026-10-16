@@ -72,8 +72,8 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   `TestCORSPreflightOnRealRoute`、`TestUnknownRouteWithSPAStaysJSON`、
   `TestNewRoutesAreNotSwallowedBySPA`、`TestRoutesAreMountedUnderPrefix`、`TestAIGuideRejectsNonGET`。
 - ✅ 两档闸门绿；`internal/api` + `internal/httpx` 的 `-race` 干净。
-- ⛔ **未做：P4 全链路（`cmd` 起 Gin+pgx 端到端）+ 真实浏览器 + 大陆观测点**。
-  现在绿的是「冻结断言对新 HTTP 层绿」，仍**不是**「在野契约端到端绿」。
+- ✅ **P4 已补上这条**（见下方 P4 小节）：全链路端到端 + 真实浏览器都做了（契约 64/64、浏览器 15/15）。
+  P3 当时那句话已由 P4 兑现：现在绿的是「在野契约对真二进制绿」。
 
 **P4 交付物（全链路 + 浏览器）**：
 - `scripts/verify-p4.sh` —— 编排：在 `teleport_test` 建私有 schema `p4`（**不新建库**：`teleport`
@@ -178,17 +178,18 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   （`sqlite_master` → `information_schema`，因为 PG 没有 sqlite 元数据表），
   **被断言的性质（明文永不入库）一字未变**；② 冻结契约测试随全套件对真库绿；
   ③ 三处上限用已验证的 advisory lock；④ 未用 `SELECT ... FOR UPDATE`；
-  ⑤ **P4/P5 仍是外部校验，尚未做**。
+  ⑤ **P4 已做**（契约 64/64 + 浏览器 15/15 + 旧树差分 108 请求 / 1 处已知差异）；
+  **P5/P6 仍是外部校验，尚未做**。
 - **P2.3 已实测 / 未实测**：
   - ✅ `env -u TEST_PG_DSN bash scripts/check.sh` 通过（含 gofmt / vet / schema 快照 / sqlc 漂移）。
   - ✅ `bash scripts/test-pg.sh` 通过（强制真库，且自检夹具仍拒绝非 test 库）。
   - ✅ `go test ./...` 对真库 0 失败（含 `internal/api`、`internal/store`、`internal/config`）。
   - ✅ `sqlc generate` 成功、`sqlc diff` 无漂移；两张动态 `SET` 列表确实可用
     `COALESCE(sqlc.narg(...))` + `CASE` 表达为单条静态语句 —— ADR 的 Revisit 条件未触发。
-  - ⛔ **未做：HTTP 端到端契约实测**（真 agent 密钥 POST / 读分享页 / PATCH / DELETE /
-    过期 410 / 未知 404 / `HEAD` 领取 405）—— 属 P4。本阶段绿的是「冻结断言对 PG 绿」，
-    **不是**「在野契约对 PG 绿」。
-  - ⛔ **未做：真实浏览器、大陆观测点、数据搬运核对、部署** —— P4/P5/P6。
+  - ✅ **P4 已补上**：HTTP 端到端契约实测已在真二进制上做完（`scripts/verify-p4-contract.sh`，64/64），
+    含真 agent 密钥 POST / 读分享页 / PATCH / DELETE / 过期 410 / 未知 404 / `HEAD` 领取 405。
+  - ✅ 真实浏览器已做（15/15）。⛔ **未做：大陆观测点（P4 全程 loopback）、数据搬运核对、部署**
+    —— P5/P6。
 - **P2.3 期间修掉的自身缺陷**（已记 pitfall）：`ClaimApplication` 的失败分支里，
   `diagnoseClaim` 在事务未提交时又向**连接池**要第二条连接；测试池只有 4 条、8 个竞争者
   ⇒ 持有一半等另一半，**永久挂死**（pgxpool 无超时）。已改为读事务自己的 query set。
