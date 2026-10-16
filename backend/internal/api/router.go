@@ -12,9 +12,12 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gin-gonic/gin"
 
 	"github.com/zeroicey/teleport/backend/internal/agentkey"
 	"github.com/zeroicey/teleport/backend/internal/aidoc"
@@ -76,53 +79,97 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	// uses the admitting middleware, so every other endpoint stays strict
 	// without anyone having to remember to keep it strict.
 	keyAuth := keyResolver{store: st, graceMS: int64(cfg.KeyRenewalGrace / time.Millisecond)}
-	requireAgent := httpx.RequireAgent(authCfg, keyAuth)
+	requireAgent := httpx.GinMiddleware(httpx.RequireAgent(authCfg, keyAuth))
 	// Used by exactly one route: filing a renewal request. An expired key may ask
 	// a human for more time and may do nothing else.
-	requireAgentRenewal := httpx.RequireAgentAllowExpired(authCfg, keyAuth)
-	requireSession := httpx.RequireSession(authCfg)
+	requireAgentRenewal := httpx.GinMiddleware(httpx.RequireAgentAllowExpired(authCfg, keyAuth))
+	requireSession := httpx.GinMiddleware(httpx.RequireSession(authCfg))
 
-	mux := http.NewServeMux()
+	// Gin, not gin.Default(): the default engine installs Gin's logger and its
+	// recovery middleware, and both are wrong here. Access logging is LogRequests
+	// in the outer chain (one line per request, carrying our request id), and
+	// recovery is httpx.Recover, which turns a panic into our JSON 500 and logs it
+	// exactly once. Gin's defaults would duplicate both, and its logger would
+	// write a second, differently-shaped line per request.
+	engine := gin.New()
+
+	// Gin's own conveniences are all switched OFF, because each one changes the
+	// wire in a way the frozen tests do not see.
+	//
+	//   - RedirectTrailingSlash / RedirectFixedPath: Gin answers an unclean or
+	//     trailing-slash-mismatched path with a 301. ServeMux also redirected such
+	//     paths, but with a **307** — and the difference matters, because a 301 on
+	//     a POST is how a POST silently becomes a GET. Rather than accept Gin's 301,
+	//     the same redirect is reproduced with the correct status in NoRoute below
+	//     (see serveMuxRedirect).
+	//   - HandleMethodNotAllowed: Gin would answer a known path with the wrong
+	//     method with a 405. ServeMux never did here, because the per-prefix
+	//     catch-alls matched every method first — so a wrong verb is a 404 with the
+	//     JSON envelope, which is what TestMethodNotAllowed asserts.
+	engine.RedirectTrailingSlash = false
+	engine.RedirectFixedPath = false
+	engine.HandleMethodNotAllowed = false
+
 	p := cfg.RoutePrefix
 
+	// route registers one middleware+handler chain for each of the given methods.
+	// Middleware comes first, the handler last.
+	route := func(path string, methods []string, chain ...gin.HandlerFunc) {
+		for _, m := range methods {
+			engine.Handle(m, path, chain...)
+		}
+	}
+	// get registers a GET route and answers HEAD with the same chain, because
+	// that is what net/http.ServeMux does and this codebase depends on it.
+	//
+	// The dependency is security-relevant: HEAD on the claim endpoint must reach
+	// the handler so it can answer 405. A HEAD has no body to carry the credential
+	// back, so letting it through would burn a one-time hand-off link. Gin does
+	// not route HEAD to a GET handler, so without this the guard in
+	// handlePollKeyApplication would become dead code and the frozen 405 would
+	// silently become a 404.
+	get := func(path string, chain ...gin.HandlerFunc) {
+		route(path, []string{http.MethodGet, http.MethodHead}, chain...)
+	}
+
 	// -- public ---------------------------------------------------------------
-	mux.HandleFunc("GET "+p+"/api/health", s.handleHealth)
-	mux.HandleFunc("GET "+p+"/api/share/{token}", s.handleReadShare)
-	mux.HandleFunc("GET "+p+"/s/{token}", s.handleSharePage)
+	get(p+"/api/health", s.handleHealth)
+	get(p+"/api/share/:token", s.handleReadShare)
+	get(p+"/s/:token", s.handleSharePage)
 	// The body of a `format: "html"` report, framed by the share page above.
-	// Registered explicitly because `p+"/s/"` is a JSON-404 catch-all: an
+	// Registered explicitly because unmatched /s/ paths are a JSON 404: an
 	// unregistered sub-path would answer the iframe with JSON.
-	mux.HandleFunc("GET "+p+"/s/{token}/html", s.handleShareHTML)
+	get(p+"/s/:token/html", s.handleShareHTML)
 
 	// The one-step key hand-off page. Public by design: the link is forwarded to
 	// whoever should get the credential, and the thing that authorises the claim
 	// is the fragment, which the server never sees.
 	//
-	// The bare `/k/` pattern is registered too, so a truncated link renders the
-	// "this link is incomplete" page instead of falling through to the SPA shell.
-	mux.HandleFunc("GET "+p+"/k/{id}", s.handleKeyHandoffPage)
-	mux.HandleFunc("GET "+p+"/k/", s.handleKeyHandoffPage)
+	// The bare /k/ is registered too, so a truncated link renders the "this link
+	// is incomplete" page instead of falling through to the SPA shell.
+	get(p+"/k/:id", s.handleKeyHandoffPage)
+	get(p+"/k/", s.handleKeyHandoffPage)
 
 	// -- machine-readable usage guide -----------------------------------------
 	//
 	// Served by this process, not the SPA, because an agent fetching a URL gets
-	// only what the server sends: the SPA renders client-side and would hand
-	// back an empty shell.
+	// only what the server sends: the SPA renders client-side and would hand back
+	// an empty shell.
 	//
 	// These sit at stable paths rather than behind a share link on purpose. A
 	// share link expires, so a guide distributed as one would eventually 410 on
 	// every agent that had cached it — the opposite of what this is for.
-	mux.HandleFunc("GET "+p+"/ai", s.handleAIGuideHTML)
-	mux.HandleFunc("GET "+p+"/ai.md", s.handleAIGuideMarkdown)
-	mux.HandleFunc("GET "+p+"/llms.txt", s.handleLLMsTxt)
+	get(p+"/ai", s.handleAIGuideHTML)
+	get(p+"/ai.md", s.handleAIGuideMarkdown)
+	get(p+"/llms.txt", s.handleLLMsTxt)
 
 	// -- agent ----------------------------------------------------------------
-	mux.Handle("POST "+p+"/api/reports", requireAgent(http.HandlerFunc(s.handleCreateReport)))
-	mux.Handle("GET "+p+"/api/reports", requireAgent(http.HandlerFunc(s.handleListOwnReports)))
-	mux.Handle("GET "+p+"/api/reports/{id}", requireAgent(http.HandlerFunc(s.handleGetReport)))
-	mux.Handle("PATCH "+p+"/api/reports/{id}", requireAgent(http.HandlerFunc(s.handleUpdateReport)))
-	mux.Handle("DELETE "+p+"/api/reports/{id}", requireAgent(http.HandlerFunc(s.handleDeleteReport)))
-	mux.Handle("POST "+p+"/api/share/{token}/revoke", requireAgent(http.HandlerFunc(s.handleRevoke)))
+	route(p+"/api/reports", []string{http.MethodPost}, requireAgent, s.handleCreateReport)
+	get(p+"/api/reports", requireAgent, s.handleListOwnReports)
+	get(p+"/api/reports/:id", requireAgent, s.handleGetReport)
+	route(p+"/api/reports/:id", []string{http.MethodPatch}, requireAgent, s.handleUpdateReport)
+	route(p+"/api/reports/:id", []string{http.MethodDelete}, requireAgent, s.handleDeleteReport)
+	route(p+"/api/share/:token/revoke", []string{http.MethodPost}, requireAgent, s.handleRevoke)
 
 	// Key self-service. The application and renewal poll endpoints are their own
 	// public surface, protected by the claim secret in X-Teleport-Claim rather
@@ -130,110 +177,248 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	//
 	// POST applications is the one write an anonymous caller may make, so it is
 	// the one route behind the per-IP limiter.
-	mux.Handle("POST "+p+"/api/agent-keys/applications",
-		s.limitKeyApplications(http.HandlerFunc(s.handleCreateKeyApplication)))
-	mux.HandleFunc("GET "+p+"/api/agent-keys/applications/{id}", s.handlePollKeyApplication)
-	mux.HandleFunc("GET "+p+"/api/agent-keys/renewals/{id}", s.handlePollRenewal)
+	route(p+"/api/agent-keys/applications", []string{http.MethodPost},
+		s.limitKeyApplications(), s.handleCreateKeyApplication)
+	get(p+"/api/agent-keys/applications/:id", s.handlePollKeyApplication)
+	get(p+"/api/agent-keys/renewals/:id", s.handlePollRenewal)
 
-	mux.Handle("GET "+p+"/api/agent-keys/me", requireAgent(http.HandlerFunc(s.handleKeyMe)))
+	get(p+"/api/agent-keys/me", requireAgent, s.handleKeyMe)
 	// The one route that admits an expired key, so that letting a key lapse is
 	// recoverable by the agent itself instead of orphaning every report it ever
 	// published. Everything it can reach is a *request*; a human still decides.
-	mux.Handle("POST "+p+"/api/agent-keys/renewals", requireAgentRenewal(http.HandlerFunc(s.handleCreateRenewal)))
+	route(p+"/api/agent-keys/renewals", []string{http.MethodPost},
+		requireAgentRenewal, s.handleCreateRenewal)
 
 	// -- dashboard ------------------------------------------------------------
-	mux.HandleFunc("POST "+p+"/api/admin/login", s.handleLogin)
-	mux.HandleFunc("POST "+p+"/api/admin/logout", s.handleLogout)
-	mux.Handle("GET "+p+"/api/admin/session", requireSession(http.HandlerFunc(s.handleSession)))
-	mux.Handle("GET "+p+"/api/admin/reports", requireSession(http.HandlerFunc(s.handleListReports)))
-	mux.Handle("GET "+p+"/api/admin/reports/{id}", requireSession(http.HandlerFunc(s.handleAdminGetReport)))
-	mux.Handle("PATCH "+p+"/api/admin/reports/{id}", requireSession(http.HandlerFunc(s.handleAdminUpdateReport)))
-	mux.Handle("DELETE "+p+"/api/admin/reports/{id}", requireSession(http.HandlerFunc(s.handleAdminDeleteReport)))
-	mux.Handle("POST "+p+"/api/admin/reports/{id}/shares", requireSession(http.HandlerFunc(s.handleCreateShare)))
-	mux.Handle("PATCH "+p+"/api/admin/shares/{token}", requireSession(http.HandlerFunc(s.handlePatchShare)))
-	mux.Handle("DELETE "+p+"/api/admin/shares/{token}", requireSession(http.HandlerFunc(s.handleDeleteShare)))
+	route(p+"/api/admin/login", []string{http.MethodPost}, s.handleLogin)
+	route(p+"/api/admin/logout", []string{http.MethodPost}, s.handleLogout)
+	get(p+"/api/admin/session", requireSession, s.handleSession)
+	get(p+"/api/admin/reports", requireSession, s.handleListReports)
+	get(p+"/api/admin/reports/:id", requireSession, s.handleAdminGetReport)
+	route(p+"/api/admin/reports/:id", []string{http.MethodPatch}, requireSession, s.handleAdminUpdateReport)
+	route(p+"/api/admin/reports/:id", []string{http.MethodDelete}, requireSession, s.handleAdminDeleteReport)
+	route(p+"/api/admin/reports/:id/shares", []string{http.MethodPost}, requireSession, s.handleCreateShare)
+	route(p+"/api/admin/shares/:token", []string{http.MethodPatch}, requireSession, s.handlePatchShare)
+	route(p+"/api/admin/shares/:token", []string{http.MethodDelete}, requireSession, s.handleDeleteShare)
 
-	// Key administration. Every one of these is Session-gated: a human manages
-	// all keys, and no agent credential reaches this surface at all.
-	mux.Handle("GET "+p+"/api/admin/keys", requireSession(http.HandlerFunc(s.handleAdminListKeys)))
-	mux.Handle("POST "+p+"/api/admin/keys", requireSession(http.HandlerFunc(s.handleAdminCreateKey)))
-	// One-step issuance: the administrator's decision is made here, when the
-	// link is generated, so the recipient never waits for a second action.
-	mux.Handle("POST "+p+"/api/admin/key-handoffs", requireSession(http.HandlerFunc(s.handleCreateKeyHandoff)))
-	mux.Handle("PATCH "+p+"/api/admin/keys/{id}", requireSession(http.HandlerFunc(s.handleAdminPatchKey)))
-	mux.Handle("GET "+p+"/api/admin/key-applications", requireSession(http.HandlerFunc(s.handleAdminListKeyApplications)))
-	mux.Handle("POST "+p+"/api/admin/key-applications/{id}/approve", requireSession(http.HandlerFunc(s.handleAdminApproveKeyApplication)))
-	mux.Handle("POST "+p+"/api/admin/key-applications/{id}/reject", requireSession(http.HandlerFunc(s.handleAdminRejectKeyApplication)))
-	mux.Handle("GET "+p+"/api/admin/key-renewals", requireSession(http.HandlerFunc(s.handleAdminListRenewals)))
-	mux.Handle("POST "+p+"/api/admin/key-renewals/{id}/approve", requireSession(http.HandlerFunc(s.handleAdminApproveRenewal)))
-	mux.Handle("POST "+p+"/api/admin/key-renewals/{id}/reject", requireSession(http.HandlerFunc(s.handleAdminRejectRenewal)))
+	// Key administration. Every one of these is Session-gated: a human manages all
+	// keys, and no agent credential reaches this surface at all.
+	get(p+"/api/admin/keys", requireSession, s.handleAdminListKeys)
+	route(p+"/api/admin/keys", []string{http.MethodPost}, requireSession, s.handleAdminCreateKey)
+	// One-step issuance: the administrator's decision is made here, when the link
+	// is generated, so the recipient never waits for a second action.
+	route(p+"/api/admin/key-handoffs", []string{http.MethodPost}, requireSession, s.handleCreateKeyHandoff)
+	route(p+"/api/admin/keys/:id", []string{http.MethodPatch}, requireSession, s.handleAdminPatchKey)
+	get(p+"/api/admin/key-applications", requireSession, s.handleAdminListKeyApplications)
+	route(p+"/api/admin/key-applications/:id/approve", []string{http.MethodPost},
+		requireSession, s.handleAdminApproveKeyApplication)
+	route(p+"/api/admin/key-applications/:id/reject", []string{http.MethodPost},
+		requireSession, s.handleAdminRejectKeyApplication)
+	get(p+"/api/admin/key-renewals", requireSession, s.handleAdminListRenewals)
+	route(p+"/api/admin/key-renewals/:id/approve", []string{http.MethodPost},
+		requireSession, s.handleAdminApproveRenewal)
+	route(p+"/api/admin/key-renewals/:id/reject", []string{http.MethodPost},
+		requireSession, s.handleAdminRejectRenewal)
 
-	// Anything else under the prefix is a JSON 404 rather than Go's plain-text
-	// "404 page not found", so clients can rely on the envelope everywhere.
+	// Serve the frontend from this same process when one is available. It is
+	// mounted as the unmatched-path fallback, so the SPA shell, its hashed assets
+	// and the API all share one origin — which is what makes the session cookie
+	// first-party and keeps the share page's `script-src 'self'` meaningful.
 	//
-	// This is registered as the prefix catch-all, and net/http gives the more
-	// specific patterns above precedence over it — that is what keeps unknown
-	// /api/... paths returning JSON instead of falling through to the SPA.
-	var root http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+	// Two sources, in order of preference:
+	//
+	//   1. Assets embedded in the binary (the normal deployment: one file to copy,
+	//      and the assets can never drift from the code).
+	//   2. STATIC_DIR on disk, which makes `pnpm run build` + restart enough to
+	//      ship a frontend change without recompiling.
+	build, buildSource, err := resolveFrontend(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var static http.Handler
+	if build != nil {
+		static, err = spa.New(build, p, buildSource)
+		if err != nil {
+			return nil, fmt.Errorf("frontend build at %s is unusable: %w", buildSource, err)
+		}
+		slog.Info("serving frontend", "source", buildSource, "prefix", p)
+	} else {
+		slog.Warn("no frontend build available; serving API only")
+	}
+
+	// Everything no route matched lands here — including a known path with an
+	// unregistered method, since Gin's 405 is switched off above. That is exactly
+	// what the old per-prefix catch-alls did, and it is what keeps an unknown
+	// /api/... path a JSON 404 instead of the SPA's HTML.
+	engine.NoRoute(func(c *gin.Context) {
+		w, r := c.Writer, c.Request
+		path := r.URL.Path
+
+		// The two redirects ServeMux used to perform, reproduced exactly.
+		// Without this a request to the *documented* entry URL — the bare prefix,
+		// which is what Caddy's `handle /yeciorez/teleport*` matches and what a
+		// human types — answers a JSON 404 instead of redirecting to the panel.
+		if serveMuxRedirect(c, p) {
+			return
+		}
+
+		// The one subtree pattern ServeMux had that a Gin route cannot express
+		// alongside its :id sibling: /k/ matched every path beneath it, so a link
+		// truncated to /k/a/b still rendered the friendly "incomplete link" page
+		// rather than a 404. The handler reads an empty id there, exactly as the
+		// old {id}-less subtree pattern did.
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+			strings.HasPrefix(path, p+"/k/") {
+			s.handleKeyHandoffPage(c)
+			c.Abort()
+			return
+		}
+
+		// API and share paths keep the JSON envelope even when the SPA owns the
+		// prefix root. Without this an unknown /api/... path is answered with the
+		// SPA shell, which is worse than it sounds: an XHR caller doing
+		// response.json() on HTML fails with a parse error and reports "bad
+		// response" instead of the actual 404.
+		if isEnvelopePath(path, p) {
+			httpx.Fail(w, r, http.StatusNotFound, "not_found", "Not found", nil)
+			return
+		}
+		if static != nil && strings.HasPrefix(path, p+"/") {
+			static.ServeHTTP(w, r)
 			return
 		}
 		httpx.Fail(w, r, http.StatusNotFound, "not_found", "Not found", nil)
 	})
 
-	// API and share paths get their own catch-alls so they keep the JSON
-	// envelope even when the SPA owns the prefix root.
-	//
-	// Without these, an unknown /api/... path matches the SPA catch-all and the
-	// client receives an HTML 404 — which is worse than it sounds: an XHR caller
-	// doing response.json() on it fails with a parse error and reports "bad
-	// response" instead of the actual 404. Both are more specific than
-	// `p+"/"`, so the SPA never sees these.
-	mux.Handle(p+"/api/", root)
-	mux.Handle(p+"/s/", root)
-
-	// Serve the frontend from this same process when one is available. It is
-	// mounted at the prefix root, so the SPA shell, its hashed assets and the
-	// API all share one origin — which is what makes the session cookie
-	// first-party and keeps the share page's `script-src 'self'` meaningful.
-	//
-	// Two sources, in order of preference:
-	//
-	//   1. Assets embedded in the binary (the normal deployment: one file to
-	//      copy, and the assets can never drift from the code).
-	//   2. STATIC_DIR on disk, which makes `pnpm run build` + restart enough to
-	//      ship a frontend change without recompiling.
-	//
-	// The JSON 404 handler stays as the fallback for /api/* and /s/* misses
-	// (spa.Handler deliberately refuses those paths too, so either layer alone
-	// is safe), and is what answers when no frontend is present at all.
-	build, buildSource, err := resolveFrontend(cfg)
-	if err != nil {
-		return nil, err
-	}
-	if build != nil {
-		static, err := spa.New(build, p, buildSource)
-		if err != nil {
-			return nil, fmt.Errorf("frontend build at %s is unusable: %w", buildSource, err)
-		}
-		slog.Info("serving frontend", "source", buildSource, "prefix", p)
-		mux.Handle(p+"/", static)
-	} else {
-		slog.Warn("no frontend build available; serving API only")
-		mux.Handle(p+"/", root)
-	}
-
-	return httpx.Chain(mux,
+	return httpx.Chain(engine,
 		httpx.Recover,
 		httpx.RequestID,
 		httpx.LogRequests,
 		httpx.SecurityHeaders,
 		httpx.CORS(cfg.FrontendOrigins),
+		// Before the engine, because routing is exactly what must not see it:
+		// Gin decodes %2F into a path separator while ServeMux did not, so
+		// /api%2Fhealth used to 404 and would otherwise now match /api/health —
+		// a refusal turned into a success.
+		rejectEncodedSlashes,
 		// Innermost, so it sees the final Content-Type before deciding. It only
 		// buffers compressible responses; everything else streams through.
 		httpx.Compress,
 	), nil
+}
+
+// subtreePatterns are the prefix subtree (trailing-slash) patterns this router
+// registers, i.e. the paths ServeMux matched as "this path and everything under
+// it". They are listed explicitly because that is what ServeMux's redirect rule
+// needs: a request for the *parent* of a subtree pattern was redirected to the
+// subtree form.
+//
+// Note /k/ is here even though its Gin route is exact — NoRoute handles the
+// subtree case, and the redirect for the bare /k must still happen.
+func subtreePatterns(prefix string) []string {
+	return []string{prefix + "/", prefix + "/api/", prefix + "/s/", prefix + "/k/"}
+}
+
+// serveMuxRedirect performs the redirect net/http.ServeMux used to perform, and
+// reports whether it wrote one. Two rules, both of which ServeMux applied and
+// neither of which is obvious:
+//
+//  1. An unclean path (doubled slashes, "." or "..", or a missing leading slash)
+//     is redirected to its cleaned form. Measured on the pre-Gin implementation:
+//     {prefix}//api/health and {prefix}/api/../api/health both answered
+//     **307** with Location set to the cleaned path.
+//  2. A path that is not itself registered but is the parent of a registered
+//     subtree pattern — the bare prefix, {prefix}/api, {prefix}/s, {prefix}/k —
+//     is redirected to the trailing-slash form. This is why the documented entry
+//     URL worked: {prefix} redirected to {prefix}/ and served the panel.
+//
+// The status is 307, not 301, because ServeMux used 307 and the difference is
+// load-bearing: 307 preserves the method, so a POST to the bare prefix stays a
+// POST. (Gin's own RedirectTrailingSlash emits a 301, which is why it is off.)
+func serveMuxRedirect(c *gin.Context, prefix string) bool {
+	r := c.Request
+	path := r.URL.Path
+
+	if cleaned := cleanPath(path); cleaned != path {
+		redirect307(c, cleaned)
+		return true
+	}
+	for _, sub := range subtreePatterns(prefix) {
+		if parent := strings.TrimSuffix(sub, "/"); path == parent {
+			redirect307(c, sub)
+			return true
+		}
+	}
+	return false
+}
+
+func redirect307(c *gin.Context, target string) {
+	// Written directly rather than via http.Redirect so the body is empty and no
+	// HTML anchor is emitted, matching what ServeMux produced for a path clean.
+	c.Writer.Header().Set("Location", target)
+	c.Writer.WriteHeader(http.StatusTemporaryRedirect)
+	c.Abort()
+}
+
+// cleanPath is net/http's own path cleaner, reproduced so the redirect target is
+// byte-identical to the one ServeMux computed. It differs from path.Clean in one
+// way that matters: a trailing slash is preserved, so {prefix}/api/ is not
+// rewritten to {prefix}/api.
+func cleanPath(p string) string {
+	if p == "" {
+		return "/"
+	}
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	np := path.Clean(p)
+	// path.Clean removes the trailing slash except for the root; put it back.
+	if p[len(p)-1] == '/' && np != "/" {
+		if len(p) == len(np)+1 && strings.HasPrefix(p, np) {
+			np = p
+		} else {
+			np += "/"
+		}
+	}
+	return np
+}
+
+// rejectEncodedSlashes answers 404 to any request whose escaped path contains an
+// encoded slash, so routing never sees one.
+//
+// It exists because Gin's radix tree matches on the **decoded** path while
+// net/http.ServeMux matched on the escaped one: /yeciorez/teleport/api%2Fhealth
+// answered 404 before the port and would answer 200 after it, turning a refusal
+// into a success. That is the wrong direction to be wrong in, and it also means
+// the router and anything reading the URL (Caddy's `handle /yeciorez/teleport*`,
+// a future audit rule) would disagree about what path this request has.
+//
+// It is deliberately blunt: no legitimate client of this service sends %2F —
+// share tokens and ids are URL-safe base64 or UUIDs, and neither contains a
+// slash.
+func rejectEncodedSlashes(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(strings.ToLower(r.URL.EscapedPath()), "%2f") {
+			httpx.Fail(w, r, http.StatusNotFound, "not_found", "Not found", nil)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isEnvelopePath reports whether an unmatched path must still be answered with
+// the JSON envelope rather than the SPA shell.
+//
+// The API and the share links are machine-read: a caller that gets HTML where it
+// expected JSON reports a parse error instead of the real 404. Everything else
+// under the prefix belongs to the SPA, which handles its own client-side routes.
+func isEnvelopePath(path, prefix string) bool {
+	for _, sub := range []string{"/api", "/s"} {
+		if path == prefix+sub || strings.HasPrefix(path, prefix+sub+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveFrontend picks the frontend build to serve, returning a nil fs.FS when
@@ -258,7 +443,9 @@ func resolveFrontend(cfg *config.Config) (fs.FS, string, error) {
 //
 // This is the primary entry point for agents: plain text, no HTML to strip, and
 // safe to hand straight to a model.
-func (s *Server) handleAIGuideMarkdown(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAIGuideMarkdown(c *gin.Context) {
+	// This handler never touches the request, so it binds only the writer.
+	w := c.Writer
 	body := aidoc.Markdown(s.aiFacts())
 	w.Header().Set("Content-Type", aidoc.ContentTypeMarkdown)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -270,7 +457,9 @@ func (s *Server) handleAIGuideMarkdown(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAIGuideHTML serves the same guide as a readable, script-free page.
-func (s *Server) handleAIGuideHTML(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAIGuideHTML(c *gin.Context) {
+	// This handler never touches the request, so it binds only the writer.
+	w := c.Writer
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", aidoc.CSP)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -287,7 +476,9 @@ func (s *Server) handleAIGuideHTML(w http.ResponseWriter, r *http.Request) {
 // NOTE: this is mounted under ROUTE_PREFIX, not at the origin root. The root of
 // this host belongs to a different service that shares api.hcyj.xyz, and
 // claiming /llms.txt there would hijack another application's path.
-func (s *Server) handleLLMsTxt(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleLLMsTxt(c *gin.Context) {
+	// This handler never touches the request, so it binds only the writer.
+	w := c.Writer
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -299,7 +490,10 @@ func (s *Server) aiFacts() aidoc.Facts {
 	return aidoc.FactsFrom(s.cfg)
 }
 
-func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleHealth(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	status := "ok"
 	code := http.StatusOK
 	// A cheap liveness probe for the database. A failure is reported as 503 so
@@ -317,8 +511,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}, code)
 }
 
-func (s *Server) handleReadShare(w http.ResponseWriter, r *http.Request) {
-	token, err := s.shareToken(r)
+func (s *Server) handleReadShare(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	token, err := s.shareToken(c.Param("token"))
 	if err != nil {
 		httpx.WriteError(w, r, err)
 		return
@@ -368,8 +565,11 @@ func (s *Server) handleReadShare(w http.ResponseWriter, r *http.Request) {
 //
 // The clearing exception is the secret: nothing on this page can show, derive or
 // be made to reveal the fragment.
-func (s *Server) handleKeyHandoffPage(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+func (s *Server) handleKeyHandoffPage(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	id := c.Param("id")
 	nowMS := store.NowMS()
 	s.expireApplications(nowMS)
 
@@ -423,8 +623,11 @@ func humanizeHours(hours float64) string {
 	return strconv.FormatFloat(hours, 'f', -1, 64) + " 小时"
 }
 
-func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
-	token, err := s.shareToken(r)
+func (s *Server) handleSharePage(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	token, err := s.shareToken(c.Param("token"))
 	if err != nil {
 		httpx.WriteError(w, r, err)
 		return
@@ -476,8 +679,11 @@ func (s *Server) handleSharePage(w http.ResponseWriter, r *http.Request) {
 //     is removed, since the one legitimate consumer of this URL is a frame.
 //     The CSP's `frame-ancestors 'self'` below is the replacement restriction —
 //     same-origin frames only, which is exactly what DENY would have prevented.
-func (s *Server) handleShareHTML(w http.ResponseWriter, r *http.Request) {
-	token, err := s.shareToken(r)
+func (s *Server) handleShareHTML(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	token, err := s.shareToken(c.Param("token"))
 	if err != nil {
 		httpx.WriteError(w, r, err)
 		return
@@ -517,7 +723,10 @@ func (s *Server) handleShareHTML(w http.ResponseWriter, r *http.Request) {
 // agent
 // ---------------------------------------------------------------------------
 
-func (s *Server) handleCreateReport(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCreateReport(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	raw, err := io.ReadAll(io.LimitReader(r.Body, s.cfg.MaxContentBytes+1<<16))
 	if err != nil {
 		httpx.WriteError(w, r, httpx.BadRequest("Could not read request body", nil))
@@ -571,8 +780,11 @@ func (s *Server) handleCreateReport(w http.ResponseWriter, r *http.Request) {
 	}, http.StatusCreated)
 }
 
-func (s *Server) handleGetReport(w http.ResponseWriter, r *http.Request) {
-	report, err := s.store.GetReport(r.PathValue("id"))
+func (s *Server) handleGetReport(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	report, err := s.store.GetReport(c.Param("id"))
 	if err != nil {
 		httpx.WriteError(w, r, httpx.Internal("Failed to load report").WithCause(err))
 		return
@@ -591,8 +803,11 @@ func (s *Server) handleGetReport(w http.ResponseWriter, r *http.Request) {
 	httpx.OK(w, r, report)
 }
 
-func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
-	token, err := s.shareToken(r)
+func (s *Server) handleRevoke(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	token, err := s.shareToken(c.Param("token"))
 	if err != nil {
 		httpx.WriteError(w, r, err)
 		return
@@ -638,8 +853,7 @@ func (s *Server) handleRevoke(w http.ResponseWriter, r *http.Request) {
 // ownership check happening before the write, the 404-not-403 rule, and the
 // response shape — lives here once, so the dashboard cannot drift into being
 // more permissive or more talkative than the agent API.
-func (s *Server) applyReportPatch(w http.ResponseWriter, r *http.Request, authorise func(*domain.Report) bool) {
-	id := r.PathValue("id")
+func (s *Server) applyReportPatch(w http.ResponseWriter, r *http.Request, id string, authorise func(*domain.Report) bool) {
 
 	raw, err := io.ReadAll(io.LimitReader(r.Body, s.cfg.MaxContentBytes+1<<16))
 	if err != nil {
@@ -687,8 +901,7 @@ func (s *Server) applyReportPatch(w http.ResponseWriter, r *http.Request, author
 }
 
 // applyReportDelete is the shared body of the agent and dashboard DELETE routes.
-func (s *Server) applyReportDelete(w http.ResponseWriter, r *http.Request, authorise func(*domain.Report) bool) {
-	id := r.PathValue("id")
+func (s *Server) applyReportDelete(w http.ResponseWriter, r *http.Request, id string, authorise func(*domain.Report) bool) {
 
 	existing, err := s.store.GetReport(id)
 	if err != nil {
@@ -720,16 +933,22 @@ func (s *Server) applyReportDelete(w http.ResponseWriter, r *http.Request, autho
 	})
 }
 
-func (s *Server) handleUpdateReport(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleUpdateReport(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	principal := httpx.PrincipalFrom(r.Context())
-	s.applyReportPatch(w, r, func(report *domain.Report) bool {
+	s.applyReportPatch(w, r, c.Param("id"), func(report *domain.Report) bool {
 		return ownerCanAccess(principal, report.OwnerKeyID)
 	})
 }
 
-func (s *Server) handleDeleteReport(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleDeleteReport(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	principal := httpx.PrincipalFrom(r.Context())
-	s.applyReportDelete(w, r, func(report *domain.Report) bool {
+	s.applyReportDelete(w, r, c.Param("id"), func(report *domain.Report) bool {
 		return ownerCanAccess(principal, report.OwnerKeyID)
 	})
 }
@@ -739,19 +958,28 @@ func (s *Server) handleDeleteReport(w http.ResponseWriter, r *http.Request) {
 // ownerCanAccess grants root (and therefore a session, which carries none of
 // the agent principal's fields) access to everything. Passing "always true"
 // keeps that in one visible place.
-func (s *Server) handleAdminUpdateReport(w http.ResponseWriter, r *http.Request) {
-	s.applyReportPatch(w, r, func(*domain.Report) bool { return true })
+func (s *Server) handleAdminUpdateReport(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	s.applyReportPatch(w, r, c.Param("id"), func(*domain.Report) bool { return true })
 }
 
-func (s *Server) handleAdminDeleteReport(w http.ResponseWriter, r *http.Request) {
-	s.applyReportDelete(w, r, func(*domain.Report) bool { return true })
+func (s *Server) handleAdminDeleteReport(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	s.applyReportDelete(w, r, c.Param("id"), func(*domain.Report) bool { return true })
 }
 
 // ---------------------------------------------------------------------------
 // dashboard
 // ---------------------------------------------------------------------------
 
-func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleLogin(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	body, err := readJSONObject(r, 4096)
 	if err != nil {
 		httpx.WriteError(w, r, err)
@@ -791,12 +1019,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleLogout(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	w.Header().Set("Set-Cookie", httpx.ClearSessionCookie(s.cfg.CookieSecure, s.cfg.CookiePath))
 	httpx.OK(w, r, map[string]any{"authenticated": false})
 }
 
-func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSession(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	subject := ""
 	if session := httpx.SessionFrom(r.Context()); session != nil {
 		subject = session.Subject
@@ -812,7 +1046,10 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 // convenience: an agent must not be able to enumerate another agent's work, and
 // it must not accidentally see the root-published reports either (owner_key_id
 // ” is root's own).
-func (s *Server) handleListOwnReports(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleListOwnReports(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	principal := httpx.PrincipalFrom(r.Context())
 	if principal == nil {
 		httpx.WriteError(w, r, httpx.Unauthorized(agentAuthFailed))
@@ -855,7 +1092,10 @@ func (s *Server) handleListOwnReports(w http.ResponseWriter, r *http.Request) {
 	httpx.OK(w, r, out)
 }
 
-func (s *Server) handleListReports(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleListReports(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	q := r.URL.Query()
 	limit := clampInt(q.Get("limit"), 50, 1, 200)
 	offset := clampInt(q.Get("offset"), 0, 0, 100_000)
@@ -916,8 +1156,11 @@ func (s *Server) ownerNameIndex() (map[string]string, error) {
 	return names, nil
 }
 
-func (s *Server) handleAdminGetReport(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+func (s *Server) handleAdminGetReport(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	id := c.Param("id")
 	report, err := s.store.GetReport(id)
 	if err != nil {
 		httpx.WriteError(w, r, httpx.Internal("Failed to load report").WithCause(err))
@@ -956,8 +1199,11 @@ func (s *Server) handleAdminGetReport(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleCreateShare(w http.ResponseWriter, r *http.Request) {
-	reportID := r.PathValue("id")
+func (s *Server) handleCreateShare(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	reportID := c.Param("id")
 
 	// An absent or empty body means "use the default duration".
 	var body map[string]any
@@ -1001,8 +1247,11 @@ func (s *Server) handleCreateShare(w http.ResponseWriter, r *http.Request) {
 	}, http.StatusCreated)
 }
 
-func (s *Server) handlePatchShare(w http.ResponseWriter, r *http.Request) {
-	token, err := s.shareToken(r)
+func (s *Server) handlePatchShare(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	token, err := s.shareToken(c.Param("token"))
 	if err != nil {
 		httpx.WriteError(w, r, err)
 		return
@@ -1070,8 +1319,11 @@ func (s *Server) handlePatchShare(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (s *Server) handleDeleteShare(w http.ResponseWriter, r *http.Request) {
-	token, err := s.shareToken(r)
+func (s *Server) handleDeleteShare(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	token, err := s.shareToken(c.Param("token"))
 	if err != nil {
 		httpx.WriteError(w, r, err)
 		return
@@ -1112,8 +1364,10 @@ func ownerCanAccess(principal *domain.Principal, ownerKeyID string) bool {
 // shareToken validates the {token} path value, returning a 404 (not a 400) when
 // the shape is wrong so a malformed token is indistinguishable from an unknown
 // one.
-func (s *Server) shareToken(r *http.Request) (string, error) {
-	raw := r.PathValue("token")
+//
+// It takes the raw path value rather than the request so that the caller reads
+// it from the router (c.Param) at the one place a router exists.
+func (s *Server) shareToken(raw string) (string, error) {
 	if raw == "" || !isShareTokenShape(raw) {
 		return "", httpx.NotFound("Report or share link not found")
 	}

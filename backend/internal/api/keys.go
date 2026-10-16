@@ -15,6 +15,8 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/gin-gonic/gin"
+
 	"github.com/zeroicey/teleport/backend/internal/agentkey"
 	"github.com/zeroicey/teleport/backend/internal/domain"
 	"github.com/zeroicey/teleport/backend/internal/httpx"
@@ -114,16 +116,20 @@ func (r keyResolver) Resolve(ctx context.Context, tokenHash string) (domain.Prin
 // headers unconditionally, so with no CDN in front a caller could mint a fresh
 // bucket per request by rotating X-Forwarded-For. ClientIP ignores every header
 // unless the immediate peer is a known proxy.
-func (s *Server) limitKeyApplications(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func (s *Server) limitKeyApplications() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		w, r := c.Writer, c.Request
 		if !s.applyLimiter.allow(httpx.ClientIP(r)) {
 			w.Header().Set("Retry-After", strconv.Itoa(s.applyLimiter.retryAfterSeconds()))
 			httpx.Fail(w, r, http.StatusTooManyRequests, "rate_limited",
 				"Too many key applications from this address; try again later", nil)
+			// Refused: stop the chain, or the handler would run and write a
+			// second response over this one.
+			c.Abort()
 			return
 		}
-		next.ServeHTTP(w, r)
-	})
+		c.Next()
+	}
 }
 
 // expireApplications closes stale rows before a read that would otherwise show
@@ -144,7 +150,10 @@ func (s *Server) expireApplications(nowMS int64) {
 
 // handleCreateKeyApplication is the open entry point: any agent may ask for a
 // credential, and a human decides whether to grant it.
-func (s *Server) handleCreateKeyApplication(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCreateKeyApplication(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	body, err := readJSONObject(r, 1<<16)
 	if err != nil {
 		httpx.WriteError(w, r, err)
@@ -212,7 +221,10 @@ func (s *Server) handleCreateKeyApplication(w http.ResponseWriter, r *http.Reque
 
 // handlePollKeyApplication is how an agent learns the decision, and the one
 // moment a plaintext credential exists.
-func (s *Server) handlePollKeyApplication(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handlePollKeyApplication(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	// net/http serves HEAD from the GET pattern, so this state-changing handler
 	// would otherwise run for a HEAD — and a HEAD has no body to carry the token
 	// back. A proxy, prefetcher or link checker that reissues a request as HEAD
@@ -224,7 +236,7 @@ func (s *Server) handlePollKeyApplication(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	id := r.PathValue("id")
+	id := c.Param("id")
 	provided := r.Header.Get(claimHeader)
 	// No id and no secret are the same answer as a secret that does not match:
 	// 404. Anything else would confirm that an application id exists.
@@ -281,7 +293,10 @@ func (s *Server) handlePollKeyApplication(w http.ResponseWriter, r *http.Request
 }
 
 // handlePollRenewal exposes a renewal's outcome to the agent that filed it.
-func (s *Server) handlePollRenewal(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handlePollRenewal(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	// Same trap as the application poll: ServeMux serves HEAD from GET, and this
 	// handler hands back a credential.
 	if r.Method == http.MethodHead {
@@ -290,7 +305,7 @@ func (s *Server) handlePollRenewal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	id := r.PathValue("id")
+	id := c.Param("id")
 	provided := r.Header.Get(claimHeader)
 	if id == "" || provided == "" {
 		httpx.WriteError(w, r, httpx.NotFound("Renewal not found"))
@@ -362,7 +377,10 @@ type keyMeResponse struct {
 
 // handleKeyMe reports the caller's own credential. Root has no key row, so it
 // gets a synthetic identity instead of a 404.
-func (s *Server) handleKeyMe(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleKeyMe(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	principal := httpx.PrincipalFrom(r.Context())
 	if principal == nil {
 		httpx.WriteError(w, r, httpx.Unauthorized(agentAuthFailed))
@@ -400,7 +418,10 @@ func (s *Server) handleKeyMe(w http.ResponseWriter, r *http.Request) {
 // handleCreateRenewal lets a key ask for more time. It stays pending until a
 // human approves it — a key that could extend itself would make expiry
 // decorative.
-func (s *Server) handleCreateRenewal(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCreateRenewal(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	principal := httpx.PrincipalFrom(r.Context())
 	if principal == nil {
 		httpx.WriteError(w, r, httpx.Unauthorized(agentAuthFailed))
@@ -442,7 +463,10 @@ func (s *Server) handleCreateRenewal(w http.ResponseWriter, r *http.Request) {
 
 // handleAdminListKeyApplications drives the approval queue. Expiry runs first so
 // the queue never shows a row that is already dead.
-func (s *Server) handleAdminListKeyApplications(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAdminListKeyApplications(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	q := r.URL.Query()
 	status := strings.TrimSpace(q.Get("status"))
 	if status == "" {
@@ -474,8 +498,11 @@ func (s *Server) handleAdminListKeyApplications(w http.ResponseWriter, r *http.R
 // application. It deliberately does not create the key: the token is derived
 // from the claim secret, which the server only holds a hash of until the agent
 // claims it. So "approving adds no key row yet" is the contract, not a bug.
-func (s *Server) handleAdminApproveKeyApplication(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+func (s *Server) handleAdminApproveKeyApplication(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	id := c.Param("id")
 	body, err := readOptionalJSONObject(r, 1<<16)
 	if err != nil {
 		httpx.WriteError(w, r, err)
@@ -523,8 +550,11 @@ func (s *Server) handleAdminApproveKeyApplication(w http.ResponseWriter, r *http
 }
 
 // handleAdminRejectKeyApplication transitions a pending application to rejected.
-func (s *Server) handleAdminRejectKeyApplication(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+func (s *Server) handleAdminRejectKeyApplication(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	id := c.Param("id")
 	body, err := readOptionalJSONObject(r, 1<<16)
 	if err != nil {
 		httpx.WriteError(w, r, err)
@@ -550,7 +580,10 @@ func (s *Server) handleAdminRejectKeyApplication(w http.ResponseWriter, r *http.
 // handleAdminListKeys returns every key, active or not. TokenHash is json:"-"
 // on the domain type, so it cannot be serialized even by accident, and the
 // plaintext does not exist server-side at all.
-func (s *Server) handleAdminListKeys(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAdminListKeys(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	keys, err := s.store.ListAgentKeys()
 	if err != nil {
 		httpx.WriteError(w, r, httpx.Internal("Failed to list keys").WithCause(err))
@@ -574,7 +607,10 @@ func (s *Server) handleAdminListKeys(w http.ResponseWriter, r *http.Request) {
 // server, so the secret stays out of access logs and out of the Referer header
 // of anything the page loads; it is read by the page's own script and sent as
 // the X-Teleport-Claim header of the claim request.
-func (s *Server) handleCreateKeyHandoff(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleCreateKeyHandoff(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	body, err := readJSONObject(r, 1<<16)
 	if err != nil {
 		httpx.WriteError(w, r, err)
@@ -674,7 +710,10 @@ func (s *Server) handoffPrompt(app *domain.KeyApplication, claimSecret string) s
 // handleAdminCreateKey mints a credential outright, for handing one to an agent
 // that cannot poll. This response is one of only two places a plaintext token
 // ever appears.
-func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAdminCreateKey(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	body, err := readJSONObject(r, 1<<16)
 	if err != nil {
 		httpx.WriteError(w, r, err)
@@ -708,8 +747,11 @@ func (s *Server) handleAdminCreateKey(w http.ResponseWriter, r *http.Request) {
 
 // handleAdminPatchKey renames a key, changes its expiry (which is the human's
 // direct renewal path) or revokes it.
-func (s *Server) handleAdminPatchKey(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+func (s *Server) handleAdminPatchKey(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	id := c.Param("id")
 	body, err := readJSONObject(r, 1<<16)
 	if err != nil {
 		httpx.WriteError(w, r, err)
@@ -771,7 +813,10 @@ func (s *Server) handleAdminPatchKey(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAdminListRenewals drives the renewal approval queue.
-func (s *Server) handleAdminListRenewals(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAdminListRenewals(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
 	q := r.URL.Query()
 	status := strings.TrimSpace(q.Get("status"))
 	if status == "" {
@@ -798,8 +843,11 @@ func (s *Server) handleAdminListRenewals(w http.ResponseWriter, r *http.Request)
 
 // handleAdminApproveRenewal extends the key. With no `expiresInHours` the
 // agent's requested lifetime is granted.
-func (s *Server) handleAdminApproveRenewal(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+func (s *Server) handleAdminApproveRenewal(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	id := c.Param("id")
 	body, err := readOptionalJSONObject(r, 1<<16)
 	if err != nil {
 		httpx.WriteError(w, r, err)
@@ -844,8 +892,11 @@ func (s *Server) handleAdminApproveRenewal(w http.ResponseWriter, r *http.Reques
 }
 
 // handleAdminRejectRenewal refuses a renewal without touching the key.
-func (s *Server) handleAdminRejectRenewal(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
+func (s *Server) handleAdminRejectRenewal(c *gin.Context) {
+	// w and r keep every handler body byte-identical to the net/http version;
+	// only the signature and c.Param (below) differ.
+	w, r := c.Writer, c.Request
+	id := c.Param("id")
 	if _, err := s.store.DecideRenewal(id, false, 0, store.NowMS()); err != nil {
 		writeKeyLifecycleError(w, r, err)
 		return

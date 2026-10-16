@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1225,6 +1228,243 @@ func TestAIGuideDoesNotLeakSecrets(t *testing.T) {
 			if strings.Contains(body, secret) {
 				t.Errorf("%s leaked a credential", path)
 			}
+		}
+	}
+}
+
+// TestHeadIsRoutedLikeGet pins the one net/http behaviour the Gin port has to
+// reproduce by hand.
+//
+// net/http's ServeMux serves HEAD from a GET pattern; Gin does not — HEAD is a
+// separate method tree, so a GET-only route answers HEAD with the 404 fallback
+// unless HEAD is registered too. The port therefore registers every GET route for
+// both methods (see the `get` helper in New).
+//
+// This is not academic. The one frozen 405 in the contract is *reached through
+// HEAD*: HEAD on the claim endpoint must run the handler so it can refuse with
+// 405 rather than burn a one-time hand-off link
+// (TestKeyHandoffClaimRefusesHEAD). If HEAD stopped being routed, that guard would
+// become dead code and the 405 would silently degrade to 404. This test catches
+// the general regression — HEAD no longer reaching GET handlers at all — so the
+// reason is visible even if someone edits the claim route in isolation.
+//
+// What it deliberately does NOT assert: that a HEAD response has an empty body.
+// net/http's *server* discards body writes for a HEAD request, but
+// httptest.ResponseRecorder does not — it records whatever the handler wrote, so
+// a body assertion here fails against a correct implementation and tells us
+// nothing about ours. (Found by writing that assertion and watching it fail on
+// /api/health, where the handler writes a JSON body and only a real net/http
+// server suppresses it.) The status equality below is the part that is actually
+// about routing.
+func TestHeadIsRoutedLikeGet(t *testing.T) {
+	h, _ := testServer(t)
+
+	for _, path := range []string{
+		testPrefix + "/api/health",
+		testPrefix + "/ai.md",
+		testPrefix + "/llms.txt",
+	} {
+		get := do(t, h, http.MethodGet, path, "", nil)
+		head := do(t, h, http.MethodHead, path, "", nil)
+
+		if get.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, want 200 (this test needs a working GET route)", path, get.Code)
+		}
+		if head.Code != get.Code {
+			t.Errorf("HEAD %s = %d, GET = %d: HEAD is not routed like GET, so every "+
+				"handler that guards against HEAD is now unreachable", path, head.Code, get.Code)
+		}
+	}
+}
+
+// TestCompressWorksThroughGinEngine guards the interaction the Gin port created:
+// httpx.Compress is an outer middleware that wraps the raw ResponseWriter and now
+// wraps a *gin.Engine*, with gin's own ResponseWriter in between.
+//
+// That code is the subtlest in the repository — it defers the encoding decision
+// because net/http flushes the header block on the first write, and getting the
+// decision wrong does not merely skip compression: the client is told
+// Content-Length: N with no Content-Encoding, receives gzip bytes, and aborts with
+// "end of response with N bytes missing". So the assertion is a full round trip:
+// the gzip body must inflate to exactly the bytes the uncompressed request
+// returned, and Content-Length must be gone rather than describing the old body.
+//
+// /llms.txt is used because it is text/plain and comfortably over the 1 KiB floor.
+// (text/markdown is deliberately NOT in the compressible list, so /ai.md is the
+// wrong subject for this test.)
+func TestCompressWorksThroughGinEngine(t *testing.T) {
+	h, _ := testServer(t)
+
+	plain := do(t, h, http.MethodGet, testPrefix+"/llms.txt", "", nil)
+	gz := do(t, h, http.MethodGet, testPrefix+"/llms.txt", "", map[string]string{
+		"Accept-Encoding": "gzip",
+	})
+
+	if plain.Code != http.StatusOK || gz.Code != http.StatusOK {
+		t.Fatalf("statuses: plain=%d gzip=%d, want 200 both", plain.Code, gz.Code)
+	}
+	if got := gz.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip — compression is not reaching a Gin-served response", got)
+	}
+	if got := gz.Header().Get("Vary"); !strings.Contains(got, "Accept-Encoding") {
+		t.Errorf("Vary = %q, want it to include Accept-Encoding so a shared cache cannot "+
+			"hand gzip bytes to a client that cannot read them", got)
+	}
+	if got := gz.Header().Get("Content-Length"); got != "" {
+		t.Errorf("Content-Length = %q must be dropped when the body is re-encoded; keeping the "+
+			"uncompressed length is the truncation bug this writer exists to prevent", got)
+	}
+
+	zr, err := gzip.NewReader(bytes.NewReader(gz.Body.Bytes()))
+	if err != nil {
+		t.Fatalf("body is not gzip despite Content-Encoding: gzip: %v", err)
+	}
+	inflated, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("inflate: %v", err)
+	}
+	if !bytes.Equal(inflated, plain.Body.Bytes()) {
+		t.Errorf("gzip body does not round-trip: %d inflated vs %d plain bytes",
+			len(inflated), plain.Body.Len())
+	}
+}
+
+// TestRefusedRequestNeverReachesTheHandler guards the GinMiddleware adapter's
+// refusal path (internal/httpx/gin.go).
+//
+// The adapter runs an httpx middleware around a next-handler that calls c.Next().
+// When the middleware refuses it writes the response itself and never calls next,
+// and the adapter must then Abort — otherwise Gin continues the chain and the
+// handler runs anyway, on an unauthenticated request, and writes a second
+// response over the first. Asserting only the 401 would miss that completely: the
+// status would still look right while the write had already happened.
+//
+// So this asserts the effect, not the response: a report that the handler would
+// have created must not exist. That is the same shape as the ownership tests,
+// which count rows rather than trust the status code.
+func TestRefusedRequestNeverReachesTheHandler(t *testing.T) {
+	h, cfg := testServer(t)
+	before := reportCount(t, cfg)
+
+	rec := do(t, h, http.MethodPost, testPrefix+"/api/reports",
+		`{"title":"must not exist","content":"x"}`, bearerHeaders("not-a-real-token"))
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("bad credential: status = %d, want 401", rec.Code)
+	}
+	if code := envelopeCode(t, rec); code != "unauthorized" {
+		t.Errorf("error code = %q, want unauthorized", code)
+	}
+	if after := reportCount(t, cfg); after != before {
+		t.Fatalf("a refused request still created %d report(s): the middleware refused but the "+
+			"handler ran anyway, so c.Abort() is not stopping the Gin chain", after-before)
+	}
+}
+
+// reportCount counts reports directly, bypassing the API's ownership rules, so a
+// test can prove that a refused request wrote nothing rather than merely that it
+// returned 401.
+func reportCount(t *testing.T, cfg *config.Config) int {
+	t.Helper()
+	pool := testStoreHandle(t, cfg)
+	var n int
+	if err := pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM reports`).Scan(&n); err != nil {
+		t.Fatalf("count reports: %v", err)
+	}
+	return n
+}
+
+// TestServeMuxPathSemanticsArePreserved is the guard for the whole class of
+// divergence the Gin port could have introduced silently: Gin's router is not
+// net/http's, and the frozen tests covered none of these shapes.
+//
+// Every "want" below was MEASURED against the pre-Gin implementation (a
+// `git archive HEAD` tree driven by the same probe), not recalled. Three
+// behaviours had to be reproduced deliberately:
+//
+//  1. ServeMux redirected an unclean path — doubled slashes, "." or ".." — to its
+//     cleaned form with **307**, and redirected the *parent* of a registered
+//     subtree pattern to the trailing-slash form. The bare prefix is the case that
+//     matters: it is the documented entry URL and Caddy's `handle
+//     /yeciorez/teleport*` matches it, so without the redirect the panel's front
+//     door answers a JSON 404. 307 rather than Gin's 301, because 307 preserves the
+//     method — a 301 on a POST is how a POST silently becomes a GET.
+//  2. `/k/` was a ServeMux *subtree* pattern, so a link truncated to /k/a/b still
+//     painted the friendly "incomplete link" page. A Gin route cannot express that
+//     alongside its `:id` sibling, so NoRoute handles it.
+//  3. ServeMux matched on the **escaped** path, so /api%2Fhealth was a 404. Gin
+//     decodes the %2F and would have let it match /api/health — turning a refusal
+//     into a success, which is the wrong direction to be wrong in.
+//
+// Row one and the encoded-slash row were real regressions before this test
+// existed, found by a differential review that ran both implementations side by
+// side. They are asserted here so that "the frozen tests are green" can no longer
+// hide them.
+func TestServeMuxPathSemanticsArePreserved(t *testing.T) {
+	h, _ := testServerWithFrontend(t)
+	p := testPrefix
+
+	for _, tc := range []struct {
+		name   string
+		method string
+		path   string
+		code   int
+		loc    string
+	}{
+		{"bare prefix redirects to the panel", http.MethodGet, p, http.StatusTemporaryRedirect, p + "/"},
+		{"the prefix root serves the SPA", http.MethodGet, p + "/", http.StatusOK, ""},
+		{"bare /api redirects, it does not 404", http.MethodGet, p + "/api", http.StatusTemporaryRedirect, p + "/api/"},
+		{"bare /s redirects", http.MethodGet, p + "/s", http.StatusTemporaryRedirect, p + "/s/"},
+		{"bare /k redirects", http.MethodGet, p + "/k", http.StatusTemporaryRedirect, p + "/k/"},
+		{"doubled slash is cleaned", http.MethodGet, p + "//api/health", http.StatusTemporaryRedirect, p + "/api/health"},
+		{"dot-dot is cleaned", http.MethodGet, p + "/api/../api/health", http.StatusTemporaryRedirect, p + "/api/health"},
+		{"an encoded slash is refused", http.MethodGet, p + "/api%2Fhealth", http.StatusNotFound, ""},
+		// A POST must stay a POST across the redirect: 301 would not.
+		{"a POST to the bare prefix keeps its method", http.MethodPost, p, http.StatusTemporaryRedirect, p + "/"},
+		{"a HEAD to the bare prefix redirects too", http.MethodHead, p, http.StatusTemporaryRedirect, p + "/"},
+		// /k/ is a subtree: anything under it paints the page, id or not.
+		{"a truncated hand-off link still renders", http.MethodGet, p + "/k/a/b", http.StatusOK, ""},
+		{"a deeper truncated link still renders", http.MethodGet, p + "/k/a/b/c", http.StatusOK, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := do(t, h, tc.method, tc.path, "", nil)
+			if rec.Code != tc.code {
+				t.Errorf("%s %s = %d, want %d (measured pre-Gin behaviour)", tc.method, tc.path, rec.Code, tc.code)
+			}
+			if got := rec.Header().Get("Location"); got != tc.loc {
+				t.Errorf("%s %s Location = %q, want %q", tc.method, tc.path, got, tc.loc)
+			}
+		})
+	}
+
+	// The redirect target must work, or the redirect is a loop.
+	rec := do(t, h, http.MethodGet, p+"/", "", nil)
+	if rec.Code != http.StatusOK {
+		t.Errorf("the bare-prefix redirect target %s/ = %d, want 200", p, rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Errorf("the prefix root Content-Type = %q, want the SPA's HTML", ct)
+	}
+
+	// /api/ and /s/ (the redirect targets) must be the JSON envelope, not the SPA
+	// shell: the frozen contract is that an unknown API path never degrades into
+	// HTML.
+	for _, path := range []string{p + "/api/", p + "/s/"} {
+		rec := do(t, h, http.MethodGet, path, "", nil)
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+			t.Errorf("GET %s Content-Type = %q, want JSON", path, ct)
+		}
+		if ok, _, code := decodeEnvelope(t, rec); ok || code != "not_found" {
+			t.Errorf("GET %s envelope = ok=%v code=%q, want not_found", path, ok, code)
+		}
+	}
+
+	// Neighbouring non-API paths still belong to the SPA: the JSON rule must not
+	// swallow them.
+	for _, path := range []string{p + "/apifoo", p + "/sfoo"} {
+		rec := do(t, h, http.MethodGet, path, "", nil)
+		if rec.Code != http.StatusOK {
+			t.Errorf("GET %s = %d, want 200 from the SPA fallback", path, rec.Code)
 		}
 	}
 }

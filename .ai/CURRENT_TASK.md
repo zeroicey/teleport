@@ -1,9 +1,9 @@
 # Current task
 
-**Status:** 🚧 **P0 ✅ / P1 ✅（附更正）/ P2 ✅（P2.1–P2.3）** —— store 本体已换成 **pgx + sqlc**，
-SQLite 残留（驱动、`migrations/`、`schema.sql`、`check-schema-sync.mjs`）已删除；两档闸门
-（`scripts/check.sh` 无库档、`scripts/test-pg.sh` 强制真库）对**真库**全绿，`go test ./...`
-0 失败。**P3（Gin/HTTP）未开工；线上仍是旧版且已停（502）。**
+**Status:** 🚧 **P0 ✅ / P1 ✅（附更正）/ P2 ✅（P2.1–P2.3）/ P3 ✅** —— store 已换成 **pgx + sqlc**，
+HTTP 层已换成 **Gin**（`internal/api` 路由表 + handler；`internal/httpx` 认证中间件经适配器
+接入 Gin）。**`internal/api` 的 47 个测试与 `internal/httpx` 全部零改动通过**；两档闸门对
+**真库**全绿，`-race` 干净。**P4（全链路 + 浏览器验证）未开工；线上仍是旧版且已停（502）。**
 
 **P2.3 交付物**：`internal/store/` 的 `queries.go` + `keys.go` 改为 pgx；新增
 `internal/store/queries/*.sql`（sqlc 源）+ `internal/store/storedb/`（生成物）+ `backend/sqlc.yaml` +
@@ -44,6 +44,36 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   （零处提到 PostgreSQL，备份步骤仍是 sqlite3）、`README.md`、`.engram/BOOTSTRAP.md`、
   `backend/deploy/teleport.env.example`（仍写 `DB_PATH`，照它部署**启动即失败**）、
   若干测试注释与 `.gitignore`。
+
+**P3 交付物（HTTP 层 → Gin）**：
+- `internal/api/router.go` 的 `New` 改成 **Gin 路由表**（`gin.New()`，关掉
+  `RedirectTrailingSlash`/`RedirectFixedPath`/`HandleMethodNotAllowed`，否则会出现
+  ServeMux 从未有过的 301/307/405）；39 个 handler 变成 `gin.HandlerFunc`，用 `c.Param`
+  取代 `PathValue`。
+- `internal/httpx/gin.go`：`GinMiddleware(mw)` 把现有的 net/http 中间件适配成 Gin 中间件，
+  并把中间件塞进 request context 的 principal/session/requestId 回写到 `c.Request`，
+  所以下游（含服务端渲染的交接页）读法一字未变。拒绝时 `c.Abort()`。
+- **信封、session 加密、`ClientIP` 全部保持纯函数**，仍以 `(w, r)` 调用
+  （`httpx.OK(c.Writer, c.Request, ...)`），所以信封逐字节不变、其测试零改动。
+- 传输链（Recover/RequestID/LogRequests/SecurityHeaders/CORS/Compress）**仍包在 Gin 引擎外面**，
+  理由见决策记录：`Compress` 靠包装**原始** ResponseWriter 才正确，`CORS` 必须在路由**之前**
+  处理 OPTIONS（都有冻结测试盯着），在 Gin 里重建这两个是纯粹的净损失。
+- **HEAD 必须显式注册**（`get` helper = GET+HEAD）：Gin 不会把 HEAD 路由给 GET handler，
+  而冻结契约里唯一一处真 405 正是「HEAD 领取一次性凭据」。
+  新增 `TestHeadIsRoutedLikeGet` 并**反证**过（删掉 HEAD 注册 → 它与
+  `TestKeyHandoffClaimRefusesHEAD` 一起变红，405 退化成 404）。
+- **gin 版本钉在 v1.10.1**：实测 v1.11.0 起 `gin/binding` 会链入 `mongo-driver/v2/bson`、
+  `gin` 会链入 `quic-go/http3`（v1.11.0 有 15 个这类包，v1.12.0 有 22 个，v1.10.1 是 0）。
+  一个手写信封、自己解析 body、只跑 HTTP/1.1 的服务不该链进 BSON 编解码器和 HTTP/3 栈。
+
+**P3 已验证 / 未验证**：
+- ✅ `internal/api`（47 个测试）与 `internal/httpx` **零测试改动**通过 —— 这是 ADR 的完成判据。
+- ✅ 逐个跑过 Gin 默认值会破坏的冻结行为：`TestMethodNotAllowed`、`TestKeyHandoffClaimRefusesHEAD`、
+  `TestCORSPreflightOnRealRoute`、`TestUnknownRouteWithSPAStaysJSON`、
+  `TestNewRoutesAreNotSwallowedBySPA`、`TestRoutesAreMountedUnderPrefix`、`TestAIGuideRejectsNonGET`。
+- ✅ 两档闸门绿；`internal/api` + `internal/httpx` 的 `-race` 干净。
+- ⛔ **未做：P4 全链路（`cmd` 起 Gin+pgx 端到端）+ 真实浏览器 + 大陆观测点**。
+  现在绿的是「冻结断言对新 HTTP 层绿」，仍**不是**「在野契约端到端绿」。
 
 **Updated:** 2026-10-16
 **目标：** 把 teleport 重写到 Gin + pgx/sqlc + PostgreSQL，**在野契约逐字节不变**，
@@ -105,7 +135,7 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 | ↳ **P2.2** | ✅ 锁定设计已验证：`pg_advisory_xact_lock` 的三个键（`pg.go`）。确定性实验证明 READ COMMITTED 下 cap=1 能落 2 行（不是假设）；锁能把第二个事务真的擋住并使 cap 精确，24 竞争者×5 轮 → 每轮恰好 3 个赢 | 先有靶子再改实现，否则锁加错地方也看不出来 |
 | ↳ **P2.2b** | ✅ 迁移内容哈希守卫：`schema_migrations` 记 sha256，库与文件不符就拒绝启动（含旧迁移器建的库）。4 个测试 + 端到端反证（改文件→拒绝，撤销→通过，文件与 HEAD 逐字节相同） | 把 2026-10-16 那次事故从「靠守卫事后发现」变成「源头不可能发生」 |
 | ↳ **P2.3** | ✅ 完成：`queries.go` + `keys.go` 改 pgx；sqlc 生成 `storedb`（两张动态 `SET` 列表用 `COALESCE(sqlc.narg(...))` + `CASE` 表达为单条静态语句——ADR 的 Revisit 条款担心的那点已被实测证明可行）；三处上限用已验证的 advisory lock；`SELECT ... FOR UPDATE` 未被采用（无法锁不存在的行）。断言未为了变绿而重写：唯一改断言机制的一处是 `TestNoPlaintextCollected` 的 `sqlite_master` → `information_schema`（PG 无 sqlite 元数据表），**被断言的性质（明文永不入库）原样保留** | P2 的主体 |
-| P3 | `internal/httpx` → Gin 中间件；`internal/api` 移植 | 封套与状态码必须逐条对齐 |
+| **P3** | ✅ 完成：Gin 路由表 + `gin.HandlerFunc` handler（`c.Param`）；`internal/httpx` 的认证中间件用 `httpx.GinMiddleware` 适配成 Gin 中间件；信封/session/principal 仍是框架无关的纯函数。**零测试改动**通过。决策与 gin 版本证据见 `2026-10-16-p3-gin-integration.md` | 封套与状态码逐条对齐 —— 已逐条验证 |
 | P4 | 全链路起新版（Gin + pgx），243 测试 + 浏览器验证 | 切换前的最后一道闸 |
 | P5 | SQLite → PG 的数据搬运脚本 + 行数核对（5 报告 / 2 密钥 / 全部分享链接） | 切换当天不能靠猜 |
 | P6 | 切到 hpcore（frpc 隧道 8788）。**hcyj 的 Caddy 需要改**：加 `teleport.hcyj.xyz` site block + 证书，并保留原有 `handle /yeciorez/teleport*`（见 `2026-10-16-teleport-own-hostname.md`）。两个入口都必须在同一窗口验证 | 用户要的最终形态：hcyj 只转发；且新域名不再挤在别人的路径下 |
