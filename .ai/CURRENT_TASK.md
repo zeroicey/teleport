@@ -1,7 +1,8 @@
 # Current task
 
-**Status:** 🚧 **P0 ✅ / P1 ✅** —— 契约已钉住（243 → 247 个测试）；PostgreSQL 库、角色、
-基线迁移、快照与漂移守卫都已就位并在真库上验证（8 个新测试）。P2（store 换 pgx）未开工。
+**Status:** 🚧 **P0 ✅ / P1 ✅（附一处更正）/ P2 待批** —— 契约已钉住（243 → 247 个测试）；
+PostgreSQL 库、角色、基线迁移、快照与漂移守卫都已就位。**P2 的测试策略已写成 ADR 提案，
+等人类裁决**（`.ai/decisions/2026-10-16-p2-test-strategy.md`）。
 **Updated:** 2026-10-16
 **目标：** 把 teleport 重写到 Gin + pgx/sqlc + PostgreSQL，**在野契约逐字节不变**，
 然后部署到 hpcore（本机），让 hcyj 只剩转发。
@@ -36,8 +37,9 @@
 | # | 任务 | 为什么排在这里 |
 | --- | --- | --- |
 | **P0** | ✅ 清点完成 + 补上缺口：审计发现 **agentkey 的三个派生标签零测试覆盖**（最危险的一条），已加 4 个守卫（标签字面量 + 黄金字节 + 独立重算 + 续期域分离），并做了两次反证确认会变红。剩下的 11 项契约已由现有测试钉住（见下） | 重写期间的每一次"绿"必须是同一个判据下的绿 |
-| **P1** | ✅ 完成：库/角色 `teleport`（非超级用户）、`migrations_pg/0001_init.sql`（合并式基线）、生成的 `schema.pg.sql`、`MigratePG` 运行器、8 个新测试（在真库 `teleport_test` 上验证 4 处**必须改对**的转换）、两道漂移守卫 | schema 是后面一切的接口 |
-| P2 | `internal/store/` 逐函数换成 pgx + sqlc（每换一个跑一遍现有 store 测试）—— **注意：SQLite 的单写者保证在 PG 里消失，待批准上限/密钥上限/分享链接计数这三处必须显式加锁** | 存储语义最容易在不知不觉中变 |
+| **P1** | ✅ 完成（**附更正，见下**）：库/角色 `teleport`（非超级用户）、`migrations_pg/0001_init.sql`（合并式基线）、生成的 `schema.pg.sql`、`MigratePG` 运行器、8 个新测试（在真库 `teleport_test` 上验证 4 处**必须改对**的转换）、两道漂移守卫 | schema 是后面一切的接口 |
+| **P1.1** | ✅ 更正：P1 记的「在真库上验证」当时**已经不成立** —— `teleport_test` 是**未提交的中间版本**建的库，合并式基线按文件名记录、永不重放，于是库里留着 `CHECK ((metadata)::json IS NOT NULL)` 而文件里是 `CHECK (metadata IS JSON)`，`TestPGMetadataCheckRejectsInvalidJSON` 实际是红的（期望 23514，得到 22P02）。已 DROP/CREATE 重建 `teleport_test` 并复跑 → 8/8 绿。两道漂移守卫是**文件对文件**，看不到真库。见 pitfall `2026-10-16-merged-baseline-hides-a-stale-test-db.md`。生产意图库 `teleport` 当时仍是空的，P5/P6 未受影响 | 「绿」必须真的对应当前文件；否则后面每一次绿都不可信 |
+| P2 | `internal/store/` 逐函数换成 pgx + sqlc（每换一个跑一遍现有 store 测试）—— **注意：SQLite 的单写者保证在 PG 里消失，待批准上限/密钥上限/分享链接计数这三处必须显式加锁**。**开工前先定测试策略**（见 ADR 提案） | 存储语义最容易在不知不觉中变 |
 | P3 | `internal/httpx` → Gin 中间件；`internal/api` 移植 | 封套与状态码必须逐条对齐 |
 | P4 | 全链路起新版（Gin + pgx），243 测试 + 浏览器验证 | 切换前的最后一道闸 |
 | P5 | SQLite → PG 的数据搬运脚本 + 行数核对（5 报告 / 2 密钥 / 全部分享链接） | 切换当天不能靠猜 |
@@ -48,6 +50,7 @@
 
 ## 未做 / 需要人类
 
+- **P2 的测试策略等裁决**：`.ai/decisions/2026-10-16-p2-test-strategy.md`（建议 B：每测一个 schema，从内嵌迁移现建现拆）。P2 的任何代码都排在这个裁决之后。
 - 本仓库在 GitHub 上还不存在（本地目录 `/data/dev/teleport-gin`）。
 - 线上仍是旧版（hcyj，SQLite + net/http），用户裁决「等重写版就绪再切」。
 - 与 clip 共享的基础设施改动要**同时想两边**（hcyj 的 Caddyfile 同时服务两个站点）。
