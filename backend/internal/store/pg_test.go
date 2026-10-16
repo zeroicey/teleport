@@ -3,58 +3,25 @@ package store
 import (
 	"context"
 	"errors"
-	"net/url"
-	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/zeroicey/teleport/backend/internal/store/storetest"
 )
 
-// testPGPool returns a pool against the *test* database, or skips.
-//
-// Two guards, both deliberate:
-//
-//  1. Without TEST_PG_DSN the PostgreSQL tests skip, so `go test ./...` works on
-//     a machine with no database and the gate stays green.
-//  2. The database name must contain "test". These tests TRUNCATE tables, and a
-//     stray environment variable must not be able to point them at the database
-//     that holds real reports and credentials. A missing database is a visible
-//     failure; a wrongly-targeted one is data loss.
-func testPGPool(t *testing.T) *pgxpool.Pool {
-	t.Helper()
-	dsn := strings.TrimSpace(os.Getenv("TEST_PG_DSN"))
-	if dsn == "" {
-		t.Skip("TEST_PG_DSN not set; skipping PostgreSQL-backed tests")
-	}
-	name := ""
-	if u, err := url.Parse(dsn); err == nil {
-		name = strings.TrimPrefix(u.Path, "/")
-	}
-	if !strings.Contains(name, "test") {
-		t.Fatalf("refusing to run: TEST_PG_DSN names database %q, which does not contain \"test\"", name)
-	}
-
-	ctx := context.Background()
-	pool, err := OpenPG(ctx, dsn, 4)
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
-	t.Cleanup(pool.Close)
-
-	// agent_keys cascades to key_renewals; reports cascades to share_tokens.
-	if _, err := pool.Exec(ctx, `TRUNCATE reports, agent_keys, key_applications CASCADE`); err != nil {
-		t.Fatalf("truncate: %v", err)
-	}
-	return pool
-}
+// Every PostgreSQL test runs in its own schema, created from the embedded
+// migrations by the shared harness and dropped when the test ends. The DSN
+// guard (TEST_PG_DSN must name a database containing "test") lives in the
+// harness, because internal/api's tests need the same isolation and the same
+// guard.
 
 // TestPGMigrationsApplyAndAreIdempotent proves the baseline builds a schema and
 // that re-running it is a no-op rather than an error.
 func TestPGMigrationsApplyAndAreIdempotent(t *testing.T) {
-	pool := testPGPool(t)
+	pool := storetest.Pool(t, MigratePG)
 	ctx := context.Background()
 
 	var version string
@@ -89,7 +56,7 @@ func TestPGMigrationsApplyAndAreIdempotent(t *testing.T) {
 // report would fail with "integer out of range" — so this asserts a *current*
 // epoch-millisecond value round-trips, not just that the column exists.
 func TestPGTimestampsAreBigint(t *testing.T) {
-	pool := testPGPool(t)
+	pool := storetest.Pool(t, MigratePG)
 	ctx := context.Background()
 
 	now := time.Now().UnixMilli()
@@ -126,7 +93,7 @@ func TestPGTimestampsAreBigint(t *testing.T) {
 // changes what a constraint violation looks like to the caller — so this asserts
 // a violation, not a particular error string.
 func TestPGMetadataCheckRejectsInvalidJSON(t *testing.T) {
-	pool := testPGPool(t)
+	pool := storetest.Pool(t, MigratePG)
 	ctx := context.Background()
 	now := time.Now().UnixMilli()
 
@@ -171,7 +138,7 @@ func sqlStateOf(err error) string {
 // TestPGUpdatedAtTriggerMatchesTheSQLiteCondition pins the trigger's behaviour,
 // including the condition that makes it almost never fire.
 func TestPGUpdatedAtTriggerMatchesTheSQLiteCondition(t *testing.T) {
-	pool := testPGPool(t)
+	pool := storetest.Pool(t, MigratePG)
 	ctx := context.Background()
 	created := time.Now().Add(-time.Hour).UnixMilli()
 
@@ -219,7 +186,7 @@ func TestPGUpdatedAtTriggerMatchesTheSQLiteCondition(t *testing.T) {
 // PostgreSQL's float4 REAL, the value below would be rounded on the way in and
 // the Go code (which scans float64) would silently see a different number.
 func TestPGDoublePrecisionHours(t *testing.T) {
-	pool := testPGPool(t)
+	pool := storetest.Pool(t, MigratePG)
 	ctx := context.Background()
 	now := time.Now().UnixMilli()
 
@@ -243,7 +210,7 @@ func TestPGDoublePrecisionHours(t *testing.T) {
 // to BOOLEAN: the Go queries compare `is_active = 1`, and a BOOLEAN column would
 // make every one of those statements a type error.
 func TestPGIntegerFlagsStayIntegers(t *testing.T) {
-	pool := testPGPool(t)
+	pool := storetest.Pool(t, MigratePG)
 	ctx := context.Background()
 	now := time.Now().UnixMilli()
 
@@ -276,7 +243,7 @@ func TestPGIntegerFlagsStayIntegers(t *testing.T) {
 // cascade that deletes a report's links, and the view whose liveness predicate
 // was rewritten from strftime to EXTRACT.
 func TestPGCascadeAndView(t *testing.T) {
-	pool := testPGPool(t)
+	pool := storetest.Pool(t, MigratePG)
 	ctx := context.Background()
 	now := time.Now().UnixMilli()
 

@@ -17,6 +17,7 @@
     "db:check-schema": "node scripts/check-schema-sync.mjs",
     "backend:build": "bash scripts/build.sh",
     "backend:test": "cd backend && go test ./...",
+    "backend:test-pg": "bash scripts/test-pg.sh",
     "backend:vet": "cd backend && go vet ./...",
     "backend:hash-password": "cd backend && go run . hash-password"
   },

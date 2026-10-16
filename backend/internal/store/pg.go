@@ -10,6 +10,41 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Advisory lock keys for the count-then-write decisions that SQLite used to make
+// safe for free.
+//
+// SQLite allows exactly one writer, and `_txlock=immediate` takes that writer
+// lock when a transaction begins — so "count the rows, then insert if under the
+// limit" was atomic without anyone writing it down. PostgreSQL grants no such
+// thing: under its default READ COMMITTED, two concurrent transactions can both
+// read COUNT(*) = 0 and both insert. `SELECT COUNT(*) ... FOR UPDATE` does not
+// fix it either, because the rows that would violate the cap do not exist yet
+// and there is nothing to lock — the anomaly is a phantom.
+//
+// The three sites below therefore take a transaction-scoped advisory lock
+// (pg_advisory_xact_lock) before reading the count. The lock is released on
+// commit or rollback, so it cannot be leaked by a forgotten unlock, and it
+// serialises exactly the decision it guards rather than all writes.
+//
+// The keys are namespaced with "tele" as ASCII in the high 32 bits, so that a
+// lock of ours is recognisable in pg_locks. Advisory locks are scoped to one
+// database, and this database belongs to teleport alone, so the low bits only
+// have to be distinct from each other.
+const (
+	advisoryLockNamespace int64 = 0x74656c65 // "tele"
+
+	// LockPendingApplications guards the KEY_MAX_PENDING cap in
+	// CreateApplication: no more than N applications may be outstanding.
+	LockPendingApplications int64 = advisoryLockNamespace<<32 | 1
+	// LockActiveKeys guards the KEY_MAX_ACTIVE cap. Both paths that mint a
+	// credential — ClaimApplication and CreateManualKey — take it, so they
+	// cannot each spend the same last slot.
+	LockActiveKeys int64 = advisoryLockNamespace<<32 | 2
+	// LockPendingRenewals guards "at most one pending renewal per key" in
+	// CreateRenewal, which SQLite enforced with the same free serialisation.
+	LockPendingRenewals int64 = advisoryLockNamespace<<32 | 3
+)
+
 // pgMigrationFS embeds the PostgreSQL migrations, so the deployed binary carries
 // its own schema and cannot run against a directory that has drifted from it.
 //

@@ -53,6 +53,16 @@ fi
 echo "==> go test"
 # -count=1 disables the test cache. Several guards here read files from outside
 # their package (the schema snapshots), and the cache cannot see those change.
+#
+# The PostgreSQL-backed tests SKIP here when TEST_PG_DSN is unset, so this gate
+# stays runnable on a machine with no database. That skip is why
+# scripts/test-pg.sh exists and why it is the required gate for any change that
+# touches storage or the store SQL: a green run *here* does not mean the
+# database paths were exercised.
+if [ -z "${TEST_PG_DSN:-}" ]; then
+  echo "    NOTE: TEST_PG_DSN is unset, so the PostgreSQL-backed tests will SKIP." >&2
+  echo "    For the real gate run: pnpm run backend:test-pg" >&2
+fi
 (cd backend && go test ./... -count=1)
 
 echo
