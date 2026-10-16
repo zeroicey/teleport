@@ -26,7 +26,7 @@ SQLite + 手写 `net/http`），并且身上压着三类不可再生的资产：
 | 密钥派生标签 | `"teleport/derive/agent-key/v1"`、`"teleport/agent-key/v1"`、`"teleport/agent-key/renewal-claim/v1"` | **所有已发出的 agent 密钥当场失效**（token 是派生的，标签是输入） |
 | Cookie 名 | `teleport_session` | 所有人被登出 |
 | 请求头 | `X-Teleport-Claim`、`X-Teleport-Key-Expires-At`、`X-Teleport-Key-Expired` | 外部 agent 已按 `/ai.md` 里的头名调用 |
-| 路由前缀 | `/yeciorez/teleport/*`（含 `/s/`、`/k/`、`/ai`、`/ai.md`、`/llms.txt`） | 在野链接 404；且 `expires_at=0` 让它**永久**不可挽回 |
+| 路由前缀 | **`teleport.hcyj.xyz` 根路径**（`ROUTE_PREFIX=""`）；旧前缀 `/yeciorez/teleport/*` **已弃用**（用户 2026-10-16 裁决 break change） | 旧长链接 404，**包括 `expires_at=0` 的永久链接** —— 用户知情选择；新链接短且与 clip 形态一致 |
 | 封套 | `{ok:true,data,requestId}` / `{ok:false,error:{code,message},requestId}` | 所有客户端与文档 |
 | 命名约定 | **请求体 camelCase、响应 snake_case**；`PATCH` 遇未知字段 400 | 静默丢字段（clip 仓库里刚踩过一次，见其 pitfalls） |
 | 链接语义 | 未知 token 与已吊销 → **404**；仅过期 → **410** | 泄漏状态 |
@@ -38,12 +38,18 @@ SQLite + 手写 `net/http`），并且身上压着三类不可再生的资产：
 | 一次性凭据 | claim secret 只在 **URL fragment**；领取页无 JS 时惰性（按钮默认 `hidden`）；`HEAD` 领取必须 405 | 聊天工具预览会烧掉一次性链接 |
 | 密钥永不入库 | 服务端只存 `sha256(token)`；明文只在领取那一刻派生出来 | 快照泄漏可用凭据 |
 
-**2026-10-16 修正（路由前缀那一项）**：见 `2026-10-16-teleport-own-hostname.md`。
-新增 `https://teleport.hcyj.xyz/` 根路径入口（`ROUTE_PREFIX=""`），而**旧前缀
-`/yeciorez/teleport/*` 必须永久保留** —— 因为 `expires_at=0` 的链接永不过期，删掉前缀
-就是永久碎掉它们。这一项的含义因此从「前缀不可改」变成「**旧前缀必须一直有效**」，
-比原来更严，不是更松。已核实：agent 密钥只用 `SESSION_SECRET`+两个标签+applicationID+
-claimSecret 派生（`agentkey.DeriveToken`），**与域名/前缀无关**，所以这次变更不失效凭据。
+**2026-10-16 两次变更（路由前缀那一项）**：先是一次修正（见
+`2026-10-16-teleport-own-hostname.md`）要求新增 `https://teleport.hcyj.xyz/` 根路径入口
+（`ROUTE_PREFIX=""`）而**永久保留旧前缀**；随后用户裁决**放弃旧前缀**（break change）：
+
+> 「break change 没事的 使用 teleport.hcyj.xyz 然后直接 /链接 就好了」
+
+所以这一项现在的含义是：**根路径是唯一入口**，旧前缀 `api.hcyj.xyz/yeciorez/teleport/*`
+不再保留，即使是 `expires_at=0` 的永久链接也会 404（用户已知情）。理由、被推翻的
+“旧前缀必须永久保留”那条的完整论证、以及为什么这反而**简化**了 P6，见
+`2026-10-16-p6-single-root-entry.md`。已核实：agent 密钥只用 `SESSION_SECRET`+两个标签+
+applicationID+claimSecret 派生（`agentkey.DeriveToken`），**与域名/前缀无关**，
+所以这次变更不失效任何凭据（只失效旧 URL）。
 
 **做法**：先建一张 `contract_test`（或沿用现有测试文件）把这 14 项逐条钉住，
 **在重写开始之前**让它对旧实现全绿。这样重写期间每一次「绿」都是同一个判据下的绿。

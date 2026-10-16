@@ -60,9 +60,16 @@ Go 工具链：`go 1.26` 模块在 `backend/`，本机 `go` 在 `/usr/local/go/b
 ## 硬约定
 
 - **`pnpm` only。** 不引 npm/yarn；`pnpm-lock.yaml` 是唯一锁文件，`pnpm-workspace.yaml` 不要改。
-- **前缀只写一处。** `/yeciorez/teleport` 由 `ROUTE_PREFIX` 推导，Go 路由、`vite.config.ts`
-  的 `base`、`web/src/api.ts` 的 `BASE_URL`、分享链接全部从它来。Caddy 必须用 `handle`
-  而不是 `handle_path` —— 前缀必须**保留**给后端。
+- **前缀只写一处。** 服务挂在 **`teleport.hcyj.xyz` 根路径**（`ROUTE_PREFIX=""`，用户 2026-10-16
+  裁决，见 `.ai/decisions/2026-10-16-p6-single-root-entry.md`）。前缀仍由 `ROUTE_PREFIX` 推导，
+  Go 路由、`vite.config.ts` 的 `base`、`web/src/api.ts` 的 `BASE_URL`、分享链接全部从它来。
+  ⚠️ **根路径要写 `ROUTE_PREFIX="/"`，不能写空值** —— `env()` 把「设为空」当成「未设置」并回落到
+  默认的 `/yeciorez/teleport`（实测：`""→/yeciorez/teleport`、`"/"→""`）。
+  Caddy 用 `handle` 而不是 `handle_path`（前缀**保留**给后端——根路径下这条自然成立）。
+  ⚠️ **前端前缀是构建期烧进产物的**：`vite.config.ts` 的 `base` 来自 `VITE_ROUTE_PREFIX`，
+  默认仍是旧的 `/yeciorez/teleport`。所以发布构建必须显式带上
+  `VITE_ROUTE_PREFIX=/`，否则前端基址与后端前缀不一致（根路径下白屏/资源 404）。
+  **旧前缀 `/yeciorez/teleport` 已弃用**，不再保留（永久链接随之 404，用户知情）。
 - **markdown 报告永不渲染原始 HTML。** goldmark 不加 `WithUnsafe`，报告里的
   `<script>` 一律被替换为 `<!-- raw HTML omitted -->`。这条不因为下面那条而放宽。
 - **`format: "html"` 报告原样渲染**（2026-10-11 用户裁决，见

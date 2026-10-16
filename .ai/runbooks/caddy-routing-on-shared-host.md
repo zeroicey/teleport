@@ -7,6 +7,13 @@
 给 `api.hcyj.xyz` 增删路径分流（例如本项目的 `/yeciorez/teleport*`），
 或修改站点级响应头。
 
+> **P6 起 teleport 不再挂在这台主机的路径下**（2026-10-16 用户裁决：单一根路径入口，
+> 见 `.ai/decisions/2026-10-16-p6-single-root-entry.md`）：新增 `teleport.hcyj.xyz` 的
+> **独立 site block**（照抄 `clip.hcyj.xyz` 那个 block），而 `api.hcyj.xyz` 里的
+> `handle /yeciorez/teleport*` 换成一条显式的 `respond … 410`。
+> 完整步骤与风险见 `.ai/runbooks/p6-cutover.md`。本文的「站点级响应头必须排除该前缀」
+> 那条纪律在 P6 之后只对那个 410 responder 有意义（保留即可，无害）。
+
 ## Preconditions
 
 - `ssh hcyj`（root）

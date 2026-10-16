@@ -5,6 +5,8 @@ HTTP 层是 **Gin**，**全链路已在真二进制上验过**：HTTP 契约 **6
 （`scripts/verify-p4.sh`，第三档闸门），并做了 **旧树 vs 新树的差分跑：108 请求只有 1 处已知差异**。
 **数据搬运已在临时 schema 上彩排通过（`scripts/verify-p5.sh`，15/15 + 负向对照）。**
 四档闸门全绿。**P6（切换）未做，且必须先问人类；线上仍是旧版且已停（502）。**
+**P6 的双入口阻塞点已裁决**（单一根路径入口、旧前缀弃用，见
+`2026-10-16-p6-single-root-entry.md`），并把步骤与风险写成了 `.ai/runbooks/p6-cutover.md`。
 
 **P2.3 交付物**：`internal/store/` 的 `queries.go` + `keys.go` 改为 pgx；新增
 `internal/store/queries/*.sql`（sqlc 源）+ `internal/store/storedb/`（生成物）+ `backend/sqlc.yaml` +
@@ -306,7 +308,7 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 | **P3** | ✅ 完成：Gin 路由表 + `gin.HandlerFunc` handler（`c.Param`）；`internal/httpx` 的认证中间件用 `httpx.GinMiddleware` 适配成 Gin 中间件；信封/session/principal 仍是框架无关的纯函数。**零测试改动**通过。决策与 gin 版本证据见 `2026-10-16-p3-gin-integration.md` | 封套与状态码逐条对齐 —— 已逐条验证 |
 | **P4** | ✅ 完成：全链路起新版（Gin + pgx + 内嵌 SPA + 真 PG），HTTP 契约 **64/64** + 真实浏览器 **15/15**；另做**差分跑**（P3 之前的树 vs 新版，108 请求 / 1 处已知差异）。第三档闸门 `scripts/verify-p4.sh`。**未做：大陆观测点（要等 P6 切换后）** | 切换前的最后一道闸 —— 已过，但外部校验（P5/P6）仍在 |
 | **P5** | ✅ 完成：`internal/sqlitemigrate` + `cmd/sqliteimport`（**单事务、默认拒绝非空目标、`-replace` 需 `-yes`**）+ `scripts/verify-p5.sh`（第四档闸门）。**schema 由应用自己的迁移器建，工具从不发 DDL；P5 不建生产库的 schema**（决策记录 `2026-10-16-p5-schema-ownership.md`）。真源真库彩排 15/15 + 负向对照按名字变红。**未做：真往生产库灌**（属 P6） | 切换当天不能靠猜 —— 现在不用猜了，但**生产的第一次仍然在 P6** |
-| P6 | 切到 hpcore（frpc 隧道 8788）。**hcyj 的 Caddy 需要改**：加 `teleport.hcyj.xyz` site block + 证书，并保留原有 `handle /yeciorez/teleport*`（见 `2026-10-16-teleport-own-hostname.md`）。两个入口都必须在同一窗口验证。**必须先问人类确认窗口** | 用户要的最终形态：hcyj 只转发；且新域名不再挤在别人的路径下 |
+| P6 | 切到 hpcore（frpc 隧道 8788）。**runbook 已写好**：`.ai/runbooks/p6-cutover.md`（逐步命令 + 每步验证/回滚 + 12 条风险，全部标了「实测过 ✅ / 只在纸上跑过 ❓」）。**入口形态已裁决为单一根路径**（`teleport.hcyj.xyz`，旧前缀弃用 —— `2026-10-16-p6-single-root-entry.md`），因为侦察发现「一个二进制无法同时服务两个前缀」（前端 base 构建期烧死 + 分享页资产/iframe 是 `PUBLIC_BASE_URL` 的绝对地址 + CSP `'self'`）。**必须先问人类确认窗口**。P6 之前的头号未知数：`ROUTE_PREFIX=""` 这个分支从未跑过 → 应先用 `verify-p4.sh` 那套在空前缀 + `VITE_ROUTE_PREFIX=/` 的产物上跑绿一次 | 用户要的最终形态：hcyj 只转发；新域名挂在根路径 |
 
 **保持冻结的线上环境**：重写期间**不要**改 hcyj 的 Caddy、不要升级本机 Postgres、
 **绝对不要轮换 `SESSION_SECRET`**（它会让所有派生密钥失效）。
@@ -319,6 +321,14 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   P6 的顺序是 `migrate` → `import` → `verify`（都在同一个窗口里，不存在「提前建好却静默变旧」的间隔）。
 - **P6 之前必须问人类**：切到 hpcore、改 hcyj 的 Caddy（加 `teleport.hcyj.xyz` site block + 证书）、
   frpc 隧道 8788。P5 全程没有碰线上（Caddy / frpc / 8788 一次未动），也没有碰生产意图库。
+- **P6 的实际工作量比纲领预想的多**（只读侦察实测，细节见 runbook）：hpcore 上**没有** teleport
+  的 systemd unit（要新建，模板是 `clip.service`）；`/data/services/teleport/teleport.env` **仍是
+  旧配置**（含 `DB_PATH`、没有 `DATABASE_URL`）；frpc 是 **user unit**（用户 `oicey`），
+  要照抄 `frpc-relay-clip` 的形式；hcyj 的 frps **没有 `allowPorts` 限制**（8788 隧道会被接受）；
+  DNS 已解析到同一 IP，只差 site block + 证书；`clip.hcyj.xyz` 的 block 是现成模板。
+- **🔴 改 Caddyfile 是 P6 最危险的一步**：写错会让 hcyj 的 **443 整体不可用**，连带 clip 与
+  `api.hcyj.xyz` 上别的服务。所以 `caddy-routing-on-shared-host.md` 的校验三步（备份 →
+  `docker cp` + `md5sum` 对比 → `caddy adapt`）不能跳。
 - **P5 的源获取方式（P6 会重跑一次）**：`P5_FETCH=1 bash scripts/verify-p5.sh` 会
   `ssh hcyj sha256sum` → 检查无 `-wal/-shm/-journal` → `scp` → 本地再 `sha256sum` 比对。
   已实测的源：`sha256 0b3855d7b130e30d7ca2128afce7c9dd30dfaf7eba5f7a57293347a2cbbeb24d`
@@ -359,10 +369,16 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 - **配置变更需人类知晓**：`DB_PATH` → `DATABASE_URL`（**必填、无默认值**，`Load()` 缺它就报错），
   新增 `DB_MAX_CONNS`（默认 8）。P6 部署时 `teleport.env` 必须提供 `DATABASE_URL`，
   否则新版**启动即失败**，而不是静默连到别的库。该值含口令，**故意不写日志**。
-- **域名已裁决**（`.ai/decisions/2026-10-16-teleport-own-hostname.md`）：teleport 将拥有
-  `https://teleport.hcyj.xyz/`（**根路径**，`ROUTE_PREFIX=""`），**P6 与切换一起做**，
-  且**旧前缀 `api.hcyj.xyz/yeciorez/teleport` 必须永久保留**（`expires_at=0` 的永久链接）。
-  已核实 agent 密钥与域名无关（`DeriveToken` 不吃 URL），不会失效凭据。
+- **域名与入口已裁决**（`2026-10-16-teleport-own-hostname.md`，**约束 2 已被取代**）：
+  teleport 拥有 `https://teleport.hcyj.xyz/`（**根路径**，`ROUTE_PREFIX=""`），P6 与切换一起做；
+  而**旧前缀 `api.hcyj.xyz/yeciorez/teleport` 已弃用**（用户 2026-10-16 裁决 break change）——
+  **`expires_at=0` 的永久链接也随之失效**，这是用户知情选择的结果，理由与后果见
+  `2026-10-16-p6-single-root-entry.md`。已核实 agent 密钥与域名无关
+  （`DeriveToken` 不吃 URL），所以**凭据不失效，只失效旧 URL**。
+  **前端前缀在构建期烧死**：`vite.config.ts` 的 `base = VITE_ROUTE_PREFIX + "/"`（默认仍是旧前缀），
+  所以发布构建必须显式 `VITE_ROUTE_PREFIX=/`，并与后端的 `ROUTE_PREFIX="/"` **成对**使用。
+  ⚠️ **后端那边要写 `"/"` 而不是空值**：`env()` 把空值当「未设置」→ 回落默认的
+  `/yeciorez/teleport`，于是「前端根路径 + 后端旧前缀」→ 白屏。已实测三种写法的启动日志前缀。
   影响面：`ROUTE_PREFIX`、`PUBLIC_BASE_URL`、`FRONTEND_ORIGINS`、`CookiePath`、Vite `base`、
   `/ai.md` 与 `/llms.txt` 里的地址、`format:"html"` 的同源 iframe 判定。
 - **更正交接文档里的一处计数**（保留，已按此落地）：需要显式加锁的「计数—插入」实际上有
@@ -381,8 +397,10 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 ## 长期约束（改动前必须知道）
 
 - 冻结清单（见决策记录第一张表）**不可改**；改之前必须先改决策记录。
-  **路由前缀那一项已于 2026-10-16 修正**：不是「前缀不可改」，而是「**旧前缀必须一直有效**」
-  —— 新增 `teleport.hcyj.xyz` 根路径入口，旧前缀永久保留（见其专有决策记录）。
+  **路由前缀那一项已于 2026-10-16 改了两次**：先改成「旧前缀必须一直有效」，随后用户裁决
+  **放弃旧前缀**（break change）—— 现在 `teleport.hcyj.xyz` **根路径是唯一入口**，
+  `expires_at=0` 的永久链接也随之失效（知情接受）。见
+  `2026-10-16-p6-single-root-entry.md`（含「为什么一个二进制做不到双入口」的实测证据链）。
 - **归属是安全边界**：非归属者的读/改/删一律 404 而不是 403，且判定在任何写入之前。
 - **事务内只准用 `WithTx` 的 query set。** 在 `s.pool.Begin` 之后碰 `s.q.` 或 `s.pool.`
   会向池再要一条连接，而自己已占着一条；小池 + N 竞争者 = 无超时永久挂死。

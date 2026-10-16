@@ -135,7 +135,8 @@ P5_SKIP_NEGATIVE=1 ...                         # 只跳过负向对照（**别�
 
 ## 八、下一步
 
-**P6：切换，且必须先问人类。** 顺序（全部在同一切换窗口内）：
+**P6：切换，且必须先问人类。** 完整逐步命令 + 风险清单见 `.ai/runbooks/p6-cutover.md`；
+下面是摘要（全部在同一切换窗口内）：
 
 ```bash
 # 0. 问人类 → 确认窗口（会改 hcyj 的 Caddy、开 frpc 8788、加 teleport.hcyj.xyz 证书）
@@ -145,8 +146,9 @@ P5_FETCH=1 P5_EXPECT_SHA256=<pinned> bash scripts/verify-p5.sh   # 先在临时 
 ./bin/teleport-linux-amd64 migrate            # 需要 teleport.env 里的 DATABASE_URL（含口令，必填）
 ./bin/import/sqliteimport import -source bin/import/teleport.db -dsn "$DATABASE_URL"   # 不带 -replace
 ./bin/import/sqliteimport verify -source bin/import/teleport.db -dsn "$DATABASE_URL"
-# 3. 起服务 + frpc 8788 + hcyj Caddy（新域名根路径 + 旧前缀都留着）
-# 4. 两个入口 + 大陆观测点 + 真实浏览器
+# 3. 起服务 + frpc 8788 + hcyj Caddy（新域名根路径；旧前缀**弃用**，见
+#    .ai/decisions/2026-10-16-p6-single-root-entry.md）
+# 4. 新域名 + 大陆观测点 + 真实浏览器（**不再有两个入口**）
 ```
 
 不要轮换 `SESSION_SECRET`（会让所有派生密钥失效）。不要用 `-replace` 打生产（除非真的打算清空它）。

@@ -3,6 +3,14 @@
 个人 AI 报告展示与时效分享平台。在终端 / 工作框中完成复杂工作（安全渗透、架构设计、
 开发进度等）后，通过一次 API 调用把报告发布为在线网页，并得到一条**带时效的分享链接**。
 
+> ## ⚠️ P6 之前：入口即将变更（2026-10-16 用户裁决）
+>
+> teleport 将迁到 **`https://teleport.hcyj.xyz/`（根路径）**，且**旧前缀
+> `api.hcyj.xyz/yeciorez/teleport` 弃用**（break change：连 `expires_at=0` 的永久链接
+> 也会失效，用户已知情）。因此**本文里的旧前缀 URL 描述的是 P6 之前的形态**。
+> 裁决理由与后果见 `.ai/decisions/2026-10-16-p6-single-root-entry.md`，
+> 切换步骤见 `.ai/runbooks/p6-cutover.md`。
+>
 > ## ⚠️ 重写进行中（P2.3 已完成，P3–P6 未做）
 >
 > 本仓库正在从 `net/http + SQLite` 重写为 `Gin + pgx/sqlc + PostgreSQL`，**在野契约逐字节不变**。
@@ -23,7 +31,7 @@
 |---|---|---|
 | 前端 | Vue 3 + Vite（pnpm） | **编译进 Go 二进制**（`go:embed`） |
 | 后端 | Go + pgx/sqlc（PostgreSQL；旧版线上仍是 SQLite） | 国内云服务器 hcyj — Caddy 分流至 `/yeciorez/teleport` |
-| 入口 | 单一来源：`https://api.hcyj.xyz/yeciorez/teleport/` | 前端、API、分享页同源同前缀 |
+| 入口 | **P6 起**单一来源：`https://teleport.hcyj.xyz/`（根路径）；P6 之前是 `api.hcyj.xyz/yeciorez/teleport/` | 前端、API、分享页同源同前缀 |
 
 前端与后端**构建为同一个可执行文件**：Vite 产物写进 `backend/internal/webui/dist/`，
 由 `//go:embed` 打进二进制。部署就是上传一个文件、重启服务，服务器上不需要

@@ -8,8 +8,9 @@
 > 备份对象是 database 而不是文件。下面的 §4.2 与 §4.4 已给出 PostgreSQL 变体，
 > 但**那双路径尚未在切换窗口里验证过** —— 首次用它们就是在 P6。
 >
-> 另：重写期间 **ROUTE_PREFIX / PUBLIC_BASE_URL 未改**（P6 才加
-> `teleport.hcyj.xyz` 根路径入口），所以本文的路径与域名对 P2.3 之后的构建仍适用。
+> 另：**P6 会改 ROUTE_PREFIX / PUBLIC_BASE_URL**（2026-10-16 用户裁决：单一根路径入口，
+> 旧前缀弃用），所以本文正文里的 `api.hcyj.xyz/yeciorez/teleport` 路径是 **P6 之前**的形态。
+> 切换当天照 `.ai/runbooks/p6-cutover.md` 走，不要照本文的路径拼命令。
 >
 > 当前线上是 **`disabled` + `inactive`，公网 502**（用户裁决：等新版）。
 > 所以重写版上线前，这份手册的「先绿后发」部分要改为 `pnpm run backend:test-pg`
