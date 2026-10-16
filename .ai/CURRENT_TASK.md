@@ -288,6 +288,14 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   已实测的源：`sha256 0b3855d7b130e30d7ca2128afce7c9dd30dfaf7eba5f7a57293347a2cbbeb24d`
   （P6 建议用 `P5_EXPECT_SHA256=` 把它钉住）。**只读**：hcyj 上没有任何写入。
 - **P5 未做**：真往生产库灌、旧新对账（旧版已停）、大陆观测点/浏览器（属 P6）。
+- **⚠️ P5 的独立复审没拿到（要如实知道）。** 四种尝试全部因**环境**失败：
+  `bg_delegate` × 2 在 35 次工具调用后被 24 turn 上限截断（`child_turn_limit`，未交答案）；
+  `fusion_validate` × 2 的三个候选各自读了文件后以**空响应**告终
+  （`session_shutdown before agent_settled` / `Pi assistant response is empty`）。
+  因此本次提交背后的证据是 **一个作者的对抗性反证 + 机械可证伪性**（20 项检查各有篡改用例、
+  负向对照必须按名字变红、范围检查 revert 后必须变红），**不是独立审查**。
+  补做的 `subagent` 审查（另一种机制）在会话末尾启动，结果见其后的提交/交接。
+- **P5 已提交并推送**：`06cefbe`（`de22443..06cefbe`，分支 `main`）。**未部署**。
 - **P2 测试策略已裁决**（`.ai/decisions/2026-10-16-p2-test-strategy.md`）：B —— 每测一个 schema，
   从内嵌迁移现建现拆；闸门两层（`check.sh` 可跳过 DB，`test-pg.sh` 强制）。
 - **P2.3 做法已裁决并已执行**（`.ai/decisions/2026-10-16-p2-store-port-technique.md`）：**B 一次性大爆炸**。

@@ -88,8 +88,17 @@ P5_SKIP_NEGATIVE=1 ...                         # 只跳过负向对照（**别�
 
 - [ ] **P5 尚未提交**（7 个新文件 + 4 个 `.ai` 文件）。
 - [ ] `bin/import/` 与 `bin/e2e/` 都在 gitignore 里（生成物），但 `scripts/verify-p5.sh` **要提交**。
-- [ ] P5 的复审：两个后台只读子代理（数据路径正确性 / 夹具可证伪性）的结果见本会话；第三个
-      （架构 + P6 安全性）**provider 侧 abort**，已改用 `fusion_validate` 复核。
+- [ ] **P5 的独立复审没拿到，要如实知道这一点。** 四种尝试全部因**环境**失败（不是「没发现问题」）：
+      - 两个 `bg_delegate` 只读子代理（数据路径正确性 / 夹具可证伪性）：
+        各做了 35 次工具调用后被 **24 turn 上限**截断，**没有交出答案**
+        （`child_turn_limit`）；
+      - 两个 `fusion_validate`（架构 + P6 安全性 / 数据路径正确性）：三个候选各自读了文件
+        （共 240K 输出 token），随后以**空响应**告终
+        （`session_shutdown before agent_settled` / `Pi assistant response is empty`）。
+      所以本次提交背后的独立验证 = **我自己的对抗性反证**（它抓到了 int64 回绕那个真 bug）
+      + **机械反证**（20 项检查各有篡改用例、负向对照必须按名字变红、范围检查 revert 后必须变红）。
+      这是**一个作者的眼睛 + 机械可证伪性**，不是独立审查。
+      补做的 `subagent` 审查（不同机制，会话末尾启动）见 CURRENT_TASK。
 
 ## 七、不要重复
 
