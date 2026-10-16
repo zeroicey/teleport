@@ -14,16 +14,17 @@
 | 事实 | 值 |
 | --- | --- |
 | teleport 的公网入口 | 仍是 `https://api.hcyj.xyz/yeciorez/teleport`（hcyj 的 Caddy `handle /yeciorez/teleport*` → `172.17.0.1:8788`，前缀保留） |
-| 现在是什么状态 | **502**。hcyj 上 `teleport` unit ：`disabled` + `inactive`；frps 只监听 `8790`（clip），`8788` 无监听 |
+| 现在是什么状态 | **502**。hcyj 上 `teleport` unit ：`disabled` + `inactive`；frps 只监听 `8790`（clip），`8788` 无监听。**用户 2026-10-16 再次裁决：继续停着，等新版上线**（不临时恢复） |
 | `teleport.hcyj.xyz` | **不存在**。DNS 解析到同一个 IP，但 hcyj 的 Caddyfile 里**没有任何 site block**、也没有证书 → TLS 直接失败（`code=000`，`no peer certificate available`）。全仓库与记忆库里搜不到这个字符串 |
 | 有自己独立域名的那个是 | **clip**（`clip.hcyj.xyz`）。Caddyfile 注释里写着 `A whole host of its own, unlike teleport` —— 很可能就是这行造成了「teleport 也有自己的域名」的印象 |
 | `https://api.hcyj.xyz/` 的 200 | 那是 Caddy 的 fallback `handle` → `172.17.0.1:3000`（**别的服务**），不是 teleport。链路/TLS 健康不等于 teleport 可用 |
 
 要临时恢复旧版（让 8788 重新有服务）：`ssh hcyj 'systemctl enable --now teleport'`。
-**主意愿是「无人使用，等重写版就绪再切」，所以 502 是当前预期状态**，不是事故。
+**当前裁决是「不恢复」** —— 用户确认无人使用，等重写版就绪再切，所以 502 是预期状态，不是事故。
+代价（已接受）：`expires_at=0` 的在野永久链接现在打不开；P5 搬运后无法马上拿旧版做对账。
 
-若要真的把 teleport 挪到自己的域名，那是**冻结清单里「路由前缀 `/yeciorez/teleport/*`」的改动**，
-必须先改决策记录；而且 `expires_at=0` 的在野链接会**永久**失效，旧前缀必须继续保留。
+**新域名 `teleport.hcyj.xyz` 已裁决**（见 `2026-10-16-teleport-own-hostname.md`）：
+新版挂在**根路径**，**P6 与切换一起做**（现在不加 Caddy，否则新域名也是 502）。
 
 ---
 
@@ -65,7 +66,7 @@
 | P3 | `internal/httpx` → Gin 中间件；`internal/api` 移植 | 封套与状态码必须逐条对齐 |
 | P4 | 全链路起新版（Gin + pgx），243 测试 + 浏览器验证 | 切换前的最后一道闸 |
 | P5 | SQLite → PG 的数据搬运脚本 + 行数核对（5 报告 / 2 密钥 / 全部分享链接） | 切换当天不能靠猜 |
-| P6 | 切到 hpcore（frpc 隧道 8788；hcyj 的 Caddy **不需要改**，它本来就指 `172.17.0.1:8788`） | 用户要的最终形态：hcyj 只转发 |
+| P6 | 切到 hpcore（frpc 隧道 8788）。**hcyj 的 Caddy 需要改**：加 `teleport.hcyj.xyz` site block + 证书，并保留原有 `handle /yeciorez/teleport*`（见 `2026-10-16-teleport-own-hostname.md`）。两个入口都必须在同一窗口验证 | 用户要的最终形态：hcyj 只转发；且新域名不再挤在别人的路径下 |
 
 **保持冻结的线上环境**：重写期间**不要**改 hcyj 的 Caddy、不要升级本机 Postgres、
 **绝对不要轮换 `SESSION_SECRET`**（它会让所有派生密钥失效）。
@@ -77,6 +78,12 @@
 - **P2.3 做法已裁决**（`.ai/decisions/2026-10-16-p2-store-port-technique.md`）：**B 一次性大爆炸**
   （A「接口 + 双实现交叉验证」是 AI 的建议，用户选了 B）。B 必须做的 5 项缓解写在文件里，
   其中最关键的一条是：**测试断言冻结、不许为了变绿而重写**。
+- **域名已裁决**（`.ai/decisions/2026-10-16-teleport-own-hostname.md`）：teleport 将拥有
+  `https://teleport.hcyj.xyz/`（**根路径**，`ROUTE_PREFIX=""`），**P6 与切换一起做**，
+  且**旧前缀 `api.hcyj.xyz/yeciorez/teleport` 必须永久保留**（`expires_at=0` 的永久链接）。
+  已核实 agent 密钥与域名无关（`DeriveToken` 不吃 URL），不会失效凭据。
+  影响面：`ROUTE_PREFIX`、`PUBLIC_BASE_URL`、`FRONTEND_ORIGINS`、`CookiePath`、Vite `base`、
+  `/ai.md` 与 `/llms.txt` 里的地址、`format:"html"` 的同源 iframe 判定。
 - **更正交接文档里的一处计数**：需要显式加锁的「计数—插入」实际上有 **3 处**，不是文档写的
   「待批准上限 / 密钥上限 / 分享链接计数」：① `CreateApplication` 的 `KEY_MAX_PENDING`，
   ② `ClaimApplication` 与 `CreateManualKey` 共用的 `KEY_MAX_ACTIVE`，③ `CreateRenewal` 的
@@ -89,6 +96,8 @@
 ## 长期约束（改动前必须知道）
 
 - 冻结清单（见决策记录第一张表）**不可改**；改之前必须先改决策记录。
+  **路由前缀那一项已于 2026-10-16 修正**：不是「前缀不可改」，而是「**旧前缀必须一直有效**」
+  —— 新增 `teleport.hcyj.xyz` 根路径入口，旧前缀永久保留（见其专有决策记录）。
 - **归属是安全边界**：非归属者的读/改/删一律 404 而不是 403，且判定在任何写入之前。
 - **密钥是派生的，不是暂存的**；服务端只存 `sha256`。
 - **一次性凭据只走 URL fragment**，页面无 JS 时惰性，`HEAD` 领取必须 405。

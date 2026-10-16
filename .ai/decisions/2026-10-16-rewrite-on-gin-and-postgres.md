@@ -38,6 +38,13 @@ SQLite + 手写 `net/http`），并且身上压着三类不可再生的资产：
 | 一次性凭据 | claim secret 只在 **URL fragment**；领取页无 JS 时惰性（按钮默认 `hidden`）；`HEAD` 领取必须 405 | 聊天工具预览会烧掉一次性链接 |
 | 密钥永不入库 | 服务端只存 `sha256(token)`；明文只在领取那一刻派生出来 | 快照泄漏可用凭据 |
 
+**2026-10-16 修正（路由前缀那一项）**：见 `2026-10-16-teleport-own-hostname.md`。
+新增 `https://teleport.hcyj.xyz/` 根路径入口（`ROUTE_PREFIX=""`），而**旧前缀
+`/yeciorez/teleport/*` 必须永久保留** —— 因为 `expires_at=0` 的链接永不过期，删掉前缀
+就是永久碎掉它们。这一项的含义因此从「前缀不可改」变成「**旧前缀必须一直有效**」，
+比原来更严，不是更松。已核实：agent 密钥只用 `SESSION_SECRET`+两个标签+applicationID+
+claimSecret 派生（`agentkey.DeriveToken`），**与域名/前缀无关**，所以这次变更不失效凭据。
+
 **做法**：先建一张 `contract_test`（或沿用现有测试文件）把这 14 项逐条钉住，
 **在重写开始之前**让它对旧实现全绿。这样重写期间每一次「绿」都是同一个判据下的绿。
 现有测试里已经覆盖了大部分 —— 先清点，缺的补上，再动手改实现。
@@ -89,10 +96,14 @@ SQLite + 手写 `net/http`），并且身上压着三类不可再生的资产：
 | P3 | `internal/httpx` → Gin 中间件；`internal/api` 路由与 handler 移植 | `internal/api` 测试全绿 |
 | P4 | 全链路：`cmd/teleport` 起 Gin + pgx，跑 243 个测试 + 真实浏览器验证 | `scripts/check.sh` 全绿 + 浏览器 27/27 级别的验证 |
 | P5 | 数据搬运（SQLite → PG）脚本 + 行数核对 | 5 报告 / 2 密钥 / 所有分享链接可读 |
-| P6 | 切换：hpcore 起新版 + frpc 隧道 8788 + hcyj Caddy 不变（它本来就指 `172.17.0.1:8788`） | 公网 URL 200、分享链接可读、agent 密钥可用 |
+| P6 | 切换：hpcore 起新版 + frpc 隧道 8788 + hcyj Caddy ~~不变（它本来就指 `172.17.0.1:8788`）~~ **需要改**：加 `teleport.hcyj.xyz` site block + 证书，并保留原有 `handle /yeciorez/teleport*`（见 `2026-10-16-teleport-own-hostname.md`） | 公网 URL 200、分享链接可读、agent 密钥可用、**两个入口都活着** |
 
 **P6 之后 hcyj 上只剩转发**，与 clip 的形态一致。
-**切换前旧版一直服务**；切换窗口内可回滚（旧二进制 + SQLite 原样保留在 hcyj）。
+
+> **2026-10-16 修正**：「切换前旧版一直服务」与实情不符 —— 旧版已在 hcyj 上
+> `disabled`+`inactive`，公网入口 502（用户当时确认无人使用，并再次裁决「继续停着等新版上线」）。
+> 后果：`expires_at=0` 的在野链接**现在就是打不开的**；P5 搬运后无法马上拿旧版做对账。
+> 回滚材料（旧二进制 + SQLite + `teleport.env`）仍原样留在 `/data/services/teleport/`。
 
 ## 五、验收（不能只靠单元测试）
 

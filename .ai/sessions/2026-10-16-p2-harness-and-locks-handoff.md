@@ -38,6 +38,21 @@ env -u TEST_PG_DSN bash scripts/check.sh   # 无库档：PG 测试 SKIP，但会
 `teleport` 角色口令在 `/data/services/teleport/.pgpassword.tmp`（600 root:root，需 `sudo`）。
 **不要把它写进仓库**。Postgres 是 docker 容器 `postgres`，宿主 `127.0.0.1:5432`。
 
+## 二点五、本会话新增的裁决（P2.3 不必做，但 P6 前必须知道）
+
+`.ai/decisions/2026-10-16-teleport-own-hostname.md`（✅ ACCEPTED，用户裁决）：
+
+- teleport 将拥有 `https://teleport.hcyj.xyz/`，**根路径**（`ROUTE_PREFIX=""`）。
+- **P6 与切换一起做**，不提前。（纲领里「重写期间不要改 hcyj 的 Caddy」继续有效。）
+- **旧前缀 `api.hcyj.xyz/yeciorez/teleport` 永久保留**：`expires_at=0` 的分享链接
+  永不过期，删前缀就是永久碎掉它们。两个入口长期并存。
+- 已核实：`agentkey.DeriveToken` 只吃 `SESSION_SECRET`+两个标签+applicationID+claimSecret，
+  **不吃 URL**，所以域名变更**不失效**已发出的 agent 密钥。
+- P6 之前**不要**碰 `ROUTE_PREFIX`/`PUBLIC_BASE_URL`/Vite `base`/`/ai.md` 里的地址，
+  否则会做出一个只有新域名能开、旧链接全碎、且未验证过的中间态。
+- 线上继续 **502**（用户裁决：不临时恢复旧版），所以 P2.3/P3/P4 期间**没有线上参系可比**；
+  P5 的对账靠 SQLite 文件本身（仍在 hcyj `/data/services/teleport/`）。
+
 ## 三、P2.3 具体怎么做（已备好清单，别重新推导）
 
 做法已定：**B，一次性把 `queries.go` + `keys.go` 改成 pgx，一个提交**。下面是本会话
