@@ -51,6 +51,8 @@ Teleport 是**个人 AI 报告展示与时效分享**平台。AI 在终端/工�
 | `backend/internal/store/queries/` | sqlc 查询源（`*.sql`）—— SQL 的唯一真源 | 无 |
 | `backend/internal/store/storedb/` | `sqlc generate` 产物，**勿手改** | 无 |
 | `backend/internal/store/storetest/` | 每测一个 schema 的 PG 夹具 | postgres |
+| `backend/internal/sqlitemigrate/` | **一次性**的 SQLite → PostgreSQL 搬运与核对（读旧库靠 `sqlite3` shell，**不发 DDL**）；见 `2026-10-16-p5-schema-ownership.md` | postgres, store |
+| `backend/cmd/sqliteimport/` | 上面那包的 CLI（`import` / `verify`）；**不在服务器二进制的依赖图里**（`scripts/build.sh` 只 build `.`） | sqlitemigrate, store |
 | `backend/internal/markdown/` | goldmark + Chroma 渲染器 | 无 |
 | `backend/internal/validate/` | 请求体校验（**复刻 JS 语义**，见 §5.4） | 无 |
 | `backend/internal/views/` | 分享页 HTML + CSP 常量 | 无 |
@@ -58,7 +60,7 @@ Teleport 是**个人 AI 报告展示与时效分享**平台。AI 在终端/工�
 | `backend/internal/aidoc/` | 给 AI 读的使用说明（`guide.md` + 占位符替换） | config, markdown |
 | `backend/internal/webui/` | `//go:embed dist/`，构建标签 `embed_frontend` 切换桩实现 | 无 |
 | `web/src/` | Vue 面板（登录/列表/详情）+ 分享页客户端入口 | api.ts 封套 |
-| `scripts/` | `build.sh`（发布构建）、`check.sh`（闸门）、`check-sqlc-sync.sh`（`sqlc diff`）、`test-pg.sh`（真库闸门） | — |
+| `scripts/` | `build.sh`（发布构建）、`check.sh`（闸门）、`check-sqlc-sync.sh`（`sqlc diff`）、`test-pg.sh`（真库闸门）、`verify-p4.sh`/`verify-p5.sh`（全链路 / 数据搬运的彩排闸门） | — |
 | `schema.pg.sql` | DDL 快照，由 `migrations_pg/` 生成，逐字节一致（闸门校验） | — |
 
 ## 4. Core topology

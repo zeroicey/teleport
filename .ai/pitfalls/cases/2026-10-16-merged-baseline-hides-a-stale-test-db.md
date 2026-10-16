@@ -79,3 +79,25 @@ merged baseline is not a migration.
 
 Deliberately *not* the guard: a test that compares the live `reports_metadata_check` text to
 the migration. It would pin one constraint and miss the next one.
+
+## 追加（2026-10-16，P5 期间第二次遇到同族现象）
+
+P4 交接文档把「环境干净」写成「`teleport_test` 只剩 `public`；生产意图库 `teleport` 仍 0 张表」。
+P5 开始搬运时发现 **`teleport_test.public` 里躺着一整套完整的 schema**
+（`reports`/`share_tokens`/`agent_keys`/`key_applications`/`key_renewals`/`schema_migrations`/`v_live_shares`，
+`applied_at = 1792145288078` ≈ 当天 18:08，即 P4 会话期间由某次没带 `search_path` 的迁移跑出来的）。
+
+所以那句话是**真的但读错了**：「只剩 `public`」说的是**只剩这一个 schema**，不是**这个 schema 是空的**。
+这正好是「绿必须真的对应当前状态」的同一个教训——**判据要指向对象，不能指向对象的容器**。
+
+已处理：把 `public` 里的那套对象逐一下掉（`DROP VIEW … CASCADE; DROP TABLE … CASCADE; DROP FUNCTION …`），
+`teleport_test` 现在是 0 张表、只剩 `public`；同时删掉了 P5 手工跑留下的 `p5_scratch`。
+
+**规则（追加）：**
+
+- 说「环境干净」时必须给出**计数**（几张表、几个 schema），不能只给名字。
+- 每次彩排/手工实验后用**自己的 schema**（`p5`、`p4`……）并确保退出时拆掉；
+  带 `search_path` 的 DSN 是唯一安全的写法，不带就是把对象写进 `public`。
+- 这不会影响 P5/P6：生产意图库 `teleport` 当时与现在都是 0 张表，而 P5 的彩排用的是
+  `teleport_test` 里的临时 schema（用完即拆）。合并式基线的那条守卫（内容哈希 + 拒绝启动）
+  仍然只在**真正建过库**的地方起作用——`public` 那套对象之所以无害，只是因为它没被任何人使用。

@@ -15,6 +15,26 @@
 > 所以重写版上线前，这份手册的「先绿后发」部分要改为 `pnpm run backend:test-pg`
 > （旧版没有真库闸门）。
 
+## Preconditions
+
+> **P6 切换前必读**：数据从旧版 SQLite 搬到新版 PostgreSQL 的完整顺序与护栏见
+> `.ai/decisions/2026-10-16-p5-schema-ownership.md` 与
+> `.ai/sessions/2026-10-16-p5-import-handoff.md` 的「下一步」。要点：
+
+```bash
+# 1. 取源（在 hpcore 上，**只读** hcyj）——先查 -wal，再比对两端 sha256
+P5_FETCH=1 bash scripts/verify-p5.sh          # 彩排：在 teleport_test 的临时 schema 上跑
+P5_EXPECT_SHA256=<pinned> bash scripts/verify-p5.sh
+# 2. 生产库：建 schema（应用自己的迁移器）→ 灌数据 → 核对（都在同一窗口）
+./bin/teleport-linux-amd64 migrate            # 需要 teleport.env 里的 DATABASE_URL
+./bin/import/sqliteimport import -source bin/import/teleport.db -dsn "$DATABASE_URL"
+./bin/import/sqliteimport verify -source bin/import/teleport.db -dsn "$DATABASE_URL"
+```
+
+> 三条护栏：① 搬运工具**从不发 DDL**（schema 只可能来自嵌入迁移器）；
+> ② 非空目标**默认拒绘**，`-replace` 必须再给 `-yes` 才会 TRUNCATE；
+> ③ 源带 `-wal/-shm/-journal` 时**拒绘**（`immutable=1` 读法会静默丢掉 WAL 里的已提交事务）。
+
 ## When to use this
 
 发布新版本，或后端二进制需要更新时。前端**没有独立部署步骤** —— 它已在二进制里。

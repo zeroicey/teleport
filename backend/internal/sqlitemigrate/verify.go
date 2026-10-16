@@ -1,0 +1,971 @@
+package sqlitemigrate
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/zeroicey/teleport/backend/internal/domain"
+	"github.com/zeroicey/teleport/backend/internal/store"
+)
+
+// Check is one verification result.
+type Check struct {
+	Name   string `json:"name"`
+	OK     bool   `json:"ok"`
+	Detail string `json:"detail"`
+}
+
+// VerifyReport is the outcome of comparing a source with a target.
+type VerifyReport struct {
+	SourceSchema string  `json:"source_schema"`
+	TargetSchema string  `json:"target_schema"`
+	Checks       []Check `json:"checks"`
+	Passed       int     `json:"passed"`
+	Failed       int     `json:"failed"`
+}
+
+// OK reports whether every check passed.
+func (r *VerifyReport) OK() bool { return r.Failed == 0 }
+
+// Verifier compares an imported target against its source.
+//
+// It is deliberately a separate pass from Import rather than a by-product of it.
+// The import's own reconciliation happens inside the transaction and can only
+// see counts; this runs afterwards, reads the target through the *store's* own
+// API (the code the service will use) as well as through raw SQL, and states the
+// properties a human cares about in the language they asked in: five reports,
+// two keys, permanent links still permanent, revoked links still 404.
+type Verifier struct {
+	src  Reader
+	pool *pgxpool.Pool
+	st   *store.Store
+	rep  *VerifyReport
+}
+
+// NewVerifier wraps a source and a target pool.
+//
+// The pool is borrowed, not owned: Verify does not close it (and the
+// *store.Store built here must not be Close()d either, because that would close
+// the caller's pool).
+func NewVerifier(src Reader, pool *pgxpool.Pool) *Verifier {
+	return &Verifier{
+		src:  src,
+		pool: pool,
+		st:   store.New(pool),
+		rep:  &VerifyReport{},
+	}
+}
+
+// Report returns what has been checked so far.
+func (v *Verifier) Report() *VerifyReport { return v.rep }
+
+// Verify runs every check and returns the report.
+//
+// It returns an error only for infrastructure failures (the source or the target
+// cannot be read at all). A check that finds a discrepancy is recorded as a
+// failure, not an error, so one run reports everything wrong rather than the
+// first thing.
+func Verify(ctx context.Context, src Reader, pool *pgxpool.Pool) (*VerifyReport, error) {
+	v := NewVerifier(src, pool)
+	if err := v.run(ctx); err != nil {
+		return nil, err
+	}
+	return v.rep, nil
+}
+
+func (v *Verifier) add(name string, ok bool, format string, args ...any) {
+	detail := fmt.Sprintf(format, args...)
+	v.rep.Checks = append(v.rep.Checks, Check{Name: name, OK: ok, Detail: detail})
+	if ok {
+		v.rep.Passed++
+	} else {
+		v.rep.Failed++
+	}
+}
+
+func (v *Verifier) run(ctx context.Context) error {
+	versions, err := v.src.MigrationVersions(ctx)
+	if err != nil {
+		return err
+	}
+	if err := CheckSourceMigrations(versions); err != nil {
+		// The source is not a database this mapping was written for. Every
+		// check below would be comparing against the wrong thing, so record the
+		// failure and stop rather than produce a long list of nonsense.
+		v.add("source_migrations", false, "%v", err)
+		return nil
+	}
+	v.rep.SourceSchema = strings.Join(versions, "+")
+
+	tables, err := v.src.Tables(ctx)
+	if err != nil {
+		return err
+	}
+	byName := make(map[string]*Table, len(tables))
+	for i := range tables {
+		byName[tables[i].Name] = &tables[i]
+	}
+
+	target, err := inspectTarget(ctx, v.pool)
+	if err != nil {
+		return err
+	}
+	v.rep.TargetSchema = target.Schema
+
+	if err := checkTargetTables(target.Schema, target); err != nil {
+		v.add("target_schema", false, "%v", err)
+		return nil
+	}
+	v.add("target_schema", true, "schema %q contains exactly %s",
+		target.Schema, strings.Join(expectedTargetTables(), ", "))
+
+	v.checkColumnSets(byName, target)
+	v.checkRowCounts(ctx, byName)
+	v.checkRowsEqual(ctx, byName, target)
+	v.checkReportContent(byName)
+	v.checkOwnershipBoundary(byName)
+	v.checkDatabaseRenderedText(ctx, byName, target)
+	v.checkShareSemantics(byName)
+	v.checkAgentKeys(byName)
+	return nil
+}
+
+// checkColumnSets requires every table's source and target column sets to match.
+func (v *Verifier) checkColumnSets(source map[string]*Table, target *TargetSchema) {
+	var bad []string
+	for _, name := range Tables {
+		if err := checkColumnsMatch(name, source[name].Columns, target.Tables[name]); err != nil {
+			bad = append(bad, err.Error())
+		}
+	}
+	v.add("column_sets", len(bad) == 0, "%s", strings.Join(bad, "; "))
+}
+
+// checkRowCounts compares the number of rows per table.
+func (v *Verifier) checkRowCounts(ctx context.Context, source map[string]*Table) {
+	var parts, bad []string
+	for _, name := range Tables {
+		var n int
+		if err := v.pool.QueryRow(ctx, "SELECT count(*) FROM "+quoteIdent(name)).Scan(&n); err != nil {
+			bad = append(bad, fmt.Sprintf("%s: %v", name, err))
+			continue
+		}
+		want := len(source[name].Rows)
+		parts = append(parts, fmt.Sprintf("%s=%d", name, want))
+		if n != want {
+			bad = append(bad, fmt.Sprintf("%s: source %d, target %d", name, want, n))
+		}
+	}
+	v.add("row_counts", len(bad) == 0, "source and target: %s%s", strings.Join(parts, " "),
+		prefixIf(len(bad) > 0, " — "+strings.Join(bad, "; ")))
+}
+
+// checkRowsEqual compares every column of every row, keyed by primary key.
+//
+// This is the check that makes "the data was moved" mean something stronger than
+// "the right number of rows arrived": a value written to the wrong column, a
+// timestamp rounded through a float, a text encoding change or a truncation all
+// pass a count and all fail here.
+func (v *Verifier) checkRowsEqual(ctx context.Context, source map[string]*Table, target *TargetSchema) {
+	for _, name := range Tables {
+		table := source[name]
+		columns := target.Tables[name]
+		problems, err := compareRows(ctx, v.pool, table, columns)
+		if err != nil {
+			v.add("row_equality["+name+"]", false, "%v", err)
+			continue
+		}
+		// An empty source table makes this check vacuous, and the real data set
+		// has one (key_renewals). Saying so in the detail line is the difference
+		// between a green line that means "every row matched" and a green line
+		// that means "there were no rows to match" — the distinction this
+		// repository got wrong once already, when a check that could not fail
+		// was counted as evidence.
+		detail := fmt.Sprintf("%d row(s) compared", len(table.Rows))
+		if len(table.Rows) == 0 {
+			detail = "0 rows — the source table is empty, so this check compared nothing (the count check still requires both sides to be empty)"
+		}
+		v.add("row_equality["+name+"]", len(problems) == 0, "%s%s", detail,
+			prefixIf(len(problems) > 0, " — "+strings.Join(problems, "; ")))
+	}
+}
+
+// digestEntry is one row's identity and content digest.
+type digestEntry struct {
+	id     string
+	digest string
+}
+
+// checkReportContent is the "5 reports" evidence: a digest over the bytes that
+// actually matter, computed from the source's JSON and from the target through
+// the store's own read path.
+//
+// The digest covers the report's identity and content, not the row layout: a
+// report whose content survived but whose updated_at moved by a millisecond
+// would already have failed row_equality, and folding every column in here would
+// make this line fail for the same reason twice.
+func (v *Verifier) checkReportContent(source map[string]*Table) {
+	table := source["reports"]
+	index := sourceColumnIndex(table)
+
+	var sourceEntries, targetEntries []digestEntry
+	for _, row := range table.Rows {
+		id, err := asString(row[index["id"]])
+		if err != nil {
+			v.add("report_content", false, "source report id: %v", err)
+			return
+		}
+		metadata, err := canonicalJSON(mustString(row[index["metadata"]]))
+		if err != nil {
+			v.add("report_content", false, "source report %s: %v", id, err)
+			return
+		}
+		sourceEntries = append(sourceEntries, digestEntry{id: id, digest: reportDigest(
+			id,
+			mustString(row[index["title"]]),
+			mustString(row[index["format"]]),
+			mustString(row[index["content"]]),
+			metadata,
+		)})
+	}
+
+	// Read the target through the store, not through raw SQL: the store's read
+	// path is what the service will use, so a decode/encode bug there shows up
+	// here instead of only in production.
+	for _, e := range sourceEntries {
+		report, err := v.st.GetReport(e.id)
+		if err != nil {
+			v.add("report_content", false, "read target report %s: %v", e.id, err)
+			return
+		}
+		if report == nil {
+			v.add("report_content", false, "target has no report %s", e.id)
+			return
+		}
+		targetEntries = append(targetEntries, digestEntry{id: e.id, digest: reportDigest(
+			report.ID, report.Title, string(report.Format), report.Content, mustJSON(report.Metadata),
+		)})
+	}
+
+	sortEntries(sourceEntries)
+	sortEntries(targetEntries)
+	sourceDigest := digestOfEntries(sourceEntries)
+	targetDigest := digestOfEntries(targetEntries)
+
+	ok := sourceDigest == targetDigest
+	detail := fmt.Sprintf("%d report(s), content digest %s", len(sourceEntries), short(sourceDigest))
+	if !ok {
+		detail = fmt.Sprintf("source digest %s but target digest %s (ids: %s)",
+			short(sourceDigest), short(targetDigest), strings.Join(idsOf(sourceEntries), ", "))
+	}
+	v.add("report_content", ok, "%s", detail)
+}
+
+// checkDatabaseRenderedText compares each row's values as rendered by the SOURCE
+// database against the TARGET database's own rendering, and is the one check that
+// never calls convertValue.
+//
+// That independence is the whole reason it exists. Every other value comparison
+// here converts the source through the same function the import uses, so a bug in
+// that function cancels itself out: the two sides agree, the check is green, and a
+// wrong value is in the database. This is not hypothetical — a source value of
+// 9223372036854775808 (above int64's maximum, so SQLite stores it with REAL
+// affinity) reached int64(), wrapped to -9223372036854775808, was written to
+// PostgreSQL, and passed every check in this file. Rendering both sides with their
+// own database catches it, because SQLite says "9.2233720368547758e+18" and
+// PostgreSQL says "-9223372036854775808" and no Go code is involved in either
+// string.
+//
+// Only integer and text columns are compared. A REAL column is excluded on
+// purpose: SQLite's CAST to TEXT uses 15 significant digits while PostgreSQL's
+// ::text uses the shortest round-trip representation, so their renderings differ
+// for values that are bit-identical — a check that compares them would report a
+// difference where there is none, and a check that cries wolf gets ignored. For
+// REAL columns the assurance is the Float64 round-trip, which preserves the exact
+// IEEE754 bits (measured: 0.1, the smallest subnormal, 0.30000000000000004 and the
+// largest finite double all landed bit-exact), plus the range refusal in integral.
+func (v *Verifier) checkDatabaseRenderedText(ctx context.Context, source map[string]*Table, target *TargetSchema) {
+	comparable := func(dataType string) bool {
+		return containsString(intTypes, dataType) || containsString(textTypes, dataType)
+	}
+
+	for _, name := range Tables {
+		var columns []string
+		for _, c := range target.Tables[name] {
+			if comparable(c.DataType) {
+				columns = append(columns, c.Name)
+			}
+		}
+
+		sourceRendered, err := v.src.RenderedText(ctx, name, columns)
+		if err != nil {
+			v.add("db_rendered_text["+name+"]", false, "%v", err)
+			continue
+		}
+		targetRendered, err := v.renderedTargetText(ctx, name, columns)
+		if err != nil {
+			v.add("db_rendered_text["+name+"]", false, "%v", err)
+			continue
+		}
+
+		cells := len(columns) * len(source[name].Rows)
+		problems := compareRenderedText(columns, sourceRendered, targetRendered)
+		detail := fmt.Sprintf("%d cell(s) rendered by both databases", cells)
+		if cells == 0 {
+			detail = "0 cells — the source table is empty, so this check compared nothing"
+		}
+		v.add("db_rendered_text["+name+"]", len(problems) == 0, "%s%s", detail,
+			prefixIf(len(problems) > 0, " — "+strings.Join(problems, "; ")))
+	}
+}
+
+// renderedTargetText renders the same columns with PostgreSQL's own ::text.
+func (v *Verifier) renderedTargetText(ctx context.Context, table string, columns []string) (map[string][]RenderedValue, error) {
+	key := PrimaryKey[table]
+	exprs := make([]string, 0, len(columns)+1)
+	exprs = append(exprs, quoteIdent(key)+"::text")
+	for _, c := range columns {
+		exprs = append(exprs, quoteIdent(c)+"::text")
+	}
+	rows, err := v.pool.Query(ctx, "SELECT "+strings.Join(exprs, ", ")+" FROM "+quoteIdent(table))
+	if err != nil {
+		return nil, fmt.Errorf("render target %s as text: %w", table, err)
+	}
+	defer rows.Close()
+
+	out := make(map[string][]RenderedValue)
+	for rows.Next() {
+		values, err := rows.Values()
+		if err != nil {
+			return nil, fmt.Errorf("read rendered target %s row: %w", table, err)
+		}
+		id, err := asString(values[0])
+		if err != nil {
+			return nil, fmt.Errorf("target %s %s: %w", table, key, err)
+		}
+		rendered := make([]RenderedValue, len(columns))
+		for i := range columns {
+			rendered[i] = renderedFromDBValue(values[i+1])
+		}
+		out[id] = rendered
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("render target %s as text: %w", table, err)
+	}
+	return out, nil
+}
+
+// renderedFromDBValue adapts a pgx value to a RenderedValue. Only string and NULL
+// can appear, because every expression in the query above is a ::text cast.
+func renderedFromDBValue(v any) RenderedValue {
+	switch value := v.(type) {
+	case nil:
+		return RenderedValue{Null: true}
+	case string:
+		return RenderedValue{Text: value}
+	default:
+		// Not reachable while the query casts to text; returning the Go rendering
+		// keeps the comparison honest rather than silently equal.
+		return RenderedValue{Text: fmt.Sprintf("%v", value)}
+	}
+}
+
+// compareRenderedText is the pure comparison behind the check, so that it can be
+// tested without two databases.
+func compareRenderedText(columns []string, source, target map[string][]RenderedValue) []string {
+	var problems []string
+	for _, id := range sortedRenderedKeys(source) {
+		want := source[id]
+		got, ok := target[id]
+		if !ok {
+			problems = append(problems, fmt.Sprintf("%s=%s is missing from the target", "row", id))
+			continue
+		}
+		for i := range columns {
+			if i >= len(want) || i >= len(got) {
+				problems = append(problems, fmt.Sprintf("%s=%s rendered a different number of columns", "row", id))
+				break
+			}
+			if renderedText(want[i]) != renderedText(got[i]) {
+				problems = append(problems, fmt.Sprintf("%s=%s column %s: source renders %s, target renders %s",
+					"row", id, columns[i], quotedRendered(want[i]), quotedRendered(got[i])))
+			}
+		}
+	}
+	for _, id := range sortedRenderedKeys(target) {
+		if _, ok := source[id]; !ok {
+			problems = append(problems, fmt.Sprintf("row=%s is in the target but not the source", id))
+		}
+	}
+	return bound(problems, 5)
+}
+
+// renderedText folds NULL into the comparison so that NULL never equals the empty
+// string.
+func renderedText(v RenderedValue) string {
+	if v.Null {
+		return "\x00null"
+	}
+	return "\x00s" + v.Text
+}
+
+func quotedRendered(v RenderedValue) string {
+	if v.Null {
+		return "NULL"
+	}
+	return strconv.Quote(v.Text)
+}
+
+func sortedRenderedKeys(m map[string][]RenderedValue) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// checkOwnershipBoundary is the ADR's "关键边界" that no other check states in
+// behavioural terms: a report whose owner_key_id is ” was published by the
+// break-glass root key (or before keys existed), and it must stay readable by root
+// and by the dashboard and by nobody else.
+//
+// row_equality already proves the column was copied. This asks the STORE what it
+// believes afterwards, because that is where a change of meaning would actually
+// bite: a root report whose owner_key_id had been filled in with somebody's key id
+// would look perfectly equal in every count and would have silently changed hands.
+func (v *Verifier) checkOwnershipBoundary(source map[string]*Table) {
+	table := source["reports"]
+	index := sourceColumnIndex(table)
+
+	var rootReports, ownedReports []string
+	var failures []string
+	for _, row := range table.Rows {
+		id := mustString(row[index["id"]])
+		wantOwner := mustString(row[index["owner_key_id"]])
+		if wantOwner == "" {
+			rootReports = append(rootReports, id)
+		} else {
+			ownedReports = append(ownedReports, id)
+		}
+
+		owner, found, err := v.st.ReportOwner(id)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", id, err))
+			continue
+		}
+		if !found {
+			failures = append(failures, fmt.Sprintf("%s: the store cannot find the report", id))
+			continue
+		}
+		if owner != wantOwner {
+			if wantOwner == "" {
+				failures = append(failures, fmt.Sprintf("%s: was published by the root key but now belongs to %s", id, owner))
+			} else {
+				failures = append(failures, fmt.Sprintf("%s: belonged to %s but now belongs to %q", id, wantOwner, owner))
+			}
+		}
+	}
+
+	v.add("ownership_boundary_unchanged", len(failures) == 0,
+		"root(owner_key_id='')=%d %s, key-owned=%d%s",
+		len(rootReports), list(rootReports), len(ownedReports),
+		prefixIf(len(failures) > 0, " — "+strings.Join(failures, "; ")))
+}
+
+// checkShareSemantics is the human's checklist, stated as two properties.
+//
+// It asks the *store* — the same code the running service will use — what each
+// link is now, and requires that to match the source row. Doing it through the
+// store rather than by re-reading the columns is what makes it evidence about
+// behaviour (404 vs 200) instead of evidence about storage.
+//
+// It also reads the token's stored row, because "resolves OK" does NOT imply
+// "still permanent": a link whose expires_at had been moved to now+1h would
+// resolve perfectly well and would silently stop being a permanent link. The
+// property the human asked for is the stored expires_at, so that is asserted
+// directly.
+func (v *Verifier) checkShareSemantics(source map[string]*Table) {
+	table := source["share_tokens"]
+	index := sourceColumnIndex(table)
+	now := time.Now().UnixMilli()
+
+	// Each category gets its own token list and its own failure list, and a row
+	// is classified BEFORE the target is read. Filing every target-side failure
+	// in one bucket was the first version of this function, and it attributed a
+	// missing *permanent* token to the revoked check — the same accident the
+	// repository already recorded once, where a check reported a failure under a
+	// name that did not describe what it had found.
+	permanent := &shareCategory{}
+	revoked := &shareCategory{}
+	live := &shareCategory{}
+	expired := &shareCategory{}
+	categories := []*shareCategory{permanent, revoked, live, expired}
+	failAll := func(msg string) {
+		for _, c := range categories {
+			c.failures = append(c.failures, msg)
+		}
+	}
+
+	for _, row := range table.Rows {
+		token := mustString(row[index["token"]])
+		sourceExpires, err := anyToInt64(row[index["expires_at"]], "expires_at")
+		if err != nil {
+			failAll(fmt.Sprintf("%s: %v", token, err))
+			continue
+		}
+		sourceActive, err := anyToInt64(row[index["is_active"]], "is_active")
+		if err != nil {
+			failAll(fmt.Sprintf("%s: %v", token, err))
+			continue
+		}
+
+		var group *shareCategory
+		switch {
+		case sourceActive == 0:
+			group = revoked
+		case sourceExpires == 0:
+			group = permanent
+		case sourceExpires <= now:
+			group = expired
+		default:
+			group = live
+		}
+		group.tokens = append(group.tokens, token)
+		fail := func(format string, args ...any) {
+			group.failures = append(group.failures, fmt.Sprintf("%s: %s", token, fmt.Sprintf(format, args...)))
+		}
+
+		stored, err := v.st.GetShareToken(token)
+		if err != nil {
+			fail("read target token: %v", err)
+			continue
+		}
+		if stored == nil {
+			fail("missing from the target")
+			continue
+		}
+		res, err := v.st.ResolveShare(token)
+		if err != nil {
+			fail("resolve: %v", err)
+			continue
+		}
+
+		// The stored expires_at is compared in every category, not just the
+		// permanent one: it is the column the contract is written in, and a
+		// changed expiry is a changed promise even when the current status
+		// happens to be the same.
+		if stored.ExpiresAt != sourceExpires {
+			fail("expires_at %d in the source, %d in the target", sourceExpires, stored.ExpiresAt)
+		}
+
+		switch group {
+		case revoked:
+			if stored.IsActive {
+				fail("revoked in the source but active in the target")
+			}
+			if res.Status != domain.StatusMissing {
+				fail("revoked in the source (is_active=0) but resolves as %s", statusName(res.Status))
+			}
+		case permanent:
+			if !stored.IsActive {
+				fail("permanent in the source but inactive in the target")
+			}
+			if res.Status != domain.StatusOK {
+				fail("expires_at=0 (never expires) but resolves as %s", statusName(res.Status))
+			}
+		case expired:
+			if !stored.IsActive {
+				fail("expired rather than revoked in the source, but inactive in the target")
+			}
+			if res.Status != domain.StatusGone {
+				fail("expired at %d but resolves as %s", sourceExpires, statusName(res.Status))
+			}
+		default:
+			if !stored.IsActive {
+				fail("live in the source but inactive in the target")
+			}
+			if res.Status != domain.StatusOK {
+				fail("live until %d but resolves as %s", sourceExpires, statusName(res.Status))
+			}
+		}
+	}
+
+	classified := len(permanent.tokens) + len(revoked.tokens) + len(live.tokens) + len(expired.tokens)
+	if classified != len(table.Rows) {
+		// Every source row must land in exactly one category. If a future edit
+		// to the classification stops covering a case, the four checks below
+		// would each pass while silently ignoring a link.
+		failAll(fmt.Sprintf("only %d of %d source share tokens were classified", classified, len(table.Rows)))
+	}
+
+	inventory := fmt.Sprintf("permanent(expires_at=0)=%d %s, revoked(is_active=0)=%d %s, live=%d, expired=%d",
+		len(permanent.tokens), list(permanent.tokens), len(revoked.tokens), list(revoked.tokens),
+		len(live.tokens), len(expired.tokens))
+
+	for _, check := range []struct {
+		name  string
+		group *shareCategory
+	}{
+		{"permanent_links_stay_permanent", permanent},
+		{"revoked_links_stay_404", revoked},
+		{"live_links_still_resolve", live},
+		{"expired_links_stay_410", expired},
+	} {
+		v.add(check.name, len(check.group.failures) == 0, "%s%s", inventory,
+			prefixIf(len(check.group.failures) > 0, " — "+strings.Join(check.group.failures, "; ")))
+	}
+}
+
+// shareCategory is one class of share token and what went wrong with it.
+type shareCategory struct {
+	tokens   []string
+	failures []string
+}
+
+// checkAgentKeys is the "2 keys" evidence, through the store's auth path.
+//
+// A key's plaintext token is not in the database (only its sha256 is), so the
+// strongest available statement is that resolving by hash yields the same key —
+// which is exactly what the auth middleware does on every agent request.
+func (v *Verifier) checkAgentKeys(source map[string]*Table) {
+	table := source["agent_keys"]
+	index := sourceColumnIndex(table)
+	now := time.Now().UnixMilli()
+
+	var usable, unusable []string
+	var failures []string
+	for _, row := range table.Rows {
+		id := mustString(row[index["id"]])
+		hash := mustString(row[index["token_hash"]])
+		expiresAt, err := anyToInt64(row[index["expires_at"]], "expires_at")
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", id, err))
+			continue
+		}
+		revokedAt, err := anyToInt64(row[index["revoked_at"]], "revoked_at")
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", id, err))
+			continue
+		}
+		expectUsable := revokedAt == 0 && (expiresAt == 0 || expiresAt > now)
+
+		key, err := v.st.ResolveAgentKey(hash, now)
+		if err != nil {
+			failures = append(failures, fmt.Sprintf("%s: resolve: %v", id, err))
+			continue
+		}
+		if !expectUsable {
+			unusable = append(unusable, id)
+			if key != nil {
+				failures = append(failures, fmt.Sprintf("%s: revoked_at=%d expires_at=%d but still authenticates", id, revokedAt, expiresAt))
+			}
+			continue
+		}
+		usable = append(usable, id)
+		switch {
+		case key == nil:
+			failures = append(failures, fmt.Sprintf("%s: live in the source but does not authenticate", id))
+		case key.ID != id:
+			failures = append(failures, fmt.Sprintf("%s: hash resolves to a different key %s", id, key.ID))
+		case key.ExpiresAt != expiresAt:
+			failures = append(failures, fmt.Sprintf("%s: expires_at %d in the source, %d in the target", id, expiresAt, key.ExpiresAt))
+		}
+	}
+	v.add("agent_keys_still_authenticate", len(failures) == 0,
+		"usable=%d %s, unusable=%d %s%s", len(usable), list(usable), len(unusable), list(unusable),
+		prefixIf(len(failures) > 0, " — "+strings.Join(failures, "; ")))
+}
+
+// compareRows compares every row of one table, keyed by primary key, and returns
+// a bounded list of human-readable differences.
+func compareRows(ctx context.Context, q querier, source *Table, columns []TargetColumn) ([]string, error) {
+	index := sourceColumnIndex(source)
+	key := PrimaryKey[source.Name]
+
+	sourceRows := make(map[string]string, len(source.Rows))
+	for rowNum, row := range source.Rows {
+		parts := make([]string, len(columns))
+		for i, c := range columns {
+			value, err := convertValue(row[index[c.Name]], c)
+			if err != nil {
+				return nil, fmt.Errorf("row %d column %s: %w", rowNum, c.Name, err)
+			}
+			parts[i] = canonicalValue(value)
+		}
+		id, err := asString(row[index[key]])
+		if err != nil {
+			return nil, err
+		}
+		if _, dup := sourceRows[id]; dup {
+			return nil, fmt.Errorf("source has two rows with %s=%s", key, id)
+		}
+		sourceRows[id] = strings.Join(parts, rowSeparator)
+	}
+
+	rows, err := q.Query(ctx, selectQuery(source.Name, columns))
+	if err != nil {
+		return nil, fmt.Errorf("read target %s: %w", source.Name, err)
+	}
+	defer rows.Close()
+
+	keyPos := -1
+	for i, c := range columns {
+		if c.Name == key {
+			keyPos = i
+		}
+	}
+	if keyPos < 0 {
+		return nil, fmt.Errorf("target %s has no %s column", source.Name, key)
+	}
+
+	targetRows := make(map[string]string, len(source.Rows))
+	for rows.Next() {
+		values, err := rows.Values()
+		if err != nil {
+			return nil, fmt.Errorf("read target %s row: %w", source.Name, err)
+		}
+		parts := make([]string, len(values))
+		for i, value := range values {
+			parts[i] = canonicalValue(value)
+		}
+		id, err := asString(values[keyPos])
+		if err != nil {
+			return nil, fmt.Errorf("target %s %s: %w", source.Name, key, err)
+		}
+		targetRows[id] = strings.Join(parts, rowSeparator)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read target %s: %w", source.Name, err)
+	}
+
+	var problems []string
+	for _, id := range sortedKeys(sourceRows) {
+		targetRow, ok := targetRows[id]
+		if !ok {
+			problems = append(problems, fmt.Sprintf("%s=%s is missing from the target", key, id))
+			continue
+		}
+		if targetRow != sourceRows[id] {
+			problems = append(problems, fmt.Sprintf("%s=%s differs at %s",
+				key, id, firstDifference(columns, sourceRows[id], targetRow)))
+		}
+	}
+	for _, id := range sortedKeys(targetRows) {
+		if _, ok := sourceRows[id]; !ok {
+			problems = append(problems, fmt.Sprintf("%s=%s is in the target but not the source", key, id))
+		}
+	}
+	return bound(problems, 5), nil
+}
+
+// rowSeparator separates columns inside a canonical row. A control character
+// cannot appear in any of these columns' values, so no value can forge a
+// boundary and make two different rows look identical.
+const rowSeparator = "\x1f"
+
+// canonicalValue renders a value so that two databases' representations of the
+// same value compare equal.
+//
+// The width differences are the point: PostgreSQL hands back int4 as int32 and
+// int8 as int64, while the source side converted both to int64, so comparing Go
+// types would report a difference where the values agree.
+func canonicalValue(v any) string {
+	switch value := v.(type) {
+	case nil:
+		return "\x00null"
+	case string:
+		return "\x00s" + value
+	case []byte:
+		return "\x00b" + hex.EncodeToString(value)
+	case bool:
+		return "\x00t" + strconv.FormatBool(value)
+	case int64:
+		return "\x00i" + strconv.FormatInt(value, 10)
+	case int32:
+		return "\x00i" + strconv.FormatInt(int64(value), 10)
+	case int:
+		return "\x00i" + strconv.FormatInt(int64(value), 10)
+	case int16:
+		return "\x00i" + strconv.FormatInt(int64(value), 10)
+	case float64:
+		return "\x00f" + strconv.FormatFloat(value, 'f', -1, 64)
+	case float32:
+		return "\x00f" + strconv.FormatFloat(float64(value), 'f', -1, 64)
+	default:
+		return fmt.Sprintf("\x00%T:%v", v, v)
+	}
+}
+
+// firstDifference names the first column whose canonical values disagree.
+func firstDifference(columns []TargetColumn, a, b string) string {
+	left := strings.Split(a, rowSeparator)
+	right := strings.Split(b, rowSeparator)
+	for i := range columns {
+		if i >= len(left) || i >= len(right) {
+			return "a different number of columns"
+		}
+		if left[i] != right[i] {
+			return fmt.Sprintf("%s (%s vs %s)", columns[i].Name, display(left[i]), display(right[i]))
+		}
+	}
+	return "no column (the row separators differ)"
+}
+
+// display strips the type tag and shortens a value for a one-line message.
+//
+// The tag is what makes int64(1), int32(1) and the string "1" comparable at
+// all; it is noise in a message a human reads, so it is removed here rather than
+// kept in the canonical form.
+func display(v string) string {
+	plain := v
+	if len(plain) >= 2 && plain[0] == 0 {
+		plain = plain[2:]
+	}
+	if len(plain) > 60 {
+		return strconv.Quote(plain[:60] + "…")
+	}
+	return strconv.Quote(plain)
+}
+
+// reportDigest is the digest of one report's identity and content.
+func reportDigest(id, title, format, content, metadata string) string {
+	h := sha256.New()
+	for _, part := range []string{id, title, format, content, metadata} {
+		fmt.Fprintf(h, "%d:%s\n", len(part), part)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// digestOfEntries digests a set of rows keyed by identity.
+func digestOfEntries(entries []digestEntry) string {
+	h := sha256.New()
+	for _, e := range entries {
+		fmt.Fprintf(h, "%s=%s\n", e.id, e.digest)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func idsOf(entries []digestEntry) []string {
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.id)
+	}
+	return out
+}
+
+func sortEntries(entries []digestEntry) {
+	sort.Slice(entries, func(i, j int) bool { return entries[i].id < entries[j].id })
+}
+
+// mustJSON renders a decoded JSON value back to text, so that the digest
+// compares content rather than key order.
+func mustJSON(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf("<!unencodable: %v>", err)
+	}
+	return string(b)
+}
+
+// canonicalJSON re-encodes a JSON text so that two spellings of the same object
+// compare equal.
+//
+// The two sides of the comparison arrive in different shapes: the source hands
+// back the exact bytes the agent sent — key order and all — while the store
+// hands back a decoded map, which Go re-encodes in its own key order. Comparing
+// those spellings directly would fail for any report whose metadata keys were
+// not already alphabetical. It passed on the real data set only because every
+// metadata object in it happens to be sorted, which is luck, not a property.
+//
+// An empty column becomes {} because that is what the store's decodeMetadata
+// does with it, and the two sides must agree on that edge as well.
+func canonicalJSON(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "{}", nil
+	}
+	var value any
+	if err := json.Unmarshal([]byte(trimmed), &value); err != nil {
+		return "", fmt.Errorf("metadata is not valid JSON: %w", err)
+	}
+	if value == nil {
+		return "{}", nil
+	}
+	b, err := json.Marshal(value)
+	if err != nil {
+		return "", fmt.Errorf("metadata cannot be re-encoded: %w", err)
+	}
+	return string(b), nil
+}
+
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func bound(items []string, n int) []string {
+	if len(items) <= n {
+		return items
+	}
+	return append(items[:n], fmt.Sprintf("… and %d more", len(items)-n))
+}
+
+func list(items []string) string { return "[" + strings.Join(items, " ") + "]" }
+
+func short(digest string) string {
+	if len(digest) <= 16 {
+		return digest
+	}
+	return digest[:16] + "…"
+}
+
+func prefixIf(cond bool, s string) string {
+	if cond {
+		return s
+	}
+	return ""
+}
+
+func statusName(s domain.ResolutionStatus) string {
+	switch s {
+	case domain.StatusOK:
+		return "ok(200)"
+	case domain.StatusMissing:
+		return "missing(404)"
+	case domain.StatusGone:
+		return "gone(410)"
+	default:
+		return fmt.Sprintf("unknown(%d)", int(s))
+	}
+}
+
+// asString requires a value to be a string, for columns this importer knows are
+// TEXT.
+func asString(v any) (string, error) {
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("expected text, got %T (%v)", v, v)
+	}
+	return s, nil
+}
+
+// mustString is asString for callers that have already established the column is
+// text and would only be able to abort with an error message.
+func mustString(v any) string {
+	s, _ := asString(v)
+	return s
+}

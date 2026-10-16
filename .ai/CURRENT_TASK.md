@@ -1,9 +1,10 @@
 # Current task
 
-**Status:** 🚧 **P0 ✅ / P1 ✅（附更正）/ P2 ✅（P2.1–P2.3）/ P3 ✅ / P4 ✅** —— store 是 **pgx + sqlc**，
+**Status:** 🚧 **P0 ✅ / P1 ✅（附更正）/ P2 ✅（P2.1–P2.3）/ P3 ✅ / P4 ✅ / P5 ✅** —— store 是 **pgx + sqlc**，
 HTTP 层是 **Gin**，**全链路已在真二进制上验过**：HTTP 契约 **64/64** + 真实浏览器 **15/15**
 （`scripts/verify-p4.sh`，第三档闸门），并做了 **旧树 vs 新树的差分跑：108 请求只有 1 处已知差异**。
-三档闸门全绿。**P5（数据搬运）/ P6（切换）未做；线上仍是旧版且已停（502）。**
+**数据搬运已在临时 schema 上彩排通过（`scripts/verify-p5.sh`，15/15 + 负向对照）。**
+四档闸门全绿。**P6（切换）未做，且必须先问人类；线上仍是旧版且已停（502）。**
 
 **P2.3 交付物**：`internal/store/` 的 `queries.go` + `keys.go` 改为 pgx；新增
 `internal/store/queries/*.sql`（sqlc 源）+ `internal/store/storedb/`（生成物）+ `backend/sqlc.yaml` +
@@ -101,6 +102,111 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   （会吃掉尾部换行，需 `cmp` 才算字节级证据）；合同 14 只在 API 侧间接覆盖（DB 侧由
   `TestNoPlaintextCollected` 盯着）。
 
+**P5 交付物（SQLite → PG 数据搬运 + 行数/行为核对）**：
+- `backend/internal/sqlitemigrate/`：`source.go`（**通过 `sqlite3` 命令行 shell 的 `-json` 模式**读旧库，
+  另有 `RenderedText`：让 **SQLite 自己**用 `CAST(col AS TEXT)` 渲染值，供校验器做与 Go 无关的比对），
+  `mode=ro&immutable=1` URI，**零新增 Go 依赖** —— 发布产物一个字节未变）、`target.go`（目标自省 +
+  `OpenTargetPool`）、`import.go`（单事务搬运 + 提交前行数核对）、`verify.go`（15 项只读检查）。
+- `backend/cmd/sqliteimport/`：`import` / `verify` 两个子命令；`-replace` 必须**同时**给 `-yes`
+  才会 TRUNCATE，否则只打印「将要删掉什么」并以码 3 退出。
+- `backend/internal/sqlitemigrate/testdata/legacy_sqlite_schema.sql`：**冻结的旧 SQLite DDL**，
+  只用来给测试造夹具（旧 `schema.sql` 已随 P2 删除，这份是它的最后形态）。
+- `scripts/verify-p5.sh`：第四档闸门。拒绝非 `*test*` 库名；拒绝带 `-wal/-shm/-journal` 的源；
+  可 `P5_FETCH=1` 从 hcyj **只读**取回源（先 `sha256sum` 远端、再 `scp`、再比对）；
+  在 `teleport_test` 建私有 schema 彩排，跑完即拆。
+- 决策 `2026-10-16-p5-schema-ownership.md`；pitfall `2026-10-16-verifier-shares-the-conversion-it-checks.md`
+  （🔴 本会话最重要的教训）、`2026-10-16-controls-that-tamper-the-reference.md`、
+  `2026-10-16-migration-bookkeepings-do-not-match.md`；并给
+  `2026-10-16-merged-baseline-hides-a-stale-test-db.md` 追加了第二次同族现象。
+
+**P5 的核对（用户要的四条，全部有检查）**：
+- **报告数 5 / 密钥数 2 / 分享链接 6 / 申请 4 / 续期 0** —— 源侧用 `sqlite3` shell 独立数，
+  目标侧用 `psql` 独立数，两边都对着**人给的数字**（不是工具自己算出来的数字）断言。
+- **`expires_at=0` 的永久链接仍永久**：不只断言「现在能打开」，而是直接断言目标里
+  `expires_at` 仍是 0（把它改成 `now+1h` 的篡改会被点名报错 —— 因为「能解析」**不蕴含**「永久」）。
+- **已吊销的仍 404**：`is_active=0` 的 token 在目标里必须仍非活跃，且 `store.ResolveShare` 必须返回
+  `missing(404)`。源里那两个被吊销的链接中有一个**同时**是 `expires_at=0`，所以它必须**同时**满足
+  「永久」和「404」两个性质。
+- 另加：`report_content` 摘要（报告正文逐字节）、`ownership_boundary_unchanged`（ADR 点名的
+  `owner_key_id=''` root 报告必须**仍然**归属 root）、`agent_keys_still_authenticate`
+  （按 `token_hash` 走 store 的鉴权路径，活着仍活、吊销/过期的仍解析不出来）。
+
+**P5 期间发现并修掉的自己代码里的真 bug（按严重度）**：
+- 🔴 **超范围整数被静默回绕，而且校验器报绿**。源里一个 INTEGER 列的值为 2^63
+  （SQLite 装不下就用 REAL 存，`sqlite3 -json` 打出 `9.2233720368547758e+18`），
+  `int64(float64)` 在超范围时结果未定义、本平台回绕成 `-9223372036854775808`，
+  **写进了 PG 而且导入 exit=0**；更糟的是**校验也全绿** —— 因为校验器和搬运工具共用
+  `convertValue`，两侧错得一模一样，错误互相抵消。已修两层：① `integral()` 加显式范围检查
+  （拒绝）；② 新增 5 项 `db_rendered_text[...]` 检查，让**两个数据库各自**把值渲染成文本再比
+  字符串，**全程不经过 `convertValue`**（真源上共 157 个格子）。两道反证都做过：
+  把范围检查 `if false &&` 掉 → 单元测试 5 个子用例变红并打出回绕值；端到端那条也变红。
+  见 pitfall `2026-10-16-verifier-shares-the-conversion-it-checks.md`。
+- 🔴 **`json.Number` 没被处理**：`sqlite3 -json` 把整数和实数都解码成 `json.Number`，而我的
+  `anyToInt64/anyToFloat64` 只认 `int64/float64/string` → 每一个值都会报错（幸好是响亮失败）。
+  同时把 `fmt.Sscanf("%d")` 换成 `strconv.ParseInt`：前者会把 `720.0` **静默截断成 720**。
+- 🟠 **`report_content` 摘要在真数据上「靠运气」通过**：源给的是原始 JSON 文本，store 给的是
+  解码后的 map 再编码，键序不同。真数据的每个 `metadata` 恰好都是字母序，所以它绿了。
+  已改成两侧都过 `canonicalJSON`。
+- 🟠 **负向对照第一版是重言式**：我把篡改施加在**源文件**上，然后又拿这个被篡改的文件当源去
+  `verify` —— 「目标 vs 源」变成了「A vs A」。已改为篡改**目标**、参照仍是原源。
+- 🟠 **`ownership_boundary_unchanged` 一项**（后加的检查）**没有任何反证用例** —— 后来才加的检查
+  是这类漏洞的高发区，因为它天然没有历史对照。已补两个（root 报告被改归某把密钥、
+  密钥的报告被改成 root 报告）。现在 **20 项检查每一项都有对应的篡改用例**（Go 侧 15 个）。
+- 🟠 **`row_equality[key_renewals]` 是空绿**（真源里这张表 0 行）—— 现在 detail 直接写
+  `0 rows — … this check compared nothing`，让空绿在日志里可见。
+- 🟠 **`TestVerifyDetectsEachKindOfTamper` 在无库档里是「空绿」**：父测试不 skip、只有子测试
+  skip，`go test` 于是打印 `--- PASS` 而实际什么都没断言。已按 storetest 的文档在父测试开头
+  调 `SkipWithoutDatabase`。
+- 🟠 **`teleport_test.public` 里躺着一整套陈旧 schema**（P4 会话期间 18:08 某次没带
+  `search_path` 的迁移留下的），与 P4 交接里「环境干净」的说法不符 —— 那句话说的是
+  「只剩 `public` 这个 schema」，不是「它是空的」。已清掉（连同我手工实验留下的 `p5_scratch`）。
+- 🟠 **目标自省把视图当成表**：`information_schema.columns` 也描述视图，`v_live_shares` 于是被
+  报成「不认识的表」。已改成只读 `BASE TABLE`，并把期望的视图单列出来断言其存在。
+
+**P5 的对抗性实测（自建夹具，不经过任何 Go 代码的字节级比对）**：
+- 文本列逐字节相等（emoji / 中文 / 尾随空格 / CRLF / 孤立 CR / tab / 反斜杠 / 引号）：
+  源 `hex(title)` 与目标 `convert_to(title,'UTF8')` 的 hex 完全一致。
+- BIGINT 极值精确：`created_at = 9223372036854775807`、`updated_at = -9223372036854775808`、
+  `view_count = 9223372036854775807`、`request_count = 9223372036854775807` 全部原样。
+- DOUBLE PRECISION 位级精确：0.1、最小次正规数 `4.9406564584124654e-324`、
+  `0.30000000000000004`、最大有限 double `1.7976931348623157e+308`，
+  用 PG 的 `float8send` 与源的精确十进制表示各自算 IEEE754 字节 → **全部 MATCH**。
+- **非有限值**：SQLite 能存 `9e999`（= Inf），而 `sqlite3 -json` 会打出**非法 JSON**（裸 `Inf`）
+  → 导入**响亮失败**（不是静默写坏值）。这是已接受的行为（错误信息在 pitfall 里记了原因）。
+- 唯一的静默失败就是上面 🔴 那条超范围整数 —— **修好之后，本节的每一项都变成红或明确拒绝**。
+- 🔴 **`json.Number` 没被处理**：`sqlite3 -json` 把整数和实数都解码成 `json.Number`，而我的
+  `anyToInt64/anyToFloat64` 只认 `int64/float64/string` → 每一个值都会报错（幸好是响亮失败）。
+  同时把 `fmt.Sscanf("%d")` 换成 `strconv.ParseInt`：前者会把 `720.0` **静默截断成 720**。
+- 🟠 **`report_content` 摘要在真数据上「靠运气」通过**：源给的是原始 JSON 文本，store 给的是
+  解码后的 map 再编码，键序不同。真数据的每个 `metadata` 恰好都是字母序，所以它绿了。
+  已改成两侧都过 `canonicalJSON`。
+- 🟠 **负向对照第一版是重言式**：我把篡改施加在**源文件**上，然后又拿这个被篡改的文件当源去
+  `verify` —— 「目标 vs 源」变成了「A vs A」。已改为篡改**目标**、参照仍是原源。
+- 🟠 **`TestVerifyDetectsEachKindOfTamper` 在无库档里是「空绿」**：父测试不 skip、只有子测试
+  skip，`go test` 于是打印 `--- PASS` 而实际什么都没断言。已按 storetest 的文档在父测试开头
+  调 `SkipWithoutDatabase`。
+- 🟠 **`teleport_test.public` 里躺着一整套陈旧 schema**（P4 会话期间 18:08 某次没带
+  `search_path` 的迁移留下的），与 P4 交接里「环境干净」的说法不符 —— 那句话说的是
+  「只剩 `public` 这个 schema」，不是「它是空的」。已清掉（连同我手工实验留下的 `p5_scratch`）。
+- 🟠 **目标自省把视图当成表**：`information_schema.columns` 也描述视图，`v_live_shares` 于是被
+  报成「不认识的表」。已改成只读 `BASE TABLE`，并把期望的视图单列出来断言其存在。
+
+**P5 已实测 / 未实测**：
+- ✅ 四档闸门：`check.sh`（无库，**152 项 SKIP** 并大声提示）、`test-pg.sh`（强制真库）、
+  `verify-p4.sh`（未重跑，P4 之后 Go/前端未改）、`verify-p5.sh`（15/15 + 负向对照）。
+- ✅ 真源真库彩排：17 行、5 张表、`expires_at=0` 的 2 个、`is_active=0` 的 2 个，全部对上。
+- ✅ 负向对照：把目标里 2 个被吊销的链接改活、2 个永久链接加上过期时间 → 验证**按名字**变红
+  （`revoked_links_stay_404` + `permanent_links_stay_permanent`），并且篡改行数被断言 `>= 1`
+  （防止空对照）。
+- ✅ **20 项**检查（`db_rendered_text[...]` 5 项是新增的独立比对）+ **15 个** Go 侧篡改用例
+  （`TestVerifyDetectsEachKindOfTamper`），含「多一列」「改列名」「删视图」「root 归属被改」这类
+  **静默丢数据**的形状 —— 每一项检查都有对应的反证用例。
+- ⛔ **未做：真的往生产意图库 `teleport` 灌数据**（P6，且要先问人类）。生产库现在仍是 **0 张表**。
+- ⛔ **未做：旧版与新版的对账**（旧版已停，ADR 早就记过这个代价）。
+- ⛔ **未做：搬运后的大陆观测点/浏览器验证**（属 P6）。
+- ⚠️ **未验证的假设**：源的 `content`/`metadata` 里没有 NULL、没有 BLOB（有 typeof 层面的检查，
+  但真源里本来就没有）；`sqlite3` shell 版本（3.53.4）之外的行为未测。
+
 **Updated:** 2026-10-16
 **目标：** 把 teleport 重写到 Gin + pgx/sqlc + PostgreSQL，**在野契约逐字节不变**，
 然后部署到 hpcore（本机），让 hcyj 只剩转发。
@@ -163,14 +269,25 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 | ↳ **P2.3** | ✅ 完成：`queries.go` + `keys.go` 改 pgx；sqlc 生成 `storedb`（两张动态 `SET` 列表用 `COALESCE(sqlc.narg(...))` + `CASE` 表达为单条静态语句——ADR 的 Revisit 条款担心的那点已被实测证明可行）；三处上限用已验证的 advisory lock；`SELECT ... FOR UPDATE` 未被采用（无法锁不存在的行）。断言未为了变绿而重写：唯一改断言机制的一处是 `TestNoPlaintextCollected` 的 `sqlite_master` → `information_schema`（PG 无 sqlite 元数据表），**被断言的性质（明文永不入库）原样保留** | P2 的主体 |
 | **P3** | ✅ 完成：Gin 路由表 + `gin.HandlerFunc` handler（`c.Param`）；`internal/httpx` 的认证中间件用 `httpx.GinMiddleware` 适配成 Gin 中间件；信封/session/principal 仍是框架无关的纯函数。**零测试改动**通过。决策与 gin 版本证据见 `2026-10-16-p3-gin-integration.md` | 封套与状态码逐条对齐 —— 已逐条验证 |
 | **P4** | ✅ 完成：全链路起新版（Gin + pgx + 内嵌 SPA + 真 PG），HTTP 契约 **64/64** + 真实浏览器 **15/15**；另做**差分跑**（P3 之前的树 vs 新版，108 请求 / 1 处已知差异）。第三档闸门 `scripts/verify-p4.sh`。**未做：大陆观测点（要等 P6 切换后）** | 切换前的最后一道闸 —— 已过，但外部校验（P5/P6）仍在 |
-| P5 | SQLite → PG 的数据搬运脚本 + 行数核对（5 报告 / 2 密钥 / 全部分享链接） | 切换当天不能靠猜 |
-| P6 | 切到 hpcore（frpc 隧道 8788）。**hcyj 的 Caddy 需要改**：加 `teleport.hcyj.xyz` site block + 证书，并保留原有 `handle /yeciorez/teleport*`（见 `2026-10-16-teleport-own-hostname.md`）。两个入口都必须在同一窗口验证 | 用户要的最终形态：hcyj 只转发；且新域名不再挤在别人的路径下 |
+| **P5** | ✅ 完成：`internal/sqlitemigrate` + `cmd/sqliteimport`（**单事务、默认拒绝非空目标、`-replace` 需 `-yes`**）+ `scripts/verify-p5.sh`（第四档闸门）。**schema 由应用自己的迁移器建，工具从不发 DDL；P5 不建生产库的 schema**（决策记录 `2026-10-16-p5-schema-ownership.md`）。真源真库彩排 15/15 + 负向对照按名字变红。**未做：真往生产库灌**（属 P6） | 切换当天不能靠猜 —— 现在不用猜了，但**生产的第一次仍然在 P6** |
+| P6 | 切到 hpcore（frpc 隧道 8788）。**hcyj 的 Caddy 需要改**：加 `teleport.hcyj.xyz` site block + 证书，并保留原有 `handle /yeciorez/teleport*`（见 `2026-10-16-teleport-own-hostname.md`）。两个入口都必须在同一窗口验证。**必须先问人类确认窗口** | 用户要的最终形态：hcyj 只转发；且新域名不再挤在别人的路径下 |
 
 **保持冻结的线上环境**：重写期间**不要**改 hcyj 的 Caddy、不要升级本机 Postgres、
 **绝对不要轮换 `SESSION_SECRET`**（它会让所有派生密钥失效）。
 
 ## 未做 / 需要人类
 
+- **P5 已裁决并已执行**（`.ai/decisions/2026-10-16-p5-schema-ownership.md`）：schema 由应用迁移器
+  （`store.OpenPG` → `MigratePG`）建，搬运工具**从不发 DDL**；**P5 不建生产库 schema**，
+  生产 `teleport` 保持 0 张表到 P6；读旧库用 `sqlite3` shell（**零新增依赖**）。
+  P6 的顺序是 `migrate` → `import` → `verify`（都在同一个窗口里，不存在「提前建好却静默变旧」的间隔）。
+- **P6 之前必须问人类**：切到 hpcore、改 hcyj 的 Caddy（加 `teleport.hcyj.xyz` site block + 证书）、
+  frpc 隧道 8788。P5 全程没有碰线上（Caddy / frpc / 8788 一次未动），也没有碰生产意图库。
+- **P5 的源获取方式（P6 会重跑一次）**：`P5_FETCH=1 bash scripts/verify-p5.sh` 会
+  `ssh hcyj sha256sum` → 检查无 `-wal/-shm/-journal` → `scp` → 本地再 `sha256sum` 比对。
+  已实测的源：`sha256 0b3855d7b130e30d7ca2128afce7c9dd30dfaf7eba5f7a57293347a2cbbeb24d`
+  （P6 建议用 `P5_EXPECT_SHA256=` 把它钉住）。**只读**：hcyj 上没有任何写入。
+- **P5 未做**：真往生产库灌、旧新对账（旧版已停）、大陆观测点/浏览器（属 P6）。
 - **P2 测试策略已裁决**（`.ai/decisions/2026-10-16-p2-test-strategy.md`）：B —— 每测一个 schema，
   从内嵌迁移现建现拆；闸门两层（`check.sh` 可跳过 DB，`test-pg.sh` 强制）。
 - **P2.3 做法已裁决并已执行**（`.ai/decisions/2026-10-16-p2-store-port-technique.md`）：**B 一次性大爆炸**。
