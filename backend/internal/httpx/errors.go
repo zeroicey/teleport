@@ -64,9 +64,13 @@ func Gone(message string) *Error {
 
 // MethodNotAllowed rejects a method the route does not implement.
 //
-// It exists for one specific trap: net/http's ServeMux serves HEAD from a GET
-// pattern, so a HEAD request reaches handlers that change state. A HEAD has no
-// body, so such a handler can consume a one-time credential and return nothing.
+// It exists for one specific trap: a HEAD request can reach a handler that changes
+// state, and a HEAD has no body, so such a handler can consume a one-time
+// credential and return nothing.
+//
+// In the pre-Gin router this happened because net/http's ServeMux serves HEAD from
+// a GET pattern. Gin does not, so the router registers HEAD explicitly beside every
+// GET route to keep that reachability — and therefore this guard — meaningful.
 func MethodNotAllowed(message string) *Error {
 	return &Error{Status: http.StatusMethodNotAllowed, Code: "method_not_allowed", Message: message}
 }

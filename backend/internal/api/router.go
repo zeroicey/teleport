@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -352,12 +353,39 @@ func serveMuxRedirect(c *gin.Context, prefix string) bool {
 	return false
 }
 
+// redirect307 emits the redirect ServeMux emitted, query string and all.
+//
+// It defers to http.Redirect rather than writing Location by hand, because that is
+// exactly what ServeMux does: server.go's findHandler returns
+// `RedirectHandler(u.String(), StatusTemporaryRedirect)`, and RedirectHandler calls
+// http.Redirect. Writing the header directly looked equivalent and was not — it
+// dropped the query string and the Content-Type/body.
+//
+// Both losses were measured against the pre-Gin implementation:
+//
+//	GET {p}?a=1&b=2        -> 307 Location "{p}/?a=1&b=2"  Content-Type text/html  body 67B
+//	GET {p}//api/health?x=9 -> 307 Location "{p}/api/health?x=9"
+//
+// The query matters: {p}?a=1 is a plausible SPA deep link, and a redirect that
+// silently discards it lands the user on the wrong view. The body matters less, but
+// reproducing it is free once http.Redirect is doing the writing.
 func redirect307(c *gin.Context, target string) {
-	// Written directly rather than via http.Redirect so the body is empty and no
-	// HTML anchor is emitted, matching what ServeMux produced for a path clean.
-	c.Writer.Header().Set("Location", target)
-	c.Writer.WriteHeader(http.StatusTemporaryRedirect)
+	// http.Redirect escapes non-ASCII in the value it sets, so build the full
+	// target — path *and* query — the same way ServeMux's urlFromEscaped did.
+	u := urlFromEscaped(target, c.Request.URL.RawQuery)
+	http.Redirect(c.Writer, c.Request, u, http.StatusTemporaryRedirect)
 	c.Abort()
+}
+
+// urlFromEscaped mirrors net/http's own helper: it parses an already-escaped path
+// and attaches the raw query verbatim, falling back to a path-only URL.
+func urlFromEscaped(escapedPath, rawQuery string) string {
+	u, err := url.ParseRequestURI(escapedPath)
+	if err != nil {
+		u = &url.URL{Path: escapedPath}
+	}
+	u.RawQuery = rawQuery
+	return u.String()
 }
 
 // cleanPath is net/http's own path cleaner, reproduced so the redirect target is
@@ -491,8 +519,7 @@ func (s *Server) aiFacts() aidoc.Facts {
 }
 
 func (s *Server) handleHealth(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	status := "ok"
 	code := http.StatusOK
@@ -512,8 +539,7 @@ func (s *Server) handleHealth(c *gin.Context) {
 }
 
 func (s *Server) handleReadShare(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	token, err := s.shareToken(c.Param("token"))
 	if err != nil {
@@ -566,8 +592,7 @@ func (s *Server) handleReadShare(c *gin.Context) {
 // The clearing exception is the secret: nothing on this page can show, derive or
 // be made to reveal the fragment.
 func (s *Server) handleKeyHandoffPage(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	id := c.Param("id")
 	nowMS := store.NowMS()
@@ -624,8 +649,7 @@ func humanizeHours(hours float64) string {
 }
 
 func (s *Server) handleSharePage(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	token, err := s.shareToken(c.Param("token"))
 	if err != nil {
@@ -680,8 +704,7 @@ func (s *Server) handleSharePage(c *gin.Context) {
 //     The CSP's `frame-ancestors 'self'` below is the replacement restriction —
 //     same-origin frames only, which is exactly what DENY would have prevented.
 func (s *Server) handleShareHTML(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	token, err := s.shareToken(c.Param("token"))
 	if err != nil {
@@ -724,8 +747,7 @@ func (s *Server) handleShareHTML(c *gin.Context) {
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleCreateReport(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	raw, err := io.ReadAll(io.LimitReader(r.Body, s.cfg.MaxContentBytes+1<<16))
 	if err != nil {
@@ -781,8 +803,7 @@ func (s *Server) handleCreateReport(c *gin.Context) {
 }
 
 func (s *Server) handleGetReport(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	report, err := s.store.GetReport(c.Param("id"))
 	if err != nil {
@@ -804,8 +825,7 @@ func (s *Server) handleGetReport(c *gin.Context) {
 }
 
 func (s *Server) handleRevoke(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	token, err := s.shareToken(c.Param("token"))
 	if err != nil {
@@ -934,8 +954,7 @@ func (s *Server) applyReportDelete(w http.ResponseWriter, r *http.Request, id st
 }
 
 func (s *Server) handleUpdateReport(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	principal := httpx.PrincipalFrom(r.Context())
 	s.applyReportPatch(w, r, c.Param("id"), func(report *domain.Report) bool {
@@ -944,8 +963,7 @@ func (s *Server) handleUpdateReport(c *gin.Context) {
 }
 
 func (s *Server) handleDeleteReport(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	principal := httpx.PrincipalFrom(r.Context())
 	s.applyReportDelete(w, r, c.Param("id"), func(report *domain.Report) bool {
@@ -959,15 +977,13 @@ func (s *Server) handleDeleteReport(c *gin.Context) {
 // the agent principal's fields) access to everything. Passing "always true"
 // keeps that in one visible place.
 func (s *Server) handleAdminUpdateReport(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	s.applyReportPatch(w, r, c.Param("id"), func(*domain.Report) bool { return true })
 }
 
 func (s *Server) handleAdminDeleteReport(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	s.applyReportDelete(w, r, c.Param("id"), func(*domain.Report) bool { return true })
 }
@@ -977,8 +993,7 @@ func (s *Server) handleAdminDeleteReport(c *gin.Context) {
 // ---------------------------------------------------------------------------
 
 func (s *Server) handleLogin(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	body, err := readJSONObject(r, 4096)
 	if err != nil {
@@ -1020,16 +1035,14 @@ func (s *Server) handleLogin(c *gin.Context) {
 }
 
 func (s *Server) handleLogout(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	w.Header().Set("Set-Cookie", httpx.ClearSessionCookie(s.cfg.CookieSecure, s.cfg.CookiePath))
 	httpx.OK(w, r, map[string]any{"authenticated": false})
 }
 
 func (s *Server) handleSession(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	subject := ""
 	if session := httpx.SessionFrom(r.Context()); session != nil {
@@ -1047,8 +1060,7 @@ func (s *Server) handleSession(c *gin.Context) {
 // it must not accidentally see the root-published reports either (owner_key_id
 // ” is root's own).
 func (s *Server) handleListOwnReports(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	principal := httpx.PrincipalFrom(r.Context())
 	if principal == nil {
@@ -1093,8 +1105,7 @@ func (s *Server) handleListOwnReports(c *gin.Context) {
 }
 
 func (s *Server) handleListReports(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	q := r.URL.Query()
 	limit := clampInt(q.Get("limit"), 50, 1, 200)
@@ -1157,8 +1168,7 @@ func (s *Server) ownerNameIndex() (map[string]string, error) {
 }
 
 func (s *Server) handleAdminGetReport(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	id := c.Param("id")
 	report, err := s.store.GetReport(id)
@@ -1200,8 +1210,7 @@ func (s *Server) handleAdminGetReport(c *gin.Context) {
 }
 
 func (s *Server) handleCreateShare(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	reportID := c.Param("id")
 
@@ -1248,8 +1257,7 @@ func (s *Server) handleCreateShare(c *gin.Context) {
 }
 
 func (s *Server) handlePatchShare(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	token, err := s.shareToken(c.Param("token"))
 	if err != nil {
@@ -1320,8 +1328,7 @@ func (s *Server) handlePatchShare(c *gin.Context) {
 }
 
 func (s *Server) handleDeleteShare(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	token, err := s.shareToken(c.Param("token"))
 	if err != nil {

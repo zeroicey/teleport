@@ -82,12 +82,19 @@ Three findings from reading the code decide the trade-off:
   and the principal/session are still delivered through the request context
   (`c.Request = c.Request.WithContext(...)`), so `httpx.PrincipalFrom(c.Request.Context())`
   and the server-rendered pages keep working unchanged.
-- The outer chain is unchanged: `httpx.Chain(engine, Recover, RequestID, LogRequests,
-  SecurityHeaders, CORS(...), Compress)`.
+- The outer transport chain is preserved — `httpx.Chain(engine, Recover, RequestID,
+  LogRequests, SecurityHeaders, CORS(...), rejectEncodedSlashes, Compress)` — with exactly one
+  addition: `rejectEncodedSlashes`, which must run *before* routing to undo Gin's decoding of
+  `%2F` (see the divergence section below). Everything else in the chain is the same middleware
+  in the same order, which is the point: the compression writer and the CORS preflight are
+  preserved by construction rather than re-derived.
 - `NoRoute` answers the JSON 404 envelope, which is what the `/api/`, `/s/` and prefix
   catch-alls did.
-- `spa.Handler` is mounted through `gin.WrapH` — it is a `http.Handler` by design and there is
-  nothing to gain by rewriting it.
+- `spa.Handler` is *not* wrapped in a route. It is called from `NoRoute` as `static.ServeHTTP`,
+  because the SPA is the fallback for every path the router did not match — which is also what
+  it was before (`mux.Handle(p+"/", static)`). It stays a plain `http.Handler`; there is nothing
+  to gain by rewriting it, and mounting it through `gin.WrapH` on a catch-all route would change
+  which paths reach it.
 
 ### Why not B, stated plainly
 

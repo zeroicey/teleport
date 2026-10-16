@@ -151,8 +151,7 @@ func (s *Server) expireApplications(nowMS int64) {
 // handleCreateKeyApplication is the open entry point: any agent may ask for a
 // credential, and a human decides whether to grant it.
 func (s *Server) handleCreateKeyApplication(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	body, err := readJSONObject(r, 1<<16)
 	if err != nil {
@@ -222,14 +221,17 @@ func (s *Server) handleCreateKeyApplication(c *gin.Context) {
 // handlePollKeyApplication is how an agent learns the decision, and the one
 // moment a plaintext credential exists.
 func (s *Server) handlePollKeyApplication(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
-	// net/http serves HEAD from the GET pattern, so this state-changing handler
-	// would otherwise run for a HEAD — and a HEAD has no body to carry the token
-	// back. A proxy, prefetcher or link checker that reissues a request as HEAD
-	// with the claim header would silently burn the link and leave the recipient
-	// with a credential nobody can read.
+	// This state-changing handler would otherwise run for a HEAD — and a HEAD has
+	// no body to carry the token back. A proxy, prefetcher or link checker that
+	// reissues a request as HEAD with the claim header would silently burn the link
+	// and leave the recipient with a credential nobody can read.
+	//
+	// The route registers HEAD alongside GET on purpose (see the `get` helper in
+	// New): net/http's ServeMux used to serve HEAD from a GET pattern, and Gin does
+	// not — so without that registration this guard would be dead code and the 405
+	// would silently become a 404.
 	if r.Method == http.MethodHead {
 		w.Header().Set("Allow", http.MethodGet)
 		httpx.WriteError(w, r, httpx.MethodNotAllowed("Claim this application with GET"))
@@ -294,10 +296,9 @@ func (s *Server) handlePollKeyApplication(c *gin.Context) {
 
 // handlePollRenewal exposes a renewal's outcome to the agent that filed it.
 func (s *Server) handlePollRenewal(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
-	// Same trap as the application poll: ServeMux serves HEAD from GET, and this
+	// Same trap as the application poll: the route registers HEAD with GET, and this
 	// handler hands back a credential.
 	if r.Method == http.MethodHead {
 		w.Header().Set("Allow", http.MethodGet)
@@ -378,8 +379,7 @@ type keyMeResponse struct {
 // handleKeyMe reports the caller's own credential. Root has no key row, so it
 // gets a synthetic identity instead of a 404.
 func (s *Server) handleKeyMe(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	principal := httpx.PrincipalFrom(r.Context())
 	if principal == nil {
@@ -419,8 +419,7 @@ func (s *Server) handleKeyMe(c *gin.Context) {
 // human approves it — a key that could extend itself would make expiry
 // decorative.
 func (s *Server) handleCreateRenewal(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	principal := httpx.PrincipalFrom(r.Context())
 	if principal == nil {
@@ -464,8 +463,7 @@ func (s *Server) handleCreateRenewal(c *gin.Context) {
 // handleAdminListKeyApplications drives the approval queue. Expiry runs first so
 // the queue never shows a row that is already dead.
 func (s *Server) handleAdminListKeyApplications(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	q := r.URL.Query()
 	status := strings.TrimSpace(q.Get("status"))
@@ -499,8 +497,7 @@ func (s *Server) handleAdminListKeyApplications(c *gin.Context) {
 // from the claim secret, which the server only holds a hash of until the agent
 // claims it. So "approving adds no key row yet" is the contract, not a bug.
 func (s *Server) handleAdminApproveKeyApplication(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	id := c.Param("id")
 	body, err := readOptionalJSONObject(r, 1<<16)
@@ -551,8 +548,7 @@ func (s *Server) handleAdminApproveKeyApplication(c *gin.Context) {
 
 // handleAdminRejectKeyApplication transitions a pending application to rejected.
 func (s *Server) handleAdminRejectKeyApplication(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	id := c.Param("id")
 	body, err := readOptionalJSONObject(r, 1<<16)
@@ -581,8 +577,7 @@ func (s *Server) handleAdminRejectKeyApplication(c *gin.Context) {
 // on the domain type, so it cannot be serialized even by accident, and the
 // plaintext does not exist server-side at all.
 func (s *Server) handleAdminListKeys(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	keys, err := s.store.ListAgentKeys()
 	if err != nil {
@@ -608,8 +603,7 @@ func (s *Server) handleAdminListKeys(c *gin.Context) {
 // of anything the page loads; it is read by the page's own script and sent as
 // the X-Teleport-Claim header of the claim request.
 func (s *Server) handleCreateKeyHandoff(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	body, err := readJSONObject(r, 1<<16)
 	if err != nil {
@@ -711,8 +705,7 @@ func (s *Server) handoffPrompt(app *domain.KeyApplication, claimSecret string) s
 // that cannot poll. This response is one of only two places a plaintext token
 // ever appears.
 func (s *Server) handleAdminCreateKey(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	body, err := readJSONObject(r, 1<<16)
 	if err != nil {
@@ -748,8 +741,7 @@ func (s *Server) handleAdminCreateKey(c *gin.Context) {
 // handleAdminPatchKey renames a key, changes its expiry (which is the human's
 // direct renewal path) or revokes it.
 func (s *Server) handleAdminPatchKey(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	id := c.Param("id")
 	body, err := readJSONObject(r, 1<<16)
@@ -814,8 +806,7 @@ func (s *Server) handleAdminPatchKey(c *gin.Context) {
 
 // handleAdminListRenewals drives the renewal approval queue.
 func (s *Server) handleAdminListRenewals(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	q := r.URL.Query()
 	status := strings.TrimSpace(q.Get("status"))
@@ -844,8 +835,7 @@ func (s *Server) handleAdminListRenewals(c *gin.Context) {
 // handleAdminApproveRenewal extends the key. With no `expiresInHours` the
 // agent's requested lifetime is granted.
 func (s *Server) handleAdminApproveRenewal(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	id := c.Param("id")
 	body, err := readOptionalJSONObject(r, 1<<16)
@@ -893,8 +883,7 @@ func (s *Server) handleAdminApproveRenewal(c *gin.Context) {
 
 // handleAdminRejectRenewal refuses a renewal without touching the key.
 func (s *Server) handleAdminRejectRenewal(c *gin.Context) {
-	// w and r keep every handler body byte-identical to the net/http version;
-	// only the signature and c.Param (below) differ.
+	// Bound so the body below stays byte-identical to the pre-Gin handler.
 	w, r := c.Writer, c.Request
 	id := c.Param("id")
 	if _, err := s.store.DecideRenewal(id, false, 0, store.NowMS()); err != nil {

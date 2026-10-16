@@ -1416,6 +1416,12 @@ func TestServeMuxPathSemanticsArePreserved(t *testing.T) {
 		{"bare /api redirects, it does not 404", http.MethodGet, p + "/api", http.StatusTemporaryRedirect, p + "/api/"},
 		{"bare /s redirects", http.MethodGet, p + "/s", http.StatusTemporaryRedirect, p + "/s/"},
 		{"bare /k redirects", http.MethodGet, p + "/k", http.StatusTemporaryRedirect, p + "/k/"},
+		// The query string must survive the redirect: it was measured on the old
+		// implementation, and {p}?a=1 is a plausible SPA deep link that would land
+		// on the wrong view if the redirect dropped it. The first pass wrote the
+		// Location header by hand and lost it.
+		{"a query string survives the redirect", http.MethodGet, p + "?a=1&b=2", http.StatusTemporaryRedirect, p + "/?a=1&b=2"},
+		{"a query string survives a path clean", http.MethodGet, p + "//api/health?x=9", http.StatusTemporaryRedirect, p + "/api/health?x=9"},
 		{"doubled slash is cleaned", http.MethodGet, p + "//api/health", http.StatusTemporaryRedirect, p + "/api/health"},
 		{"dot-dot is cleaned", http.MethodGet, p + "/api/../api/health", http.StatusTemporaryRedirect, p + "/api/health"},
 		{"an encoded slash is refused", http.MethodGet, p + "/api%2Fhealth", http.StatusNotFound, ""},
