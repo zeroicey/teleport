@@ -33,6 +33,13 @@
 --     would be prettier and would silently break every one of those statements.
 --     Faithfulness to the existing SQL beats idiom here.
 --
+--  5. Every counter stays 64-bit. SQLite's INTEGER is 64-bit and PostgreSQL's is
+--     32-bit, so a counter typed INTEGER is narrowed, not translated. This was
+--     missed on the first pass for share_tokens.view_count (see the column) — the
+--     same trap as (1), in a column that is not a timestamp, which is exactly why
+--     it is easy to walk into: the rule is "64-bit in, 64-bit out", not "*_at
+--     columns are BIGINT".
+--
 --  And one shape change that is deliberate: the updated_at trigger is BEFORE
 --  rather than AFTER. SQLite cannot assign to NEW, so the original fires after
 --  the write and issues a second UPDATE. PostgreSQL can, so this version writes
@@ -93,7 +100,14 @@ CREATE TABLE share_tokens (
   expires_at  BIGINT  NOT NULL DEFAULT 0,          -- 0 = never expires
   is_active   INTEGER NOT NULL DEFAULT 1
                       CHECK (is_active IN (0, 1)),
-  view_count  INTEGER NOT NULL DEFAULT 0
+  -- BIGINT, not INTEGER: SQLite's INTEGER is 64-bit, so narrowing this counter to
+  -- PostgreSQL's 32-bit INTEGER would make the 2^31st view of a link an INSERT
+  -- error where the old implementation simply counted. It is the only counter that
+  -- was narrowed — agent_keys.request_count is BIGINT — and a per-link view count
+  -- is exactly the kind of value a popular share page runs up. See the note on the
+  -- epoch-millisecond columns above: the same 64-bit-to-32-bit trap, in a column
+  -- that is not a timestamp.
+  view_count  BIGINT  NOT NULL DEFAULT 0
                       CHECK (view_count >= 0)
 );
 

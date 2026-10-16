@@ -1,13 +1,15 @@
 package store
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"math"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/zeroicey/teleport/backend/internal/agentkey"
 	"github.com/zeroicey/teleport/backend/internal/domain"
+	"github.com/zeroicey/teleport/backend/internal/store/storedb"
 )
 
 // Sentinel errors for the key lifecycle.
@@ -45,25 +47,6 @@ type ApplicationInput struct {
 	TTL int64 // milliseconds
 }
 
-// applicationColumns is the single source of truth for the SELECT list, so the
-// scan order can never drift from the insert order.
-const applicationColumns = `id, claim_hash, label, purpose, requested_hours, status,
-	created_at, expires_at, decided_at, claim_deadline, issued_key_id,
-	requester_ip, user_agent, approved_name, approved_hours, approved_note`
-
-func scanApplication(row interface{ Scan(...any) error }) (*domain.KeyApplication, error) {
-	var a domain.KeyApplication
-	err := row.Scan(
-		&a.ID, &a.ClaimHash, &a.Label, &a.Purpose, &a.RequestedHours, &a.Status,
-		&a.CreatedAt, &a.ExpiresAt, &a.DecidedAt, &a.ClaimDeadline, &a.IssuedKeyID,
-		&a.RequesterIP, &a.UserAgent, &a.ApprovedName, &a.ApprovedHours, &a.ApprovedNote,
-	)
-	if err != nil {
-		return nil, err
-	}
-	return &a, nil
-}
-
 // --- application ------------------------------------------------------------
 
 // CreateApplication opens a pending application.
@@ -71,25 +54,33 @@ func scanApplication(row interface{ Scan(...any) error }) (*domain.KeyApplicatio
 // The pending count is checked inside the same transaction as the insert: doing
 // it as a separate SELECT would let two concurrent submissions both observe
 // "under the limit" and both insert.
+//
+// In SQLite that atomicity came for free from the single-writer guarantee. In
+// PostgreSQL it does not exist — two transactions can both read COUNT(*) = 0
+// under READ COMMITTED and both write — so the count is taken behind
+// LockPendingApplications. cap_lock_pg_test.go demonstrates the hazard
+// deterministically and then shows this lock removing it.
 func (s *Store) CreateApplication(in ApplicationInput, maxPending int, nowMS int64) (*domain.KeyApplication, error) {
 	id, err := agentkey.NewID()
 	if err != nil {
 		return nil, err
 	}
 
-	tx, err := s.db.Begin()
+	tx, err := s.pool.Begin(callCtx)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback(callCtx) }()
+	q := s.q.WithTx(tx)
 
-	var pending int
-	if err := tx.QueryRow(
-		`SELECT COUNT(*) FROM key_applications WHERE status = 'pending'`,
-	).Scan(&pending); err != nil {
+	if err := lockCap(callCtx, tx, LockPendingApplications); err != nil {
+		return nil, err
+	}
+	pending, err := q.CountPendingApplications(callCtx)
+	if err != nil {
 		return nil, fmt.Errorf("count pending applications: %w", err)
 	}
-	if maxPending > 0 && pending >= maxPending {
+	if maxPending > 0 && int(pending) >= maxPending {
 		return nil, ErrMaxPending
 	}
 
@@ -99,18 +90,14 @@ func (s *Store) CreateApplication(in ApplicationInput, maxPending int, nowMS int
 		CreatedAt: nowMS, ExpiresAt: nowMS + in.TTL,
 		RequesterIP: in.RequesterIP, UserAgent: in.UserAgent,
 	}
-	if _, err := tx.Exec(
-		`INSERT INTO key_applications
-		   (id, claim_hash, label, purpose, requested_hours, status, created_at,
-		    expires_at, decided_at, claim_deadline, issued_key_id, requester_ip,
-		    user_agent, approved_name, approved_hours, approved_note)
-		 VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, 0, 0, '', ?, ?, '', 0, '')`,
-		a.ID, a.ClaimHash, a.Label, a.Purpose, a.RequestedHours, a.CreatedAt,
-		a.ExpiresAt, a.RequesterIP, a.UserAgent,
-	); err != nil {
+	if err := q.InsertApplication(callCtx, storedb.InsertApplicationParams{
+		ID: a.ID, ClaimHash: a.ClaimHash, Label: a.Label, Purpose: a.Purpose,
+		RequestedHours: a.RequestedHours, CreatedAt: a.CreatedAt,
+		ExpiresAt: a.ExpiresAt, RequesterIp: a.RequesterIP, UserAgent: a.UserAgent,
+	}); err != nil {
 		return nil, fmt.Errorf("insert application: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(callCtx); err != nil {
 		return nil, err
 	}
 	return a, nil
@@ -120,15 +107,15 @@ func (s *Store) CreateApplication(in ApplicationInput, maxPending int, nowMS int
 // parked approval metadata. Callers that hand the result to a client must strip
 // those first.
 func (s *Store) GetApplication(id string) (*domain.KeyApplication, error) {
-	a, err := scanApplication(s.db.QueryRow(
-		`SELECT `+applicationColumns+` FROM key_applications WHERE id = ?`, id))
-	if errors.Is(err, sql.ErrNoRows) {
+	a, err := s.q.GetApplication(callCtx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("load application: %w", err)
 	}
-	return a, nil
+	out := applicationFromDB(a)
+	return out, nil
 }
 
 // ListApplications returns applications with the given status, newest first.
@@ -137,45 +124,26 @@ func (s *Store) ListApplications(status string, limit int) ([]domain.KeyApplicat
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	query := `SELECT ` + applicationColumns + ` FROM key_applications`
-	args := []any{}
-	if status != "" {
-		query += ` WHERE status = ?`
-		args = append(args, status)
-	}
-	query += ` ORDER BY created_at DESC LIMIT ?`
-	args = append(args, limit)
-
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.q.ListApplications(callCtx, storedb.ListApplicationsParams{
+		Status: status, LimitCount: int32(limit),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list applications: %w", err)
 	}
-	defer rows.Close()
-
 	out := []domain.KeyApplication{}
-	for rows.Next() {
-		a, err := scanApplication(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *a)
+	for _, a := range rows {
+		out = append(out, *applicationFromDB(a))
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // CountApplications counts applications in a status ("" = all).
 func (s *Store) CountApplications(status string) (int, error) {
-	query := `SELECT COUNT(*) FROM key_applications`
-	args := []any{}
-	if status != "" {
-		query += ` WHERE status = ?`
-		args = append(args, status)
-	}
-	var n int
-	if err := s.db.QueryRow(query, args...).Scan(&n); err != nil {
+	n, err := s.q.CountApplications(callCtx, status)
+	if err != nil {
 		return 0, fmt.Errorf("count applications: %w", err)
 	}
-	return n, nil
+	return int(n), nil
 }
 
 // ExpireApplications closes every application that ran out of time while still
@@ -185,16 +153,11 @@ func (s *Store) CountApplications(status string) (int, error) {
 // dashboard shows a queue that is mostly dead. It is called opportunistically
 // before reads rather than on a timer, so the service needs no scheduler.
 func (s *Store) ExpireApplications(nowMS int64) (int64, error) {
-	res, err := s.db.Exec(
-		`UPDATE key_applications
-		    SET status = 'expired'
-		  WHERE status = 'pending' AND expires_at <= ?
-		     OR status = 'approved' AND claim_deadline <= ?`,
-		nowMS, nowMS)
+	n, err := s.q.ExpireApplications(callCtx, nowMS)
 	if err != nil {
 		return 0, fmt.Errorf("expire applications: %w", err)
 	}
-	return res.RowsAffected()
+	return n, nil
 }
 
 // HandoffInput is everything needed to open an already-approved application on
@@ -253,16 +216,13 @@ func (s *Store) CreateHandoffApplication(in HandoffInput, nowMS int64) (*domain.
 		RequesterIP:   in.RequesterIP, UserAgent: in.UserAgent,
 		ApprovedName: in.Label, ApprovedHours: in.Hours, ApprovedNote: in.Note,
 	}
-	if _, err := s.db.Exec(
-		`INSERT INTO key_applications
-		   (id, claim_hash, label, purpose, requested_hours, status, created_at,
-		    expires_at, decided_at, claim_deadline, issued_key_id, requester_ip,
-		    user_agent, approved_name, approved_hours, approved_note)
-		 VALUES (?, ?, ?, '', ?, 'approved', ?, ?, ?, ?, '', ?, ?, ?, ?, ?)`,
-		a.ID, a.ClaimHash, a.Label, in.Hours, a.CreatedAt, a.ExpiresAt,
-		a.DecidedAt, a.ClaimDeadline, a.RequesterIP, a.UserAgent,
-		a.ApprovedName, a.ApprovedHours, a.ApprovedNote,
-	); err != nil {
+	if err := s.q.InsertHandoffApplication(callCtx, storedb.InsertHandoffApplicationParams{
+		ID: a.ID, ClaimHash: a.ClaimHash, Label: a.Label,
+		RequestedHours: in.Hours, CreatedAt: a.CreatedAt, ExpiresAt: a.ExpiresAt,
+		DecidedAt: a.DecidedAt, ClaimDeadline: a.ClaimDeadline,
+		RequesterIp: a.RequesterIP, UserAgent: a.UserAgent,
+		ApprovedName: a.ApprovedName, ApprovedHours: a.ApprovedHours, ApprovedNote: a.ApprovedNote,
+	}); err != nil {
 		return nil, fmt.Errorf("insert handoff application: %w", err)
 	}
 	return a, nil
@@ -279,18 +239,12 @@ func (s *Store) DecideApplication(id string, approve bool, name string, hours fl
 	if approve {
 		status = string(domain.ApplicationApproved)
 	}
-	res, err := s.db.Exec(
-		`UPDATE key_applications
-		    SET status = ?, decided_at = ?, approved_name = ?, approved_hours = ?,
-		        approved_note = ?, claim_deadline = ?
-		  WHERE id = ? AND status = 'pending'`,
-		status, nowMS, name, hours, note, claimDeadlineMS, id)
+	n, err := s.q.DecideApplication(callCtx, storedb.DecideApplicationParams{
+		Status: status, NowMs: nowMS, ApprovedName: name, ApprovedHours: hours,
+		ApprovedNote: note, ClaimDeadline: claimDeadlineMS, ID: id,
+	})
 	if err != nil {
 		return fmt.Errorf("decide application: %w", err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
 	}
 	if n == 0 {
 		// Distinguish "never existed" from "already decided" so the handler can
@@ -311,13 +265,11 @@ func (s *Store) DecideApplication(id string, approve bool, name string, hours fl
 //
 // This is the security-critical path, and the ordering matters:
 //
-//  1. The conditional UPDATE runs *first*, so the transaction takes the write
-//     lock immediately instead of reading on a snapshot that a concurrent
-//     claimer may already have invalidated (which would surface as
-//     SQLITE_BUSY_SNAPSHOT rather than a clean loss).
-//  2. The status='approved' predicate means exactly one concurrent claimer can
-//     flip the row; everyone else gets zero rows affected and loses.
-//  3. Only then is the claim secret checked. A wrong secret rolls the
+//  1. The conditional UPDATE runs *first*, so exactly one concurrent claimer
+//     can flip the row; everyone else gets zero rows affected and loses. The
+//     predicate is the whole decision — status must still be 'approved' and the
+//     claim window must still be open — so it cannot race.
+//  2. Only then is the claim secret checked. A wrong secret rolls the
 //     transaction back, so the status change is undone and the real claimant
 //     can still claim.
 //
@@ -325,11 +277,12 @@ func (s *Store) DecideApplication(id string, approve bool, name string, hours fl
 // holds — and only its hash is written. The plaintext is returned to the caller
 // and is never stored.
 func (s *Store) ClaimApplication(id, claimSecret string, kDerive []byte, maxActive int, nowMS int64) (*domain.AgentKey, string, error) {
-	tx, err := s.db.Begin()
+	tx, err := s.pool.Begin(callCtx)
 	if err != nil {
 		return nil, "", err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback(callCtx) }()
+	q := s.q.WithTx(tx)
 
 	// decided_at is the HUMAN's decision time and must survive the claim.
 	// Overwriting it with the claim time destroyed the only record of when an
@@ -337,30 +290,22 @@ func (s *Store) ClaimApplication(id, claimSecret string, kDerive []byte, maxActi
 	// API had just returned. Nothing is lost by not storing a separate claim
 	// time: the key inserted below is stamped with nowMS, and issued_key_id links
 	// to it, so the claim time is exactly agent_keys.created_at.
-	res, err := tx.Exec(
-		`UPDATE key_applications
-		    SET status = 'claimed'
-		  WHERE id = ? AND status = 'approved' AND claim_deadline > ?`,
-		id, nowMS)
+	n, err := q.MarkApplicationClaimed(callCtx, storedb.MarkApplicationClaimedParams{
+		ID: id, NowMs: nowMS,
+	})
 	if err != nil {
 		return nil, "", fmt.Errorf("claim application: %w", err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return nil, "", err
-	}
 	if n == 0 {
-		return nil, "", s.diagnoseClaim(id, nowMS)
+		return nil, "", diagnoseClaim(q, id, nowMS)
 	}
 
-	var claimHash, name, note string
-	var hours float64
-	if err := tx.QueryRow(
-		`SELECT claim_hash, approved_name, approved_hours, approved_note
-		   FROM key_applications WHERE id = ?`, id,
-	).Scan(&claimHash, &name, &hours, &note); err != nil {
+	forClaim, err := q.GetApplicationForClaim(callCtx, id)
+	if err != nil {
 		return nil, "", fmt.Errorf("read application for claim: %w", err)
 	}
+	claimHash, name, hours, note := forClaim.ClaimHash, forClaim.ApprovedName,
+		forClaim.ApprovedHours, forClaim.ApprovedNote
 
 	// Constant time: a plain comparison here would leak the hash byte by byte.
 	if !agentkey.EqualHash(claimHash, agentkey.HashToken(claimSecret)) {
@@ -370,20 +315,23 @@ func (s *Store) ClaimApplication(id, claimSecret string, kDerive []byte, maxActi
 	// The active-key ceiling is enforced HERE, inside the same transaction that
 	// already holds the write lock, rather than by a pre-check in the caller. A
 	// caller-side count would be a check-then-act race: N concurrent claims
-	// would each read a count below the cap and all insert.
+	// would each read a count below the cap and all insert. The advisory lock is
+	// what makes the count-then-insert atomic now that there is no single
+	// writer; CreateManualKey takes the SAME key, so the two minting paths
+	// cannot each spend the last slot.
 	//
 	// Returning ErrMaxActive rolls the status change back, so the application
 	// stays claimable once the operator frees a slot — being turned away must
 	// not burn the agent's one-time credential.
 	if maxActive > 0 {
-		var active int
-		if err := tx.QueryRow(
-			`SELECT COUNT(*) FROM agent_keys
-			  WHERE revoked_at = 0 AND (expires_at = 0 OR expires_at > ?)`, nowMS,
-		).Scan(&active); err != nil {
+		if err := lockCap(callCtx, tx, LockActiveKeys); err != nil {
+			return nil, "", err
+		}
+		active, err := q.CountActiveKeys(callCtx, nowMS)
+		if err != nil {
 			return nil, "", fmt.Errorf("count active keys for claim: %w", err)
 		}
-		if active >= maxActive {
+		if int(active) >= maxActive {
 			return nil, "", ErrMaxActive
 		}
 	}
@@ -398,22 +346,18 @@ func (s *Store) ClaimApplication(id, claimSecret string, kDerive []byte, maxActi
 	}
 	expiresAt := expiryFrom(hours, nowMS)
 
-	if _, err := tx.Exec(
-		`INSERT INTO agent_keys
-		   (id, name, token_hash, token_prefix, created_at, expires_at, revoked_at,
-		    last_used_at, request_count, note)
-		 VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?)`,
-		keyID, name, agentkey.HashToken(token), agentkey.Prefix(token),
-		nowMS, expiresAt, note,
-	); err != nil {
+	if err := q.InsertAgentKey(callCtx, storedb.InsertAgentKeyParams{
+		ID: keyID, Name: name, TokenHash: agentkey.HashToken(token),
+		TokenPrefix: agentkey.Prefix(token), CreatedAt: nowMS, ExpiresAt: expiresAt, Note: note,
+	}); err != nil {
 		return nil, "", fmt.Errorf("insert claimed key: %w", err)
 	}
-	if _, err := tx.Exec(
-		`UPDATE key_applications SET issued_key_id = ? WHERE id = ?`, keyID, id,
-	); err != nil {
+	if err := q.SetApplicationIssuedKey(callCtx, storedb.SetApplicationIssuedKeyParams{
+		IssuedKeyID: keyID, ID: id,
+	}); err != nil {
 		return nil, "", fmt.Errorf("record issued key: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(callCtx); err != nil {
 		return nil, "", err
 	}
 
@@ -425,15 +369,27 @@ func (s *Store) ClaimApplication(id, claimSecret string, kDerive []byte, maxActi
 }
 
 // diagnoseClaim explains why a claim did not win, for the handler's status code.
-func (s *Store) diagnoseClaim(id string, nowMS int64) error {
-	a, err := s.GetApplication(id)
+//
+// It reads through **the same transaction's query set**, never through the pool.
+// That is not a style preference: the caller still holds its connection while
+// this runs, and a small pool plus N concurrent losers each asking for a second
+// connection is a deadlock — the losers hold every connection and wait for one
+// more. It deadlocked with 8 racers on a 4-connection pool, which is exactly the
+// shape of the concurrency tests here.
+//
+// Reading inside the transaction is also correct. The conditional UPDATE that
+// returned zero rows could only have done so after any competing writer
+// committed, so under READ COMMITTED this fresh statement observes the winning
+// state — which is the thing being diagnosed.
+func diagnoseClaim(q *storedb.Queries, id string, nowMS int64) error {
+	a, err := q.GetApplication(callCtx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrApplicationMissing
+	}
 	if err != nil {
 		return err
 	}
-	if a == nil {
-		return ErrApplicationMissing
-	}
-	switch a.Status {
+	switch domain.ApplicationStatus(a.Status) {
 	case domain.ApplicationPending:
 		return ErrApplicationMissing
 	case domain.ApplicationRejected:
@@ -452,20 +408,6 @@ func (s *Store) diagnoseClaim(id string, nowMS int64) error {
 }
 
 // --- keys -------------------------------------------------------------------
-
-const keyColumns = `id, name, token_prefix, token_hash, created_at, expires_at,
-	revoked_at, last_used_at, request_count, note`
-
-func scanKey(row interface{ Scan(...any) error }) (*domain.AgentKey, error) {
-	var k domain.AgentKey
-	if err := row.Scan(
-		&k.ID, &k.Name, &k.TokenPrefix, &k.TokenHash, &k.CreatedAt, &k.ExpiresAt,
-		&k.RevokedAt, &k.LastUsedAt, &k.RequestCount, &k.Note,
-	); err != nil {
-		return nil, err
-	}
-	return &k, nil
-}
 
 // ResolveAgentKey finds a live key by the hash of the presented token.
 //
@@ -497,17 +439,16 @@ func (s *Store) ResolveAgentKey(tokenHash string, nowMS int64) (*domain.AgentKey
 // overflow. expires_at is bounded at write time (see expiryFrom) and the config
 // validator bounds grace, so the subtraction cannot underflow either.
 func (s *Store) ResolveAgentKeyWithinGrace(tokenHash string, nowMS, graceMS int64) (*domain.AgentKey, bool, error) {
-	k, err := scanKey(s.db.QueryRow(
-		`SELECT `+keyColumns+` FROM agent_keys
-		  WHERE token_hash = ? AND revoked_at = 0
-		    AND (expires_at = 0 OR expires_at > ?)`,
-		tokenHash, nowMS-graceMS))
-	if errors.Is(err, sql.ErrNoRows) {
+	row, err := s.q.ResolveAgentKey(callCtx, storedb.ResolveAgentKeyParams{
+		TokenHash: tokenHash, NotExpiredAfter: nowMS - graceMS,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, fmt.Errorf("resolve agent key: %w", err)
 	}
+	k := keyFromDB(row)
 	expired := k.ExpiresAt != 0 && k.ExpiresAt <= nowMS
 	return k, expired, nil
 }
@@ -519,9 +460,9 @@ func (s *Store) ResolveAgentKeyWithinGrace(tokenHash string, nowMS, graceMS int6
 // "when was this key last used, and how much" is the main thing that makes a
 // leaked credential noticeable.
 func (s *Store) TouchAgentKey(id string, nowMS int64) error {
-	if _, err := s.db.Exec(
-		`UPDATE agent_keys SET last_used_at = ?, request_count = request_count + 1
-		  WHERE id = ?`, nowMS, id); err != nil {
+	if err := s.q.TouchAgentKey(callCtx, storedb.TouchAgentKeyParams{
+		LastUsedAt: nowMS, ID: id,
+	}); err != nil {
 		return fmt.Errorf("touch agent key: %w", err)
 	}
 	return nil
@@ -529,46 +470,37 @@ func (s *Store) TouchAgentKey(id string, nowMS int64) error {
 
 // GetAgentKey loads one key by id.
 func (s *Store) GetAgentKey(id string) (*domain.AgentKey, error) {
-	k, err := scanKey(s.db.QueryRow(`SELECT `+keyColumns+` FROM agent_keys WHERE id = ?`, id))
-	if errors.Is(err, sql.ErrNoRows) {
+	k, err := s.q.GetAgentKey(callCtx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("load agent key: %w", err)
 	}
-	return k, nil
+	return keyFromDB(k), nil
 }
 
 // ListAgentKeys returns every key, newest first. Revoked and expired keys are
 // included: the dashboard is where you go to see what happened.
 func (s *Store) ListAgentKeys() ([]domain.AgentKey, error) {
-	rows, err := s.db.Query(`SELECT ` + keyColumns + ` FROM agent_keys ORDER BY created_at DESC`)
+	rows, err := s.q.ListAgentKeys(callCtx)
 	if err != nil {
 		return nil, fmt.Errorf("list agent keys: %w", err)
 	}
-	defer rows.Close()
-
 	out := []domain.AgentKey{}
-	for rows.Next() {
-		k, err := scanKey(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *k)
+	for _, k := range rows {
+		out = append(out, *keyFromDB(k))
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // CountActiveKeys counts keys that could still authenticate.
 func (s *Store) CountActiveKeys(nowMS int64) (int, error) {
-	var n int
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM agent_keys
-		  WHERE revoked_at = 0 AND (expires_at = 0 OR expires_at > ?)`, nowMS,
-	).Scan(&n); err != nil {
+	n, err := s.q.CountActiveKeys(callCtx, nowMS)
+	if err != nil {
 		return 0, fmt.Errorf("count active keys: %w", err)
 	}
-	return n, nil
+	return int(n), nil
 }
 
 // CreateManualKey mints a key outright, for the case where a human wants to hand
@@ -577,21 +509,27 @@ func (s *Store) CountActiveKeys(nowMS int64) (int, error) {
 // The plaintext is generated here and returned; only its hash is written, so
 // this response is the one and only place the value exists.
 func (s *Store) CreateManualKey(name string, hours float64, note string, maxActive int, nowMS int64) (*domain.AgentKey, string, error) {
-	tx, err := s.db.Begin()
+	tx, err := s.pool.Begin(callCtx)
 	if err != nil {
 		return nil, "", err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback(callCtx) }()
+	q := s.q.WithTx(tx)
 
-	var active int
-	if err := tx.QueryRow(
-		`SELECT COUNT(*) FROM agent_keys
-		  WHERE revoked_at = 0 AND (expires_at = 0 OR expires_at > ?)`, nowMS,
-	).Scan(&active); err != nil {
-		return nil, "", fmt.Errorf("count active keys: %w", err)
-	}
-	if maxActive > 0 && active >= maxActive {
-		return nil, "", ErrMaxActive
+	// The same advisory lock ClaimApplication takes. The two paths that mint a
+	// credential must share one lock, or they can each observe the last free
+	// slot and both take it.
+	if maxActive > 0 {
+		if err := lockCap(callCtx, tx, LockActiveKeys); err != nil {
+			return nil, "", err
+		}
+		active, err := q.CountActiveKeys(callCtx, nowMS)
+		if err != nil {
+			return nil, "", fmt.Errorf("count active keys: %w", err)
+		}
+		if int(active) >= maxActive {
+			return nil, "", ErrMaxActive
+		}
 	}
 
 	token, err := agentkey.NewToken()
@@ -604,17 +542,13 @@ func (s *Store) CreateManualKey(name string, hours float64, note string, maxActi
 	}
 	expiresAt := expiryFrom(hours, nowMS)
 
-	if _, err := tx.Exec(
-		`INSERT INTO agent_keys
-		   (id, name, token_hash, token_prefix, created_at, expires_at, revoked_at,
-		    last_used_at, request_count, note)
-		 VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0, ?)`,
-		keyID, name, agentkey.HashToken(token), agentkey.Prefix(token),
-		nowMS, expiresAt, note,
-	); err != nil {
+	if err := q.InsertAgentKey(callCtx, storedb.InsertAgentKeyParams{
+		ID: keyID, Name: name, TokenHash: agentkey.HashToken(token),
+		TokenPrefix: agentkey.Prefix(token), CreatedAt: nowMS, ExpiresAt: expiresAt, Note: note,
+	}); err != nil {
 		return nil, "", fmt.Errorf("insert manual key: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(callCtx); err != nil {
 		return nil, "", err
 	}
 
@@ -637,41 +571,26 @@ type KeyPatch struct {
 // UpdateAgentKey applies a patch. Setting Revoked=false is an un-revoke, which
 // is allowed so a mistaken click is recoverable; it never resurrects a key that
 // has already expired, because expiry is evaluated separately.
+//
+// The patch used to be a SET list built by string concatenation. It is now one
+// static statement whose columns are COALESCE(sqlc.narg, column) — a NULL means
+// "absent" — except revoked_at, which needs a CASE because 0 is a real target
+// value ("un-revoke") and would otherwise be indistinguishable from NULL.
 func (s *Store) UpdateAgentKey(id string, patch KeyPatch, nowMS int64) (*domain.AgentKey, error) {
-	set := []string{}
-	args := []any{}
-	if patch.Name != nil {
-		set = append(set, "name = ?")
-		args = append(args, *patch.Name)
-	}
-	if patch.ExpiresAt != nil {
-		set = append(set, "expires_at = ?")
-		args = append(args, *patch.ExpiresAt)
-	}
-	if patch.Note != nil {
-		set = append(set, "note = ?")
-		args = append(args, *patch.Note)
-	}
-	if patch.Revoked != nil {
-		if *patch.Revoked {
-			set = append(set, "revoked_at = ?")
-			args = append(args, nowMS)
-		} else {
-			set = append(set, "revoked_at = 0")
-		}
-	}
-	if len(set) == 0 {
+	if patch.Name == nil && patch.ExpiresAt == nil && patch.Note == nil && patch.Revoked == nil {
 		return s.GetAgentKey(id)
 	}
 
-	query := `UPDATE agent_keys SET ` + joinComma(set) + ` WHERE id = ?`
-	args = append(args, id)
-	res, err := s.db.Exec(query, args...)
+	n, err := s.q.UpdateAgentKey(callCtx, storedb.UpdateAgentKeyParams{
+		Name: patch.Name, ExpiresAt: patch.ExpiresAt, Note: patch.Note,
+		Revoked: patch.Revoked, NowMs: nowMS, ID: id,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("update agent key: %w", err)
 	}
-	if n, err := res.RowsAffected(); err == nil && n == 0 {
-		// Either missing, or a no-op update. Distinguish.
+	if n == 0 {
+		// Either missing, or a no-op update that matched the row but changed
+		// nothing. Distinguish.
 		k, err := s.GetAgentKey(id)
 		if err != nil {
 			return nil, err
@@ -685,22 +604,13 @@ func (s *Store) UpdateAgentKey(id string, patch KeyPatch, nowMS int64) (*domain.
 
 // --- renewals ---------------------------------------------------------------
 
-const renewalColumns = `id, key_id, requested_hours, status, created_at, decided_at, granted_expires_at`
-
-func scanRenewal(row interface{ Scan(...any) error }) (*domain.KeyRenewal, error) {
-	var r domain.KeyRenewal
-	if err := row.Scan(&r.ID, &r.KeyID, &r.RequestedHours, &r.Status,
-		&r.CreatedAt, &r.DecidedAt, &r.GrantedExpiresAt); err != nil {
-		return nil, err
-	}
-	return &r, nil
-}
-
 // CreateRenewal opens a renewal request for a key.
 //
 // Only one may be pending per key: otherwise an agent polling in a loop could
 // bury the approval queue, and the human would have to reconcile several
-// competing extensions of the same credential.
+// competing extensions of the same credential. The count and the insert are one
+// transaction behind LockPendingRenewals, because PostgreSQL has no single
+// writer to make the pair atomic for free.
 func (s *Store) CreateRenewal(keyID string, requestedHours float64, nowMS int64) (*domain.KeyRenewal, error) {
 	key, err := s.GetAgentKey(keyID)
 	if err != nil {
@@ -710,16 +620,18 @@ func (s *Store) CreateRenewal(keyID string, requestedHours float64, nowMS int64)
 		return nil, ErrKeyMissing
 	}
 
-	tx, err := s.db.Begin()
+	tx, err := s.pool.Begin(callCtx)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback(callCtx) }()
+	q := s.q.WithTx(tx)
 
-	var existing int
-	if err := tx.QueryRow(
-		`SELECT COUNT(*) FROM key_renewals WHERE key_id = ? AND status = 'pending'`, keyID,
-	).Scan(&existing); err != nil {
+	if err := lockCap(callCtx, tx, LockPendingRenewals); err != nil {
+		return nil, err
+	}
+	existing, err := q.CountPendingRenewals(callCtx, keyID)
+	if err != nil {
 		return nil, fmt.Errorf("count pending renewals: %w", err)
 	}
 	if existing > 0 {
@@ -730,14 +642,12 @@ func (s *Store) CreateRenewal(keyID string, requestedHours float64, nowMS int64)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(
-		`INSERT INTO key_renewals (id, key_id, requested_hours, status, created_at, decided_at, granted_expires_at)
-		 VALUES (?, ?, ?, 'pending', ?, 0, 0)`,
-		id, keyID, requestedHours, nowMS,
-	); err != nil {
+	if err := q.InsertRenewal(callCtx, storedb.InsertRenewalParams{
+		ID: id, KeyID: keyID, RequestedHours: requestedHours, CreatedAt: nowMS,
+	}); err != nil {
 		return nil, fmt.Errorf("insert renewal: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(callCtx); err != nil {
 		return nil, err
 	}
 	return &domain.KeyRenewal{
@@ -748,15 +658,14 @@ func (s *Store) CreateRenewal(keyID string, requestedHours float64, nowMS int64)
 
 // GetRenewal loads one renewal.
 func (s *Store) GetRenewal(id string) (*domain.KeyRenewal, error) {
-	r, err := scanRenewal(s.db.QueryRow(
-		`SELECT `+renewalColumns+` FROM key_renewals WHERE id = ?`, id))
-	if errors.Is(err, sql.ErrNoRows) {
+	r, err := s.q.GetRenewal(callCtx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("load renewal: %w", err)
 	}
-	return r, nil
+	return renewalFromDB(r), nil
 }
 
 // ListRenewals returns renewals with the given status ("" = all), newest first.
@@ -764,30 +673,17 @@ func (s *Store) ListRenewals(status string, limit int) ([]domain.KeyRenewal, err
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	query := `SELECT ` + renewalColumns + ` FROM key_renewals`
-	args := []any{}
-	if status != "" {
-		query += ` WHERE status = ?`
-		args = append(args, status)
-	}
-	query += ` ORDER BY created_at DESC LIMIT ?`
-	args = append(args, limit)
-
-	rows, err := s.db.Query(query, args...)
+	rows, err := s.q.ListRenewals(callCtx, storedb.ListRenewalsParams{
+		Status: status, LimitCount: int32(limit),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list renewals: %w", err)
 	}
-	defer rows.Close()
-
 	out := []domain.KeyRenewal{}
-	for rows.Next() {
-		r, err := scanRenewal(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *r)
+	for _, r := range rows {
+		out = append(out, *renewalFromDB(r))
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // DecideRenewal approves (extending the key) or rejects a renewal request.
@@ -797,35 +693,44 @@ func (s *Store) ListRenewals(status string, limit int) ([]domain.KeyRenewal, err
 // An expired key can still be extended here — that is the point, since an agent
 // that noticed its key about to lapse is exactly who files a renewal — but a
 // revoked key cannot, because revocation is a deliberate human act.
+//
+// The renewal row is read **FOR UPDATE**, and that is not decoration. "Read the
+// status, then write" is the same check-then-act shape as the cap counts, and
+// PostgreSQL gives it no atomicity on its own: two concurrent decisions would
+// both read 'pending', both extend the key, and only then would the guarded
+// UPDATE refuse the second — after the double grant had already happened. SQLite
+// got this right for free from BEGIN IMMEDIATE, and the port must get it right
+// explicitly. Because the row already exists, a row lock is the correct tool
+// here (unlike the caps, where the rows that would violate the limit do not
+// exist yet and `FOR UPDATE` cannot help).
+//
+// Measured before the fix: two overlapping transactions left the key with TWO
+// extensions from ONE renewal request. See
+// .ai/pitfalls/cases/2026-10-16-decide-renewal-granted-twice.md.
 func (s *Store) DecideRenewal(id string, approve bool, hours float64, nowMS int64) (*domain.KeyRenewal, error) {
-	tx, err := s.db.Begin()
+	tx, err := s.pool.Begin(callCtx)
 	if err != nil {
 		return nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback(callCtx) }()
+	q := s.q.WithTx(tx)
 
-	var keyID string
-	var claimedStatus string
-	err = tx.QueryRow(
-		`SELECT key_id, status FROM key_renewals WHERE id = ?`, id,
-	).Scan(&keyID, &claimedStatus)
-	if errors.Is(err, sql.ErrNoRows) {
+	forDecision, err := q.LockRenewalForDecision(callCtx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRenewalMissing
 	}
 	if err != nil {
 		return nil, fmt.Errorf("load renewal: %w", err)
 	}
+	keyID, claimedStatus := forDecision.KeyID, forDecision.Status
 	if claimedStatus != string(domain.RenewalPending) {
 		return nil, ErrApplicationDecided
 	}
 
 	granted := int64(0)
 	if approve {
-		var currentExpiry, revokedAt int64
-		err := tx.QueryRow(
-			`SELECT expires_at, revoked_at FROM agent_keys WHERE id = ?`, keyID,
-		).Scan(&currentExpiry, &revokedAt)
-		if errors.Is(err, sql.ErrNoRows) {
+		key, err := q.GetKeyExpiryForRenewal(callCtx, keyID)
+		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrKeyMissing
 		}
 		if err != nil {
@@ -833,7 +738,7 @@ func (s *Store) DecideRenewal(id string, approve bool, hours float64, nowMS int6
 		}
 		// A revoked key is dead by human decision; a renewal must not quietly
 		// resurrect it.
-		if revokedAt != 0 {
+		if key.RevokedAt != 0 {
 			return nil, ErrKeyMissing
 		}
 
@@ -850,21 +755,21 @@ func (s *Store) DecideRenewal(id string, approve bool, hours float64, nowMS int6
 		//   - the key already never expires (0 means unbounded, not "expired"), and
 		//   - the human granted 0 hours, which means "make it permanent".
 		switch {
-		case currentExpiry == 0:
+		case key.ExpiresAt == 0:
 			granted = 0
 		case hours <= 0:
 			granted = 0
 		default:
 			base := nowMS
-			if currentExpiry > base {
-				base = currentExpiry
+			if key.ExpiresAt > base {
+				base = key.ExpiresAt
 			}
 			granted = base + hoursToMS(hours)
 		}
 
-		if _, err := tx.Exec(
-			`UPDATE agent_keys SET expires_at = ? WHERE id = ?`, granted, keyID,
-		); err != nil {
+		if err := q.ExtendAgentKey(callCtx, storedb.ExtendAgentKeyParams{
+			ExpiresAt: granted, ID: keyID,
+		}); err != nil {
 			return nil, fmt.Errorf("extend key: %w", err)
 		}
 	}
@@ -873,14 +778,24 @@ func (s *Store) DecideRenewal(id string, approve bool, hours float64, nowMS int6
 	if approve {
 		status = string(domain.RenewalApproved)
 	}
-	if _, err := tx.Exec(
-		`UPDATE key_renewals SET status = ?, decided_at = ?, granted_expires_at = ?
-		  WHERE id = ? AND status = 'pending'`,
-		status, nowMS, granted, id,
-	); err != nil {
+	// The row count is checked rather than discarded. Under SQLite this guard
+	// was the only protection and it was sufficient, because the single-writer
+	// guarantee meant two decisions could never both reach this line. That is no
+	// longer true, so the real protection is now the FOR UPDATE on the read above
+	// — this is the second line of defence, and it must not be silently dropped.
+	decided, err := q.DecideRenewal(callCtx, storedb.DecideRenewalParams{
+		Status: status, NowMs: nowMS, GrantedExpiresAt: granted, ID: id,
+	})
+	if err != nil {
 		return nil, fmt.Errorf("decide renewal: %w", err)
 	}
-	if err := tx.Commit(); err != nil {
+	if decided == 0 {
+		// Unreachable while the locking read above holds the row: it would mean
+		// the renewal stopped being pending inside this very transaction. Fail
+		// closed rather than reporting a decision that was not recorded.
+		return nil, ErrApplicationDecided
+	}
+	if err := tx.Commit(callCtx); err != nil {
 		return nil, err
 	}
 	return &domain.KeyRenewal{
@@ -896,9 +811,8 @@ func (s *Store) DecideRenewal(id string, approve bool, hours float64, nowMS int6
 // yours" — the two must stay indistinguishable to a caller who has no right to
 // know which it was.
 func (s *Store) ReportOwner(reportID string) (string, bool, error) {
-	var owner string
-	err := s.db.QueryRow(`SELECT owner_key_id FROM reports WHERE id = ?`, reportID).Scan(&owner)
-	if errors.Is(err, sql.ErrNoRows) {
+	owner, err := s.q.ReportOwner(callCtx, reportID)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil
 	}
 	if err != nil {
@@ -909,17 +823,14 @@ func (s *Store) ReportOwner(reportID string) (string, bool, error) {
 
 // ShareTokenOwner returns owner_key_id of the report a share token belongs to.
 func (s *Store) ShareTokenOwner(token string) (owner string, active bool, found bool, err error) {
-	err = s.db.QueryRow(
-		`SELECT r.owner_key_id, t.is_active
-		   FROM share_tokens t JOIN reports r ON r.id = t.report_id
-		  WHERE t.token = ?`, token).Scan(&owner, &active)
-	if errors.Is(err, sql.ErrNoRows) {
+	row, err := s.q.ShareTokenOwner(callCtx, token)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, false, nil
 	}
 	if err != nil {
 		return "", false, false, fmt.Errorf("load share token owner: %w", err)
 	}
-	return owner, active, true, nil
+	return row.OwnerKeyID, row.IsActive == 1, true, nil
 }
 
 // expiryFrom converts an hours offset into an absolute epoch-millisecond

@@ -360,12 +360,9 @@ func TestKeyHandoffDoesNotCreateAKeyUntilClaimed(t *testing.T) {
 	id, _ := data["id"].(string)
 	secret, _ := data["claim_secret"].(string)
 
-	db, err := store.Open(cfg.DBPath)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer db.Close()
-	st := store.New(db)
+	// A second handle onto the same database (this test's private schema), used
+	// to assert what the API did and did not write.
+	st := store.New(testStoreHandle(t, cfg))
 
 	keys, err := st.ListAgentKeys()
 	if err != nil {

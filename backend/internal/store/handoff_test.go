@@ -107,8 +107,8 @@ func TestCreateHandoffApplicationNeverStoresTheSecret(t *testing.T) {
 	}
 
 	var stored string
-	if err := s.db.QueryRow(
-		`SELECT claim_hash FROM key_applications WHERE id = ?`, app.ID,
+	if err := s.Pool().QueryRow(callCtx,
+		`SELECT claim_hash FROM key_applications WHERE id = $1`, app.ID,
 	).Scan(&stored); err != nil {
 		t.Fatalf("read back claim_hash: %v", err)
 	}
@@ -122,9 +122,9 @@ func TestCreateHandoffApplicationNeverStoresTheSecret(t *testing.T) {
 	// No other column may carry it either — a stray copy would be just as bad
 	// as storing it in claim_hash.
 	var hits int
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM key_applications WHERE label = ? OR purpose = ? OR approved_note = ?`,
-		secret, secret, secret,
+	if err := s.Pool().QueryRow(callCtx,
+		`SELECT COUNT(*) FROM key_applications WHERE label = $1 OR purpose = $1 OR approved_note = $1`,
+		secret,
 	).Scan(&hits); err != nil {
 		t.Fatalf("scan for the secret: %v", err)
 	}

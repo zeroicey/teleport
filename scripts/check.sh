@@ -15,9 +15,6 @@ cd "$REPO"
 echo "==> frontend typecheck"
 pnpm run --silent typecheck
 
-echo "==> schema snapshot vs embedded migrations"
-pnpm run --silent db:check-schema
-
 echo "==> gofmt"
 unformatted="$(gofmt -l backend | grep -v '^$' || true)"
 if [ -n "$unformatted" ]; then
@@ -50,6 +47,9 @@ if ! cmp -s "$tmp" schema.pg.sql; then
   exit 1
 fi
 
+echo "==> sqlc (generated code must match the SQL)"
+"$REPO/scripts/check-sqlc-sync.sh"
+
 echo "==> go test"
 # -count=1 disables the test cache. Several guards here read files from outside
 # their package (the schema snapshots), and the cache cannot see those change.
@@ -59,11 +59,27 @@ echo "==> go test"
 # scripts/test-pg.sh exists and why it is the required gate for any change that
 # touches storage or the store SQL: a green run *here* does not mean the
 # database paths were exercised.
+#
+# That distinction is load-bearing and easy to lose, so the run is verbose and the
+# skipped count is reported in the closing line. Measured when the store moved to
+# PostgreSQL: without a DSN, internal/api skips 76 of its 79 tests and
+# internal/store skips 57 of its 63 — i.e. almost every frozen-contract test. A
+# bare "gate passed" over that is how "verified" becomes a false claim, which is
+# the failure this repository has already paid for twice.
+testlog="$(mktemp)"
+trap 'rm -f "$tmp" "$testlog"' EXIT
 if [ -z "${TEST_PG_DSN:-}" ]; then
-  echo "    NOTE: TEST_PG_DSN is unset, so the PostgreSQL-backed tests will SKIP." >&2
-  echo "    For the real gate run: pnpm run backend:test-pg" >&2
+  echo "    TEST_PG_DSN is unset: the PostgreSQL-backed tests will SKIP." >&2
+  echo "    The real gate is: pnpm run backend:test-pg" >&2
 fi
-(cd backend && go test ./... -count=1)
+(cd backend && go test ./... -count=1 -v) | tee "$testlog"
 
+skipped="$(grep -c '^--- SKIP' "$testlog" || true)"
 echo
-echo "gate passed"
+if [ "${skipped:-0}" -gt 0 ]; then
+  echo "gate passed — WITHOUT DATABASE-BACKED TESTS: $skipped test(s) skipped."
+  echo "This does not mean the store, the SQL or the frozen contracts were exercised."
+  echo "Run the real gate before trusting this: pnpm run backend:test-pg"
+else
+  echo "gate passed"
+fi

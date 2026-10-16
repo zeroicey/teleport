@@ -1,6 +1,19 @@
 # 部署 Teleport 到 hcyj
 
-**Applies to:** 生产（hcyj / `api.hcyj.xyz`） · **Owner:** lead · **Last verified:** 2026-10-11
+**Applies to:** 生产（hcyj / `api.hcyj.xyz`，旧版 SQLite） · **Owner:** lead · **Last verified:** 2026-10-11
+
+> ## ⚠️ 本手册描述的是 **P2.3 之前**的线上版本（SQLite）
+>
+> 重写版（P2.3 起）的存储是 **PostgreSQL**，启动需要 `DATABASE_URL`，
+> 备份对象是 database 而不是文件。下面的 §4.2 与 §4.4 已给出 PostgreSQL 变体，
+> 但**那双路径尚未在切换窗口里验证过** —— 首次用它们就是在 P6。
+>
+> 另：重写期间 **ROUTE_PREFIX / PUBLIC_BASE_URL 未改**（P6 才加
+> `teleport.hcyj.xyz` 根路径入口），所以本文的路径与域名对 P2.3 之后的构建仍适用。
+>
+> 当前线上是 **`disabled` + `inactive`，公网 502**（用户裁决：等新版）。
+> 所以重写版上线前，这份手册的「先绿后发」部分要改为 `pnpm run backend:test-pg`
+> （旧版没有真库闸门）。
 
 ## When to use this
 
@@ -18,9 +31,15 @@
 ### 1. 发布构建（本地）
 
 ```bash
-pnpm run check                 # 闸门必须先绿
-pnpm run build:release         # → bin/teleport-linux-amd64
+env -u TEST_PG_DSN pnpm run check   # 闸门（无库档：PG 测试会 SKIP 并大声提醒）
+pnpm run backend:test-pg            # 必需：真库闸门，无 TEST_PG_DSN 直接退出
+pnpm run build:release              # → bin/teleport-linux-amd64
 ```
+
+> **不要只跑 `pnpm run check`。** 不设 `TEST_PG_DSN` 时它会跳过一百多个测试
+> （store、api 与大部分冻结契约都在里面），结尾会打印
+> `gate passed — WITHOUT DATABASE-BACKED TESTS`。真要发版必须再跑 `backend:test-pg`，
+> 它需要 `TEST_PG_DSN` 指向名字含 `test` 的库（指向别的库会被夹具**拒绝**）。
 
 顺序不能反：Vite 产物写进 `backend/internal/webui/dist/`（`//go:embed` 的输入），
 `embed_frontend` 构建标签把 webui 从"无前端"桩切到真实文件系统。
@@ -52,8 +71,21 @@ ssh hcyj 'cd /data/services/teleport \
 ### 4. 环境文件（含密钥）
 
 `/data/services/teleport/teleport.env`，权限 **600 root:root**，模板见
-`backend/deploy/teleport.env.example`。必填三项：
-`AGENT_SECRET_KEY`、`SESSION_SECRET`、`ADMIN_PASSWORD_HASH`。
+`backend/deploy/teleport.env.example`。
+
+**旧版**必填三项：`AGENT_SECRET_KEY`、`SESSION_SECRET`、`ADMIN_PASSWORD_HASH`。
+
+**P2.3 之后另需**（缺失则**启动即失败**，而不是静默连到别的库）：
+
+```bash
+# PostgreSQL DSN；口令在这一行里，所以整个文件 600 root:root
+DATABASE_URL=postgres://teleport:CHANGE_ME@127.0.0.1:5432/teleport?sslmode=disable
+# 连接池上限；实例与 clip / registry / serenique 共用（max_connections=100 是总预算）
+DB_MAX_CONNS=8
+```
+
+> `DB_PATH` 已被 `DATABASE_URL` **取代**（不是兼容并存）：新版读到 `DB_PATH` 会忽略它。
+> 启动日志**不会**打印 DSN（它含口令），所以不要指望从 journalctl 里看到库地址。
 
 哈希用二进制自身生成（不要手搓）：
 
@@ -102,6 +134,8 @@ curl -sI $P/$H | grep -i cache-control                # public, max-age=31536000
 
 ### 4.2 数据库备份（**部署前必做**）
 
+**旧版（SQLite）**：
+
 ```bash
 # 该服务器没有 sqlite3 CLI，用 python3 的 sqlite3 模块
 ssh hcyj 'systemctl stop teleport && cd /data/services/teleport \
@@ -115,8 +149,22 @@ print(c.execute(\"SELECT COUNT(*) FROM reports\").fetchone()[0])
 "'
 ```
 
+**P2.3 之后（PostgreSQL）** —— 备份不再是「拷一个文件」，且 `teleport` 库与别的服务同实例：
+
+```bash
+# 逻辑备份；-Fc 便于 pg_restore 选择性恢复
+ssh hpcore 'PGPASSWORD=$(cat /data/services/teleport/.pgpassword.tmp) \
+  pg_dump -Fc -U teleport -d teleport \
+  > /data/services/teleport/teleport-pg-$(date +%Y%m%d-%H%M%S).dump'
+```
+
+> 重写版的迁移器会在 `schema_migrations` 记**内容 sha256**：若 `migrations_pg/` 的
+> 基线文件改过而库里的记录不匹配，服务**拒绝启动**并让你重建库或改用新迁移文件。
+> 所以「回滚二进制」不等于「回滚 schema」：换回旧二进制前先确认它能读当前 schema。
+> 见 `.ai/pitfalls/cases/2026-10-16-merged-baseline-hides-a-stale-test-db.md`。
+
 备份完再 `mv` 换二进制并 `systemctl start`，停机窗口约 2 秒。
-**回滚材料不止二进制，还有数据库** —— 单二进制的唯一状态就是这个文件。
+**回滚材料不止二进制，还有数据库。** 旧版的全部状态是那一个文件；重写版的是 `teleport` 库。
 
 **不要只看 `systemctl is-active`。** 用真实 HTTP 请求验收，且必须从**大陆观测点**发 ——
 境外观测点无法检测大陆封锁（`.ai/pitfalls/cases/cloudflare-free-ip-blocked-in-mainland.md`）。

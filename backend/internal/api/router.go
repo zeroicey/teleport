@@ -304,7 +304,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	code := http.StatusOK
 	// A cheap liveness probe for the database. A failure is reported as 503 so
 	// the systemd/Caddy health checks can act on it.
-	if err := s.store.DB().PingContext(r.Context()); err != nil {
+	if err := s.store.Pool().Ping(r.Context()); err != nil {
 		status = "degraded"
 		code = http.StatusServiceUnavailable
 		httpx.Fail(w, r, code, "unavailable", "Database unavailable", nil)

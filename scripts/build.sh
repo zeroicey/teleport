@@ -3,9 +3,10 @@
 # Build the frontend, then compile it into a single self-contained Go binary.
 #
 # This is THE release build. It produces one file that contains the Go server,
-# the SQLite driver and the entire built frontend, so deploying is: copy the
-# file, restart the unit. Nothing has to be staged alongside the binary, and the
-# assets a running process serves can never drift from the code it is running.
+# the database schema (embedded migrations) and the entire built frontend, so
+# deploying is: copy the file, restart the unit. Nothing has to be staged
+# alongside the binary, and the assets a running process serves can never drift
+# from the code it is running.
 #
 # Order matters: Vite writes into backend/internal/webui/dist/, which is the
 # `//go:embed` target, so the frontend must exist before `go build` runs. The
@@ -36,8 +37,7 @@ cd "$REPO/backend"
 
 # CGO_ENABLED=0 matters: it is what makes the result a static executable with no
 # libc dependency, so it runs on the server regardless of its glibc version.
-# (The SQLite driver is `modernc.org/sqlite` — pure Go — precisely so cgo can
-# stay off.)
+# pgx is pure Go, so the PostgreSQL client does not force cgo either.
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
   -trimpath \
   -tags embed_frontend \

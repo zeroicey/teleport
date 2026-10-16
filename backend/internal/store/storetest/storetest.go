@@ -145,6 +145,28 @@ func Pool(t *testing.T, migrate MigrateFunc) *pgxpool.Pool {
 	return pool
 }
 
+// ScopedDSN returns the DSN of the test database with search_path pinned to one
+// schema, exactly as Schema configures its pool.
+//
+// It exists for callers that must reach the *same* schema through a second
+// handle — internal/api's tests inspect rows the HTTP handler wrote, and the
+// only address they share is the DSN. Before the port that address was
+// cfg.DBPath (a temp file); it is now a DSN whose search_path names the test's
+// schema, which is a strictly better identifier: it cannot point at another
+// test's data, and a mistyped one fails loudly because the schema is absent
+// rather than silently targeting a shared database.
+//
+// The schema must already exist (Schema created it); this function does not
+// create anything.
+func ScopedDSN(t *testing.T, schema string) string {
+	t.Helper()
+	dsn, err := withSearchPath(DSN(t), schema)
+	if err != nil {
+		t.Fatalf("set search_path: %v", err)
+	}
+	return dsn
+}
+
 // Schema is Pool, plus the schema's name, for tests that need to name it.
 func Schema(t *testing.T, migrate MigrateFunc) (*pgxpool.Pool, string) {
 	t.Helper()

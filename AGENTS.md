@@ -10,17 +10,24 @@ Teleport 是「个人 AI 报告展示 + 时效分享」平台：AI 用一次 `PO
 pnpm install                    # 依赖（pnpm only，仓库禁用 npm/yarn）
 pnpm run dev:web                # Vite 开发服务器（HMR，/api 与 /s 代理到 127.0.0.1:8788）
 pnpm run build:release          # 发布构建 → bin/teleport-linux-amd64（前端 + 后端单文件）
-pnpm run check                  # 闸门：typecheck + db:check-schema + backend:test
+pnpm run check                  # 闸门：scripts/check.sh（typecheck + gofmt + vet + schema 快照 + sqlc 漂移 + go test）
 ```
 
 分项与「只跑一条测试」：
 
 ```bash
 pnpm run typecheck                                    # vue-tsc，前端类型
-pnpm run db:check-schema                              # schema.sql 与 Go 内嵌迁移不得漂移
-pnpm run backend:test                                 # cd backend && go test ./...
+pnpm run db:gen-sqlc                                  # 重新生成 backend/internal/store/storedb
+pnpm run backend:test                                 # cd backend && go test ./...（无 DSN 时 PG 测试 SKIP）
+pnpm run backend:test-pg                              # 强制真库闸门（无 TEST_PG_DSN 直接退出）
 cd backend && go test ./internal/store/ -run TestResolveShare -v -race   # 单条测试
 pnpm run backend:vet                                  # go vet
+```
+
+`TEST_PG_DSN` 取法（本机）：
+
+```bash
+export TEST_PG_DSN="postgres://teleport:$(sudo -n cat /data/services/teleport/.pgpassword.tmp)@127.0.0.1:5432/teleport_test?sslmode=disable"
 ```
 
 Go 工具链：`go 1.26` 模块在 `backend/`，本机 `go` 在 `/usr/local/go/bin`，
@@ -34,7 +41,10 @@ Go 工具链：`go 1.26` 模块在 `backend/`，本机 `go` 在 `/usr/local/go/b
 | `backend/internal/config/` | 环境变量读取与校验；`Route(suffix)`、`AppBaseURL()` 是前缀的唯一来源 |
 | `backend/internal/api/` | 路由挂载（`net/http` ServeMux），前缀 `cfg.RoutePrefix` |
 | `backend/internal/httpx/` | 中间件、响应封套、Session 签名、Bearer 鉴权 |
-| `backend/internal/store/` | SQLite 访问层 + `//go:embed migrations/*.sql` |
+| `backend/internal/store/` | PostgreSQL 访问层（pgx + sqlc）；`//go:embed migrations_pg/*.sql` |
+| `backend/internal/store/queries/` | sqlc 查询源（`*.sql`）——SQL 的唯一真源 |
+| `backend/internal/store/storedb/` | `sqlc generate` 产物，**勿手改** |
+| `backend/internal/store/storetest/` | 每测一个 schema 的 PG 夹具 |
 | `backend/internal/markdown/` | goldmark + Chroma 服务端渲染（`html:false`） |
 | `backend/internal/views/` | 分享页服务端渲染 + CSP |
 | `backend/internal/spa/` | 内嵌前端托管（SPA 回退 / 缓存 / 路径穿越防护） |
@@ -42,7 +52,10 @@ Go 工具链：`go 1.26` 模块在 `backend/`，本机 `go` 在 `/usr/local/go/b
 | `backend/internal/webui/` | `//go:embed` 前端产物（`dist/` 是生成物，勿手改） |
 | `web/src/` | Vue 3 面板 + 分享页客户端（Mermaid 懒加载） |
 | `scripts/build.sh` | 发布构建：先 Vite 后 Go，顺序不能反 |
-| `schema.sql` | DDL 快照，与 `backend/internal/store/migrations/` 逐字节一致 |
+| `scripts/check-sqlc-sync.sh` | `sqlc diff`：生成物与 SQL 不得漂移 |
+| `backend/sqlc.yaml` | sqlc 配置（engine postgresql、pgx/v5） |
+| `backend/internal/store/migrations_pg/` | 合并式 PG 基线（**唯一** schema 真源） |
+| `schema.pg.sql` | 由 `migrations_pg/` 生成的 DDL 快照，逐字节一致 |
 
 ## 硬约定
 
@@ -64,14 +77,18 @@ Go 工具链：`go 1.26` 模块在 `backend/`，本机 `go` 在 `/usr/local/go/b
 - **未知 `/api/*` 必须仍是 JSON**，不能退化成 SPA 的 HTML 404。
 - **密钥永不入库**：`AGENT_SECRET_KEY`、`SESSION_SECRET`、`ADMIN_PASSWORD_HASH` 只在服务器
   的 `teleport.env`（600 root:root）。仓库里只放 `.dev.vars.example`。
-- 改 `schema.sql` 或迁移后必须跑 `pnpm run db:check-schema`；改前端后必须跑
-  `pnpm run build`（否则 `//go:embed` 打进去的是旧产物）。
+- 改 `backend/internal/store/migrations_pg/`（或 `queries/*.sql`）后必须跑 `pnpm run db:gen-sqlc`
+  与 `scripts/gen-schema-pg.sh`；改前端后必须跑 `pnpm run build`（否则 `//go:embed` 打进去的是旧产物）。
+- **PostgreSQL 实例是共享的**（clip / registry / serenique，`max_connections=100` 共用）。
+  夹具与脚本的连接预算是小整数（`DB_MAX_CONNS` 默认 8，storetest 每测 1+4），
+  **不要在循环里开连接池**。
 - **不要提交** `bin/`、`backend/data/`、`backend/internal/webui/dist/`（都是生成物，已 gitignore）。
 - `git commit` / `git push` / 线上部署前先问人类。
 
 ## 完成定义
 
-1. `pnpm run check` 全绿（typecheck + schema 同步 + Go 测试）。
+1. `pnpm run check` 全绿（typecheck + gofmt + vet + schema 快照 + sqlc 漂移 + Go 测试）。
+   触碰存储或 SQL 时另需 `pnpm run backend:test-pg`（真库，不可跳过）。
 2. `pnpm run backend:vet` 无告警。
 3. 涉及线上行为时，从**大陆观测点**验证（境外观测点无法检测大陆封锁，见 `.ai/pitfalls/`）。
 4. 行为、决策、陷阱的变更在**同一次改动**里写回 `.ai/`。

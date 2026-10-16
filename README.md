@@ -3,12 +3,26 @@
 个人 AI 报告展示与时效分享平台。在终端 / 工作框中完成复杂工作（安全渗透、架构设计、
 开发进度等）后，通过一次 API 调用把报告发布为在线网页，并得到一条**带时效的分享链接**。
 
+> ## ⚠️ 重写进行中（P2.3 已完成，P3–P6 未做）
+>
+> 本仓库正在从 `net/http + SQLite` 重写为 `Gin + pgx/sqlc + PostgreSQL`，**在野契约逐字节不变**。
+> 当前状态：
+>
+> - **代码已切到 PostgreSQL**：`internal/store` 是 pgx + sqlc，`DATABASE_URL` 取代了 `DB_PATH`，
+>   SQLite 驱动与 `schema.sql` 已删除。
+> - **线上仍是旧版**（hcyj 上的 SQLite 构建，目前已 `disabled`，公网入口 502）。
+>   新版在 P6 才切换，届时还会同时启用新域名 `teleport.hcyj.xyz` 根路径。
+> - 因此**下面「部署」「运行手册」等章节描述的是线上旧版**，与当前工作树不完全一致；
+>   P6 之前不要照它去部署本仓库的代码。以 `.ai/CURRENT_TASK.md` 为准。
+>
+> 权威文档：`.ai/decisions/2026-10-16-rewrite-on-gin-and-postgres.md`（纲领 + 冻结清单）。
+
 **当前架构：单二进制（Go 内嵌前端）**
 
 | 层 | 技术 | 部署位置 |
 |---|---|---|
 | 前端 | Vue 3 + Vite（pnpm） | **编译进 Go 二进制**（`go:embed`） |
-| 后端 | Go + SQLite（纯 Go 驱动，无 cgo） | 国内云服务器 hcyj — Caddy 分流至 `/yeciorez/teleport` |
+| 后端 | Go + pgx/sqlc（PostgreSQL；旧版线上仍是 SQLite） | 国内云服务器 hcyj — Caddy 分流至 `/yeciorez/teleport` |
 | 入口 | 单一来源：`https://api.hcyj.xyz/yeciorez/teleport/` | 前端、API、分享页同源同前缀 |
 
 前端与后端**构建为同一个可执行文件**：Vite 产物写进 `backend/internal/webui/dist/`，
@@ -38,13 +52,16 @@ Node、不需要 Go、也没有任何需要与二进制同步的静态目录。
 
 ```
 teleport/
-├── schema.sql                    # 数据库 schema 快照（可直接喂给 sqlite3）
+├── schema.pg.sql                 # PostgreSQL DDL 快照（由 migrations_pg/ 生成）
 ├── vite.config.ts                # Vite 构建配置（root=web，输出到 Go embed 目录）
 ├── tsconfig.web.json             # 前端（含 Vite 配置）TS 配置
 │
 ├── scripts/
 │   ├── build.sh                  # 发布构建：前端 + 后端 → 单个自包含二进制
-│   └── check-schema-sync.mjs     # 校验 schema.sql 与 Go 内嵌迁移未漂移
+│   ├── check.sh                  # 闸门（typecheck / gofmt / vet / 快照 / sqlc / go test）
+│   ├── check-sqlc-sync.sh        # 校验 storedb 生成物与 queries/*.sql 未漂移
+│   ├── gen-schema-pg.sh          # 由 migrations_pg/ 重新生成 schema.pg.sql
+│   └── test-pg.sh                # 强制真库闸门（无 TEST_PG_DSN 直接退出）
 │
 ├── backend/                      # ── Go 后端（全部业务逻辑 + 前端托管）──
 │   ├── main.go                   # 启动 / 优雅退出 / hash-password / migrate / version
@@ -55,8 +72,11 @@ teleport/
 │       ├── config/               # 环境变量读取与校验
 │       ├── httpx/                # 中间件、响应封套、Session 签名、Bearer 鉴权
 │       ├── password/             # PBKDF2-HMAC-SHA256
-│       ├── store/                # SQLite 访问层 + 内嵌迁移
-│       │   └── migrations/       # *.sql，编译进二进制
+│       ├── store/                # PostgreSQL 访问层（pgx + sqlc）
+│       │   ├── migrations_pg/    # *.sql 合并式基线，编译进二进制（schema 唯一真源）
+│       │   ├── queries/          # sqlc 查询源（*.sql）
+│       │   ├── storedb/          # sqlc generate 产物，勿手改
+│       │   └── storetest/        # 每测一个 schema 的 PG 测试夹具
 │       ├── markdown/             # goldmark + Chroma 渲染
 │       ├── validate/             # 请求体校验（复刻原 JS 语义）
 │       ├── domain/               # 业务类型
@@ -96,7 +116,7 @@ teleport/
                     Caddy(:443)  handle /yeciorez/teleport*
                         │         （保留前缀，不 strip）
                         ▼
-                  Go(:8788, 仅监听 docker 网桥) ─> SQLite
+                  Go(:8788, 仅监听 docker 网桥) ─> PostgreSQL（旧版线上：SQLite）
                         ├─ /api/*        JSON API
                         ├─ /s/{token}    服务端渲染的分享页
                         ├─ /s/{token}/html  html 报告的正文（逐字节原样，供分享页 iframe）
@@ -342,7 +362,7 @@ curl -X POST https://api.hcyj.xyz/yeciorez/teleport/api/reports \
 | `category` | TEXT | `pentest` / `architecture` / `progress` / ... 默认 `general` |
 | `format` | TEXT | `markdown`（默认）或 `html`（原样渲染，见「安全模型」） |
 | `content` | TEXT | 正文（含 Markdown / Mermaid） |
-| `metadata` | TEXT | JSON（`CHECK json_valid`） |
+| `metadata` | TEXT | JSON（`CHECK metadata IS JSON`） |
 | `created_at` / `updated_at` | INTEGER | 毫秒时间戳 |
 
 ### `share_tokens`
@@ -358,9 +378,12 @@ curl -X POST https://api.hcyj.xyz/yeciorez/teleport/api/reports \
 
 一篇报告可以持有**任意多条**互相独立的失效链接。
 
-迁移文件内嵌在 Go 二进制里（`backend/internal/store/migrations/*.sql`），
-启动时自动执行，无需手工建表。`schema.sql` 是给人看 / 给 `sqlite3` 用的快照，
-`pnpm run db:check-schema` 会校验两者未漂移。
+迁移文件内嵌在 Go 二进制里（`backend/internal/store/migrations_pg/*.sql`，合并式基线），
+启动时自动执行，无需手工建表。`schema.pg.sql` 是给人看 / 给 `psql -f` 用的快照，
+`scripts/gen-schema-pg.sh` 生成它、`scripts/check.sh` 校验两者未漂移；
+迁移自身的 sha256 也会被记录，改过基线而库未重建时**拒绝启动**。
+
+> P2.3 之前是 SQLite（`migrations/*.sql` + `schema.sql`）。那套已删除，见本页顶部说明。
 
 ---
 
@@ -386,7 +409,7 @@ LISTEN_ADDR=127.0.0.1:8788 \
   SESSION_SECRET=dev-session-secret \
   AGENT_SECRET_KEY=dev-agent-secret \
   ADMIN_PASSWORD_HASH='<上一步输出的值>' \
-  DB_PATH=./data/teleport.db \
+  DATABASE_URL='postgres://teleport:dev@127.0.0.1:5432/teleport?sslmode=disable' \
   go run .
 
 # ── 终端 2：前端（HMR） ────────────────────────────────────────
@@ -429,11 +452,12 @@ npm 下可能"碰巧能跑"，pnpm 下会立刻报错。这是**期望行为**�
 | `pnpm run build` | 构建 Vue 面板 + 分享页客户端到 `backend/internal/webui/dist/` |
 | `pnpm run build:release` | **发布构建**：前端 + 后端 → 单个自包含二进制到 `bin/` |
 | `pnpm run typecheck` | 前端类型检查（`vue-tsc`） |
-| `pnpm run db:check-schema` | 校验 `schema.sql` 与 Go 内嵌迁移一致 |
-| `pnpm run backend:test` | Go 单元 / 集成测试 |
+| `pnpm run db:gen-sqlc` | 重新生成 `backend/internal/store/storedb`（sqlc） |
+| `pnpm run backend:test` | Go 单元 / 集成测试（无 `TEST_PG_DSN` 时 PG 测试 SKIP） |
+| `pnpm run backend:test-pg` | **真库闸门**：无 `TEST_PG_DSN` 直接退出，不静默跳过 |
 | `pnpm run backend:vet` | Go 静态检查 |
 | `pnpm run backend:build` | 同 `build:release`（等价入口，便于记忆） |
-| `pnpm run check` | 以上检查一把梭 |
+| `pnpm run check` | `scripts/check.sh`：typecheck + gofmt + vet + 快照 + sqlc 漂移 + go test |
 
 ---
 
@@ -498,7 +522,11 @@ journalctl -u teleport -f
 > `-X main.version` 会得到**逐字节相同**的二进制，可用 `sha256sum` 对比本地与线上产物。
 
 服务监听 `172.17.0.1:8788`（docker 网桥网关），**不对公网暴露**，只有 Caddy 能访问。
-数据目录 `/data/services/teleport/`，SQLite 使用 WAL 模式。
+数据目录 `/data/services/teleport/`。
+
+> 旧版（线上当前形态）的数据库是 SQLite，文件在 `/data/services/teleport/`，使用 WAL 模式。
+> 重写版改为 PostgreSQL（与本机 clip / registry / serenique 同实例、独立 database `teleport`）。
+
 unit 内已启用 `ProtectSystem=strict`、`NoNewPrivileges`、`MemoryDenyWriteExecute` 等沙箱选项，
 并把 `/data/services/teleport` 设为唯一可写路径。
 
@@ -707,11 +735,13 @@ Vite 的 `root` 指向 `web/`，`build.outDir` 直接输出到
 
 ## 已知陷阱
 
-### 1. SQLite 驱动必须显式空导入
+### 1. SQLite 驱动必须显式空导入（仅适用于 P2.3 之前的旧版）
 
-`internal/store/store.go` 中的 `_ "modernc.org/sqlite"` 不能删。
+旧版 `internal/store/store.go` 中的 `_ "modernc.org/sqlite"` 不能删。
 删掉后代码**照样编译、照样通过 vet**，直到运行时才报
 `sql: unknown driver "sqlite"` —— 纯 Go 驱动是靠 `init()` 注册的。
+
+P2.3 把 store 换成 pgx + sqlc（见本页顶部说明），这段历史只对回滚材料（hcyj 上的旧二进制）有意义。
 
 ### 2. 系统级 `docker exec` 看不到宿主的 `/tmp`
 
@@ -952,19 +982,21 @@ systemctl restart teleport && systemctl is-active teleport
 
 ### 测试覆盖
 
-Go 侧单元 / 集成测试（`pnpm run backend:test`，全部通过，含 `-race`）：
+Go 侧单元 / 集成测试（`pnpm run backend:test`，及**真库闸门** `pnpm run backend:test-pg`）：
 
 | 包 | 覆盖内容 |
 |---|---|
 | `internal/markdown` | XSS / 原始 HTML / 危险 URL / 扩展渲染 / 代码块 / Mermaid / 转义 / 并发 |
-| `internal/store` | 迁移幂等、创建与过期语义、解析状态、吊销、PATCH、计数与删除、列表筛选、`json_valid` 约束、`updated_at` 触发器、清理、外键级联、并发写 |
+| `internal/store` | 三处上限在真并发下精确（advisory lock，含决定性守卫）、sha256 迁移守卫、创建与过期语义、解析状态、吊销、PATCH、计数与删除、列表筛选、`IS JSON` 约束、`updated_at` 触发器、清理、外键级联、并发写 |
 | `internal/httpx` | 响应封套、错误隐藏、Bearer 变体、Session 往返 / 篡改 / 过期、Cookie 属性、严格 CORS、panic 恢复、请求 ID、真实 IP |
 | `internal/validate` | 默认值、空串视作缺省、`autoShareHours: 0` 有效、全部拒绝分支、边界值、UTF-16 emoji 计数、JS `trim()` 语义、请求体解析 |
 | `internal/spa` | 构建目录校验、SPA 深链接回退、哈希资源 `immutable`、缺失资源硬 404、`/api`「/`s` 不回退成 HTML、**路径穿越**（`../`、`%2e%2e`、`....//`）、非读方法 405、空前缀挂载 |
 | `internal/aidoc` | **无未替换占位符**、占位符确实生效、没有声明却未使用的占位符、文档随配置变化、契约字段齐全（端点/Bearer/`data.share.url`/404/410/401）、**不含密钥**、HTML 页无 `<script>` 且 CSP 无 `script-src`、`llms.txt` 保持为指针（不复制正文）、HTML 渲染开关与文档说法一致的绊线 |
 | `internal/api` | 健康检查、鉴权、主流程、校验矩阵、体积上限、公开读取与计数、404/410、分享页渲染与 CSP、面板登录登出、前缀挂载断言、CORS 预检、未知路由（**含 SPA 接管根路径后仍返回 JSON 的回归测试**）、**AI 说明三端点免鉴权且不被 SPA 吞掉** |
 
-前端：`pnpm run typecheck`、`pnpm run build`、`pnpm run db:check-schema` 均通过。
+前端：`pnpm run typecheck`、`pnpm run build` 均通过。
+后端：`pnpm run check`（typecheck + gofmt + vet + schema 快照 + sqlc 漂移 + go test）
+与 `pnpm run backend:test-pg`（真库）均通过。
 
 > `TestUnknownRouteWithSPAStaysJSON` 是刻意设计的回归测试：把
 > `mux.Handle(p+"/api/", root)` 与 `p+"/s/"` 两行删掉，它会**立刻失败**，

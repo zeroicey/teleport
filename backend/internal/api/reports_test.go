@@ -1,12 +1,12 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/zeroicey/teleport/backend/internal/config"
-	"github.com/zeroicey/teleport/backend/internal/store"
 )
 
 // reportField reads one field of a report through the agent read endpoint.
@@ -25,13 +25,10 @@ func reportField(t *testing.T, h http.Handler, token, id, field string) any {
 // that it returned 404.
 func reportExists(t *testing.T, cfg *config.Config, id string) bool {
 	t.Helper()
-	db, err := store.Open(cfg.DBPath)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer db.Close()
+	pool := testStoreHandle(t, cfg)
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM reports WHERE id = ?`, id).Scan(&n); err != nil {
+	if err := pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM reports WHERE id = $1`, id).Scan(&n); err != nil {
 		t.Fatalf("count reports: %v", err)
 	}
 	return n > 0
@@ -39,13 +36,10 @@ func reportExists(t *testing.T, cfg *config.Config, id string) bool {
 
 func shareTokenCount(t *testing.T, cfg *config.Config, reportID string) int {
 	t.Helper()
-	db, err := store.Open(cfg.DBPath)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	defer db.Close()
+	pool := testStoreHandle(t, cfg)
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM share_tokens WHERE report_id = ?`, reportID).Scan(&n); err != nil {
+	if err := pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM share_tokens WHERE report_id = $1`, reportID).Scan(&n); err != nil {
 		t.Fatalf("count share tokens: %v", err)
 	}
 	return n
@@ -284,11 +278,14 @@ func TestUpdateAndDeleteRespectOwnership(t *testing.T) {
 
 // TestDeleteReportCascadesToItsShareLinks guards the schema's ON DELETE CASCADE.
 //
-// SQLite enforces foreign keys only when the pragma is on, so a missing
-// `_pragma=foreign_keys(1)` would turn that cascade into dead code: the report
-// would go and its tokens would stay behind forever, invisible to every query
-// that joins through reports. Asserting on the row count directly is what makes
-// this a guard rather than a coincidence of the join.
+// The cascade is what makes deleting a report one statement instead of a two-step
+// dance, and under SQLite it was only live while the connection set
+// `foreign_keys(1)` — so a missing pragma turned it into dead code and left the
+// report gone with its tokens behind forever, invisible to every query that joins
+// through reports. PostgreSQL always enforces the constraint, so the failure mode
+// is now "the cascade was dropped from the schema" rather than "the pragma was
+// forgotten". Asserting on the row count directly is what makes this a guard
+// rather than a coincidence of the join.
 func TestDeleteReportCascadesToItsShareLinks(t *testing.T) {
 	h, cfg := testServer(t)
 	cookie := map[string]string{"Cookie": login(t, h)}

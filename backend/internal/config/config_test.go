@@ -15,6 +15,10 @@ func requiredEnv(t *testing.T) {
 		{"SESSION_SECRET", "test-session-secret"},
 		{"AGENT_SECRET_KEY", "test-agent-secret"},
 		{"ADMIN_PASSWORD_HASH", "pbkdf2$test"},
+		// Required since the store moved to PostgreSQL (P2). It is a plain
+		// string here, not a live DSN: Load validates presence and form, it does
+		// not connect, and a config test must not need a database.
+		{"DATABASE_URL", "postgres://teleport:test@127.0.0.1:5432/teleport_test?sslmode=disable"},
 	} {
 		t.Setenv(kv[0], kv[1])
 	}
@@ -77,6 +81,54 @@ func TestKeyRenewalGraceDefaultsAndValidation(t *testing.T) {
 		}
 		if cfg.KeyRenewalGrace != 30*24*time.Hour {
 			t.Errorf("KeyRenewalGrace = %s, want 720h", cfg.KeyRenewalGrace)
+		}
+	})
+}
+
+// TestDatabaseConfigValidation covers the storage settings the rewrite added.
+//
+// DATABASE_URL is required with no default on purpose: a wrong-but-present
+// default would point the service at another database, and the failure would
+// surface as missing data rather than as a startup error. Both branches are
+// asserted here because an unmatched validation branch is a branch nobody has
+// seen work.
+func TestDatabaseConfigValidation(t *testing.T) {
+	t.Run("DATABASE_URL is required", func(t *testing.T) {
+		requiredEnv(t)
+		t.Setenv("DATABASE_URL", "")
+		_, err := Load()
+		if err == nil {
+			t.Fatal("Load accepted an empty DATABASE_URL; the service would start with no database")
+		}
+		if !strings.Contains(err.Error(), "DATABASE_URL") {
+			t.Errorf("error does not name the variable: %v", err)
+		}
+	})
+
+	t.Run("DB_MAX_CONNS defaults to a small pool", func(t *testing.T) {
+		requiredEnv(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		// Not a magic number for its own sake: the PostgreSQL instance is shared
+		// with clip / registry / serenique and max_connections=100 is their
+		// combined budget, so the pool must be bounded by default rather than
+		// taking the driver's larger default.
+		if cfg.DBMaxConns != 8 {
+			t.Errorf("DBMaxConns = %d, want 8", cfg.DBMaxConns)
+		}
+	})
+
+	t.Run("DB_MAX_CONNS must be positive", func(t *testing.T) {
+		requiredEnv(t)
+		t.Setenv("DB_MAX_CONNS", "0")
+		_, err := Load()
+		if err == nil {
+			t.Fatal("Load accepted DB_MAX_CONNS=0; the pool could never hand out a connection")
+		}
+		if !strings.Contains(err.Error(), "DB_MAX_CONNS") {
+			t.Errorf("error does not name the variable: %v", err)
 		}
 	})
 }

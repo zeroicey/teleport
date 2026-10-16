@@ -1,164 +1,127 @@
-// Package store owns the SQLite connection, schema migration and all SQL.
+// Package store owns the PostgreSQL connection, schema migration and all SQL.
 package store
 
 import (
-	"database/sql"
-	"embed"
-	"fmt"
-	"log/slog"
-	"sort"
-	"strings"
+	"context"
+	"encoding/json"
+	"time"
 
-	// Register the pure-Go SQLite driver under the name "sqlite".
-	//
-	// This is a blank import because nothing references the package directly;
-	// database/sql discovers drivers through their init() side effect. Omitting
-	// it compiles and vets cleanly and then fails at runtime with
-	// `sql: unknown driver "sqlite"`, so it must not be removed.
-	_ "modernc.org/sqlite"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/zeroicey/teleport/backend/internal/domain"
+	"github.com/zeroicey/teleport/backend/internal/store/storedb"
 )
 
-// migrationFS embeds the SQL migrations so the deployed binary is a single
-// self-contained file — the server has no sqlite3 CLI and we do not want a
-// separate artifact to keep in sync.
+// Store is the data-access layer. All SQL in the application lives here.
 //
-//go:embed migrations/*.sql
-var migrationFS embed.FS
-
-// Open opens (creating if necessary) the SQLite database at path and applies
-// any pending migrations.
-//
-// The pragmas are set on the DSN so they apply to every pooled connection:
-//   - busy_timeout: wait rather than fail instantly when another write is in
-//     flight (SQLite allows one writer; the dashboard and agent API share it).
-//   - journal_mode=WAL: readers never block the writer, which matters because
-//     share-page views increment a counter on every read.
-//   - foreign_keys=ON: SQLite defaults this off, but the schema relies on
-//     ON DELETE CASCADE.
-//   - synchronous=NORMAL: the durable-enough default for WAL; a full fsync per
-//     commit would dominate write latency on a small VPS.
-//   - _txlock=immediate: take the write lock when the transaction BEGINS rather
-//     than on its first write. Every transaction in this package is a write
-//     (see the note below), and a DEFERRED transaction that reads before it
-//     writes must upgrade its snapshot — an upgrade SQLite refuses outright with
-//     SQLITE_BUSY_SNAPSHOT (517) when another writer committed in between.
-//     busy_timeout does NOT cover that case, because it is not a lock wait: the
-//     snapshot is simply stale and must be restarted. Measured before this
-//     change, with 24 goroutines all passing the pending cap so that each one
-//     reached its INSERT: 226 of 360 attempts failed (139x "database is locked
-//     (5)", 87x "(517)") — a public, unauthenticated endpoint returning 500s.
-//     Taking the lock up front turns that into an ordinary wait.
-//
-// _txlock=immediate applies to every Begin in this package, so it is only safe
-// while that stays true. Every current caller writes: CreateReport,
-// CreateApplication, ClaimApplication, CreateManualKey, CreateRenewal,
-// DecideRenewal and Migrate. If a read-only transaction is ever added, it does
-// not need one — plain db.Query reads run in autocommit and are unaffected — but
-// wrapping it in a Begin would serialise it behind writers for no reason.
-func Open(path string) (*sql.DB, error) {
-	if path != ":memory:" && !strings.HasPrefix(path, "file:") {
-		path = "file:" + path
-	}
-	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)&_txlock=immediate"
-
-	db, err := sql.Open("sqlite", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("open sqlite: %w", err)
-	}
-
-	// SQLite writes are serialised anyway; a small pool keeps contention
-	// explicit and avoids "database is locked" storms under load.
-	db.SetMaxOpenConns(8)
-	db.SetMaxIdleConns(8)
-
-	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("ping sqlite: %w", err)
-	}
-	if err := Migrate(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	return db, nil
+// It owns the connection pool and a sqlc-generated query set bound to it. The
+// generated statements live in one place (internal/store/queries/*.sql) that is
+// also read by the drift guard, so a query cannot be checking against a schema
+// other than the one the binary embeds and applies.
+type Store struct {
+	pool *pgxpool.Pool
+	q    *storedb.Queries
 }
 
-// Migrate applies every embedded migration that has not been applied yet.
+// New wraps an open pool.
+func New(pool *pgxpool.Pool) *Store {
+	return &Store{pool: pool, q: storedb.New(pool)}
+}
+
+// Pool exposes the handle for health checks and for tests that need to assert
+// something the store's own API cannot express (an orphan count, a raw column).
+func (s *Store) Pool() *pgxpool.Pool { return s.pool }
+
+// Close releases the pool.
+func (s *Store) Close() { s.pool.Close() }
+
+// callCtx is the context every store method runs under.
 //
-// Migrations are tracked in a `schema_migrations` table. Each file must be
-// idempotent-safe to re-run in the sense that it uses IF NOT EXISTS where the
-// original D1 migration did; we still record applied versions so a future
-// destructive migration is never replayed.
-func Migrate(db *sql.DB) error {
-	if _, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS schema_migrations (
-			version    TEXT PRIMARY KEY,
-			applied_at INTEGER NOT NULL
-		)`); err != nil {
-		return fmt.Errorf("create schema_migrations: %w", err)
-	}
+// The Store's method signatures deliberately do NOT take a context.Context. P2
+// is a port, not a redesign, and adding a parameter would touch every call site
+// *and* every assertion in a suite that this port's own decision record freezes
+// ("a failing assertion is investigated individually — never bulk-edited").
+// Threading a request context through is a separate change, and it belongs with
+// the P3 HTTP port where a per-request context actually exists.
+//
+// A package-level background context is not a shared mutable resource: it is
+// exactly what context.Background() returns, and a store call that must be
+// cancelled can be given one when the signatures change.
+var callCtx = context.Background()
 
-	applied := map[string]bool{}
-	rows, err := db.Query(`SELECT version FROM schema_migrations`)
-	if err != nil {
-		return fmt.Errorf("read schema_migrations: %w", err)
-	}
-	for rows.Next() {
-		var v string
-		if err := rows.Scan(&v); err != nil {
-			rows.Close()
-			return err
-		}
-		applied[v] = true
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
+// NowMS returns the current time in epoch milliseconds, matching the schema
+// convention (all *_at columns are ms, like JavaScript's Date.now()).
+func NowMS() int64 { return time.Now().UnixMilli() }
 
-	entries, err := migrationFS.ReadDir("migrations")
-	if err != nil {
-		return fmt.Errorf("list migrations: %w", err)
-	}
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
-			names = append(names, e.Name())
-		}
-	}
-	sort.Strings(names)
+// ---------------------------------------------------------------------------
+// row mapping: sqlc rows -> domain types
+// ---------------------------------------------------------------------------
+//
+// sqlc generates a row type per query shape and reuses a table model when a
+// SELECT lists the table's columns in the table's own order (see
+// queries/keys.sql). These helpers are the single place the generated types are
+// translated into the domain types the API layer consumes, so a column that is
+// added later cannot be half-wired.
 
-	for _, name := range names {
-		version := strings.TrimSuffix(name, ".sql")
-		if applied[version] {
-			continue
-		}
-		body, err := migrationFS.ReadFile("migrations/" + name)
-		if err != nil {
-			return fmt.Errorf("read migration %s: %w", name, err)
-		}
-		// The whole file runs in one transaction: SQLite DDL is transactional,
-		// so a failure part-way leaves the schema untouched and the version
-		// unrecorded (safe to retry).
-		tx, err := db.Begin()
-		if err != nil {
-			return fmt.Errorf("begin migration %s: %w", name, err)
-		}
-		if _, err := tx.Exec(string(body)); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("apply migration %s: %w", name, err)
-		}
-		if _, err := tx.Exec(
-			`INSERT INTO schema_migrations (version, applied_at) VALUES (?, unixepoch('subsec') * 1000)`,
-			version,
-		); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("record migration %s: %w", name, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("commit migration %s: %w", name, err)
-		}
-		slog.Info("migration applied", "version", version)
+func reportFromDB(r storedb.Report) *domain.Report {
+	return &domain.Report{
+		ID: r.ID, Title: r.Title, Category: r.Category,
+		Format:  domain.ReportFormat(r.Format),
+		Content: r.Content, Metadata: decodeMetadata(r.Metadata),
+		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt, OwnerKeyID: r.OwnerKeyID,
 	}
-	return nil
+}
+
+func shareFromDB(t storedb.ShareToken) *domain.ShareToken {
+	return &domain.ShareToken{
+		Token: t.Token, ReportID: t.ReportID, CreatedAt: t.CreatedAt,
+		ExpiresAt: t.ExpiresAt, IsActive: t.IsActive == 1, ViewCount: t.ViewCount,
+	}
+}
+
+func keyFromDB(k storedb.AgentKey) *domain.AgentKey {
+	return &domain.AgentKey{
+		ID: k.ID, Name: k.Name, TokenPrefix: k.TokenPrefix, TokenHash: k.TokenHash,
+		CreatedAt: k.CreatedAt, ExpiresAt: k.ExpiresAt, RevokedAt: k.RevokedAt,
+		LastUsedAt: k.LastUsedAt, RequestCount: k.RequestCount, Note: k.Note,
+	}
+}
+
+func applicationFromDB(a storedb.KeyApplication) *domain.KeyApplication {
+	return &domain.KeyApplication{
+		ID: a.ID, ClaimHash: a.ClaimHash, Label: a.Label, Purpose: a.Purpose,
+		RequestedHours: a.RequestedHours, Status: domain.ApplicationStatus(a.Status),
+		CreatedAt: a.CreatedAt, ExpiresAt: a.ExpiresAt, DecidedAt: a.DecidedAt,
+		ClaimDeadline: a.ClaimDeadline, IssuedKeyID: a.IssuedKeyID,
+		RequesterIP: a.RequesterIp, UserAgent: a.UserAgent,
+		ApprovedName: a.ApprovedName, ApprovedHours: a.ApprovedHours, ApprovedNote: a.ApprovedNote,
+	}
+}
+
+func renewalFromDB(r storedb.KeyRenewal) *domain.KeyRenewal {
+	return &domain.KeyRenewal{
+		ID: r.ID, KeyID: r.KeyID, RequestedHours: r.RequestedHours,
+		Status:    domain.RenewalStatus(r.Status),
+		CreatedAt: r.CreatedAt, DecidedAt: r.DecidedAt, GrantedExpiresAt: r.GrantedExpiresAt,
+	}
+}
+
+// decodeMetadata parses the stored JSON blob, degrading to an empty object so a
+// corrupt value can never break a read path.
+func decodeMetadata(raw string) map[string]any {
+	if raw == "" {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(raw), &out); err != nil || out == nil {
+		return map[string]any{}
+	}
+	return out
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

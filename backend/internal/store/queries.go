@@ -1,29 +1,15 @@
 package store
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/zeroicey/teleport/backend/internal/domain"
+	"github.com/zeroicey/teleport/backend/internal/store/storedb"
 )
-
-// Store is the data-access layer. All SQL in the application lives here.
-type Store struct {
-	db *sql.DB
-}
-
-// New wraps an open database handle.
-func New(db *sql.DB) *Store { return &Store{db: db} }
-
-// DB exposes the handle for health checks.
-func (s *Store) DB() *sql.DB { return s.db }
-
-// NowMS returns the current time in epoch milliseconds, matching the schema
-// convention (all *_at columns are ms, like JavaScript's Date.now()).
-func NowMS() int64 { return time.Now().UnixMilli() }
 
 // ---------------------------------------------------------------------------
 // writes
@@ -65,17 +51,18 @@ func (s *Store) CreateReport(input domain.CreateReportInput, defaultShareHours i
 		shareHours = *input.AutoShareHours
 	}
 
-	tx, err := s.db.Begin()
+	tx, err := s.pool.Begin(callCtx)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback(callCtx) }()
+	q := s.q.WithTx(tx)
 
-	if _, err := tx.Exec(
-		`INSERT INTO reports (id, title, category, format, content, metadata, created_at, updated_at, owner_key_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, input.Title, category, string(format), input.Content, string(metadataJSON), ts, ts, input.OwnerKeyID,
-	); err != nil {
+	if err := q.CreateReport(callCtx, storedb.CreateReportParams{
+		ID: id, Title: input.Title, Category: category, Format: string(format),
+		Content: input.Content, Metadata: string(metadataJSON),
+		CreatedAt: ts, UpdatedAt: ts, OwnerKeyID: input.OwnerKeyID,
+	}); err != nil {
 		return nil, nil, fmt.Errorf("insert report: %w", err)
 	}
 
@@ -90,11 +77,9 @@ func (s *Store) CreateReport(input domain.CreateReportInput, defaultShareHours i
 		return nil, nil, err
 	}
 	expiresAt := HoursFromNow(shareHours, defaultShareHours)
-	if _, err := tx.Exec(
-		`INSERT INTO share_tokens (token, report_id, created_at, expires_at, is_active, view_count)
-		 VALUES (?, ?, ?, ?, 1, 0)`,
-		token, id, ts, expiresAt,
-	); err != nil {
+	if err := q.CreateShareToken(callCtx, storedb.CreateShareTokenParams{
+		Token: token, ReportID: id, CreatedAt: ts, ExpiresAt: expiresAt,
+	}); err != nil {
 		return nil, nil, fmt.Errorf("insert share token: %w", err)
 	}
 	share := &domain.ShareToken{
@@ -102,7 +87,7 @@ func (s *Store) CreateReport(input domain.CreateReportInput, defaultShareHours i
 		ExpiresAt: expiresAt, IsActive: true, ViewCount: 0,
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(callCtx); err != nil {
 		return nil, nil, err
 	}
 	return report, share, nil
@@ -111,35 +96,32 @@ func (s *Store) CreateReport(input domain.CreateReportInput, defaultShareHours i
 // RevokeToken deactivates a token. It returns false only when the token does
 // not exist at all; revoking an already-revoked token is a no-op success.
 func (s *Store) RevokeToken(token string) (bool, error) {
-	res, err := s.db.Exec(
-		`UPDATE share_tokens SET is_active = 0 WHERE token = ? AND is_active = 1`, token)
+	n, err := s.q.RevokeShareToken(callCtx, token)
 	if err != nil {
 		return false, err
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
+	if n > 0 {
 		return true, nil
 	}
-	var exists string
-	err = s.db.QueryRow(`SELECT token FROM share_tokens WHERE token = ?`, token).Scan(&exists)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
+	// Nothing was flipped: the token is absent, or it was already revoked.
+	// Distinguishing the two is what makes a repeated revoke a success rather
+	// than a 404.
+	exists, err := s.q.ShareTokenExists(callCtx, token)
 	if err != nil {
 		return false, err
 	}
-	return true, nil
+	return exists, nil
 }
 
 // CreateShareToken adds another share link to an existing report. It returns
 // (nil, nil) when the report does not exist.
 func (s *Store) CreateShareToken(reportID string, expiresInHours float64) (*domain.ShareToken, error) {
-	var exists string
-	err := s.db.QueryRow(`SELECT id FROM reports WHERE id = ?`, reportID).Scan(&exists)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
+	exists, err := s.q.ReportExists(callCtx, reportID)
 	if err != nil {
 		return nil, err
+	}
+	if !exists {
+		return nil, nil
 	}
 
 	token, err := NewShareToken()
@@ -148,11 +130,9 @@ func (s *Store) CreateShareToken(reportID string, expiresInHours float64) (*doma
 	}
 	ts := NowMS()
 	expiresAt := HoursFromNow(expiresInHours, 0)
-	if _, err := s.db.Exec(
-		`INSERT INTO share_tokens (token, report_id, created_at, expires_at, is_active, view_count)
-		 VALUES (?, ?, ?, ?, 1, 0)`,
-		token, reportID, ts, expiresAt,
-	); err != nil {
+	if err := s.q.CreateShareToken(callCtx, storedb.CreateShareTokenParams{
+		Token: token, ReportID: reportID, CreatedAt: ts, ExpiresAt: expiresAt,
+	}); err != nil {
 		return nil, err
 	}
 	return &domain.ShareToken{
@@ -170,81 +150,78 @@ type SharePatch struct {
 
 // UpdateShareToken applies a partial update and returns the updated row, or
 // (nil, nil) when the token does not exist.
+//
+// The two expiry fields are resolved here, in the original's order: an explicit
+// expiresInHours wins over expiresAt, and either one becomes a single nullable
+// expires_at argument. sqlc.narg turns a nil into SQL NULL, which the query's
+// COALESCE reads as "leave this column alone" — that is what makes PATCH a patch
+// without building a SET list by string concatenation.
 func (s *Store) UpdateShareToken(token string, patch SharePatch) (*domain.ShareToken, error) {
-	set := []string{}
-	args := []any{}
+	var expiresAt *int64
 	if patch.ExpiresInHours != nil {
-		set = append(set, "expires_at = ?")
-		args = append(args, HoursFromNow(*patch.ExpiresInHours, 0))
+		v := HoursFromNow(*patch.ExpiresInHours, 0)
+		expiresAt = &v
 	} else if patch.ExpiresAt != nil {
-		set = append(set, "expires_at = ?")
-		args = append(args, *patch.ExpiresAt)
+		expiresAt = patch.ExpiresAt
 	}
+	var isActive *int32
 	if patch.IsActive != nil {
-		set = append(set, "is_active = ?")
-		args = append(args, boolToInt(*patch.IsActive))
+		v := int32(boolToInt(*patch.IsActive))
+		isActive = &v
 	}
-	if len(set) == 0 {
+	if expiresAt == nil && isActive == nil {
+		// Nothing to change. Skipping the write keeps the original's behaviour
+		// of not touching the row at all, rather than issuing a no-op UPDATE
+		// that bumps the row version.
 		return s.GetShareToken(token)
 	}
 
-	args = append(args, token)
-	res, err := s.db.Exec(`UPDATE share_tokens SET `+joinComma(set)+` WHERE token = ?`, args...)
-	if err != nil {
+	if _, err := s.q.UpdateShareToken(callCtx, storedb.UpdateShareTokenParams{
+		ExpiresAt: expiresAt, IsActive: isActive, Token: token,
+	}); err != nil {
 		return nil, err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		// Either the token is absent, or the update was a no-op. Distinguish.
-		return s.GetShareToken(token)
 	}
 	return s.GetShareToken(token)
 }
 
 // DeleteShareToken removes a token. Returns false when it did not exist.
 func (s *Store) DeleteShareToken(token string) (bool, error) {
-	res, err := s.db.Exec(`DELETE FROM share_tokens WHERE token = ?`, token)
+	n, err := s.q.DeleteShareToken(callCtx, token)
 	if err != nil {
 		return false, err
 	}
-	n, _ := res.RowsAffected()
 	return n > 0, nil
 }
 
 // RecordView increments the view counter for a token. Best-effort by design:
 // a failure here must never fail the page render.
 func (s *Store) RecordView(token string) error {
-	_, err := s.db.Exec(
-		`UPDATE share_tokens SET view_count = view_count + 1 WHERE token = ?`, token)
-	return err
+	return s.q.RecordShareView(callCtx, token)
 }
 
 // CleanupExpired removes inactive, expired tokens. Returns the number deleted.
 func (s *Store) CleanupExpired() (int64, error) {
-	res, err := s.db.Exec(
-		`DELETE FROM share_tokens WHERE is_active = 0 AND expires_at != 0 AND expires_at < ?`,
-		NowMS())
-	if err != nil {
-		return 0, err
-	}
-	n, _ := res.RowsAffected()
-	return n, nil
+	return s.q.CleanupExpiredShareTokens(callCtx, NowMS())
 }
 
 // ---------------------------------------------------------------------------
 // reads
 // ---------------------------------------------------------------------------
 
+// reportByID loads one report, leaving pgx.ErrNoRows to the caller so that
+// "absent" and "read failed" stay distinguishable.
 func (s *Store) reportByID(id string) (*domain.Report, error) {
-	row := s.db.QueryRow(
-		`SELECT id, title, category, format, content, metadata, created_at, updated_at, owner_key_id
-		   FROM reports WHERE id = ?`, id)
-	return scanReport(row)
+	row, err := s.q.GetReport(callCtx, id)
+	if err != nil {
+		return nil, err
+	}
+	return reportFromDB(row), nil
 }
 
 // GetReport returns a single report including its content.
 func (s *Store) GetReport(id string) (*domain.Report, error) {
 	report, err := s.reportByID(id)
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
 	return report, err
@@ -252,30 +229,17 @@ func (s *Store) GetReport(id string) (*domain.Report, error) {
 
 // ListReports returns newest-first summaries (content omitted).
 func (s *Store) ListReports(category string, limit, offset int) ([]domain.Report, error) {
-	base := `SELECT id, title, category, format, '' AS content, metadata, created_at, updated_at, owner_key_id
-	           FROM reports`
-	var rows *sql.Rows
-	var err error
-	if category != "" {
-		rows, err = s.db.Query(base+` WHERE category = ? ORDER BY created_at DESC LIMIT ? OFFSET ?`,
-			category, limit, offset)
-	} else {
-		rows, err = s.db.Query(base+` ORDER BY created_at DESC LIMIT ? OFFSET ?`, limit, offset)
-	}
+	rows, err := s.q.ListReports(callCtx, storedb.ListReportsParams{
+		Category: category, LimitCount: int32(limit), OffsetCount: int32(offset),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
 	out := []domain.Report{}
-	for rows.Next() {
-		report, err := scanReport(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *report)
+	for _, r := range rows {
+		out = append(out, *reportFromDB(storedb.Report(r)))
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // ListReportsByOwner returns newest-first summaries published by one key.
@@ -287,67 +251,45 @@ func (s *Store) ListReports(category string, limit, offset int) ([]domain.Report
 //
 // An empty ownerKeyID is a real value, not a wildcard: it selects the reports
 // published by the root credential, whose owner_key_id is the empty string.
-// Callers wanting
-// "everything" must use ListReports.
+// Callers wanting "everything" must use ListReports.
 func (s *Store) ListReportsByOwner(ownerKeyID, category string, limit, offset int) ([]domain.Report, error) {
-	base := `SELECT id, title, category, format, '' AS content, metadata, created_at, updated_at, owner_key_id
-	           FROM reports WHERE owner_key_id = ?`
-	args := []any{ownerKeyID}
-	if category != "" {
-		base += ` AND category = ?`
-		args = append(args, category)
-	}
-	base += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`
-	args = append(args, limit, offset)
-
-	rows, err := s.db.Query(base, args...)
+	rows, err := s.q.ListReportsByOwner(callCtx, storedb.ListReportsByOwnerParams{
+		OwnerKeyID: ownerKeyID, Category: category,
+		LimitCount: int32(limit), OffsetCount: int32(offset),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
 	out := []domain.Report{}
-	for rows.Next() {
-		report, err := scanReport(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *report)
+	for _, r := range rows {
+		out = append(out, *reportFromDB(storedb.Report(r)))
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // GetShareToken returns a single token row.
 func (s *Store) GetShareToken(token string) (*domain.ShareToken, error) {
-	row := s.db.QueryRow(
-		`SELECT token, report_id, created_at, expires_at, is_active, view_count
-		   FROM share_tokens WHERE token = ?`, token)
-	t, err := scanShare(row)
-	if errors.Is(err, sql.ErrNoRows) {
+	row, err := s.q.GetShareToken(callCtx, token)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
-	return t, err
+	if err != nil {
+		return nil, err
+	}
+	return shareFromDB(row), nil
 }
 
 // ListShareTokens returns all tokens belonging to a report, newest first.
 func (s *Store) ListShareTokens(reportID string) ([]domain.ShareToken, error) {
-	rows, err := s.db.Query(
-		`SELECT token, report_id, created_at, expires_at, is_active, view_count
-		   FROM share_tokens WHERE report_id = ? ORDER BY created_at DESC`, reportID)
+	rows, err := s.q.ListShareTokens(callCtx, reportID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
 	out := []domain.ShareToken{}
-	for rows.Next() {
-		t, err := scanShare(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, *t)
+	for _, t := range rows {
+		out = append(out, *shareFromDB(t))
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // ResolveShare looks up a share token and its report, classifying the result as
@@ -356,25 +298,8 @@ func (s *Store) ListShareTokens(reportID string) ([]domain.ShareToken, error) {
 // Liveness is computed at read time (expires_at = 0 means "never expires"), so
 // no background job is needed to flip a flag when a link expires.
 func (s *Store) ResolveShare(token string) (*domain.Resolution, error) {
-	row := s.db.QueryRow(
-		`SELECT t.token, t.report_id, t.created_at, t.expires_at, t.is_active, t.view_count,
-		        r.id, r.title, r.category, r.format, r.content, r.metadata, r.created_at, r.updated_at
-		   FROM share_tokens t
-		   JOIN reports r ON r.id = t.report_id
-		  WHERE t.token = ?`, token)
-
-	var (
-		token2                         string
-		reportID                       string
-		tokenCreated, expiresAt, views int64
-		isActive                       int
-		rid, title, category, format   string
-		content, metadataJSON          string
-		rCreated, rUpdated             int64
-	)
-	err := row.Scan(&token2, &reportID, &tokenCreated, &expiresAt, &isActive, &views,
-		&rid, &title, &category, &format, &content, &metadataJSON, &rCreated, &rUpdated)
-	if errors.Is(err, sql.ErrNoRows) {
+	row, err := s.q.ResolveShare(callCtx, token)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return &domain.Resolution{Status: domain.StatusMissing}, nil
 	}
 	if err != nil {
@@ -382,13 +307,15 @@ func (s *Store) ResolveShare(token string) (*domain.Resolution, error) {
 	}
 
 	share := &domain.ShareToken{
-		Token: token2, ReportID: reportID, CreatedAt: tokenCreated,
-		ExpiresAt: expiresAt, IsActive: isActive == 1, ViewCount: views,
+		Token: row.Token, ReportID: row.ReportID, CreatedAt: row.TokenCreatedAt,
+		ExpiresAt: row.TokenExpiresAt, IsActive: row.TokenIsActive == 1,
+		ViewCount: row.TokenViewCount,
 	}
 	report := &domain.Report{
-		ID: rid, Title: title, Category: category, Format: domain.ReportFormat(format),
-		Content: content, Metadata: decodeMetadata(metadataJSON),
-		CreatedAt: rCreated, UpdatedAt: rUpdated,
+		ID: row.ReportIDOfReport, Title: row.ReportTitle, Category: row.ReportCategory,
+		Format:  domain.ReportFormat(row.ReportFormat),
+		Content: row.ReportContent, Metadata: decodeMetadata(row.ReportMetadata),
+		CreatedAt: row.ReportCreatedAt, UpdatedAt: row.ReportUpdatedAt,
 	}
 
 	// Unknown, revoked and expired are distinct only in status code; a revoked
@@ -400,73 +327,6 @@ func (s *Store) ResolveShare(token string) (*domain.Resolution, error) {
 		return &domain.Resolution{Status: domain.StatusGone}, nil
 	}
 	return &domain.Resolution{Status: domain.StatusOK, Report: report, Share: share}, nil
-}
-
-// ---------------------------------------------------------------------------
-// scanning helpers
-// ---------------------------------------------------------------------------
-
-// scannable is satisfied by both *sql.Row and *sql.Rows.
-type scannable interface {
-	Scan(dest ...any) error
-}
-
-func scanReport(row scannable) (*domain.Report, error) {
-	var (
-		r            domain.Report
-		format       string
-		metadataJSON string
-	)
-	if err := row.Scan(&r.ID, &r.Title, &r.Category, &format, &r.Content, &metadataJSON,
-		&r.CreatedAt, &r.UpdatedAt, &r.OwnerKeyID); err != nil {
-		return nil, err
-	}
-	r.Format = domain.ReportFormat(format)
-	r.Metadata = decodeMetadata(metadataJSON)
-	return &r, nil
-}
-
-func scanShare(row scannable) (*domain.ShareToken, error) {
-	var (
-		t        domain.ShareToken
-		isActive int
-	)
-	if err := row.Scan(&t.Token, &t.ReportID, &t.CreatedAt, &t.ExpiresAt, &isActive, &t.ViewCount); err != nil {
-		return nil, err
-	}
-	t.IsActive = isActive == 1
-	return &t, nil
-}
-
-// decodeMetadata parses the stored JSON blob, degrading to an empty object so a
-// corrupt value can never break a read path.
-func decodeMetadata(raw string) map[string]any {
-	if raw == "" {
-		return map[string]any{}
-	}
-	var out map[string]any
-	if err := json.Unmarshal([]byte(raw), &out); err != nil || out == nil {
-		return map[string]any{}
-	}
-	return out
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
-}
-
-func joinComma(parts []string) string {
-	out := ""
-	for i, p := range parts {
-		if i > 0 {
-			out += ", "
-		}
-		out += p
-	}
-	return out
 }
 
 // ---------------------------------------------------------------------------
@@ -483,20 +343,22 @@ func joinComma(parts []string) string {
 // column untouched, so "field absent" and "field set to this value" stay
 // distinguishable without building SQL by string concatenation.
 //
-// updated_at is `MAX(now, updated_at + 1)` rather than a plain `now`, and both
-// halves of that matter:
+// updated_at is `GREATEST(now, updated_at + 1)` rather than a plain `now`, and
+// both halves of that matter:
 //
-//   - `MAX(..., updated_at + 1)` keeps it strictly increasing. Without the +1,
-//     an update landing in the same millisecond as the previous write would set
-//     updated_at to the value already stored, which is exactly the condition
+//   - The `+ 1` keeps it strictly increasing. Without it, an update landing in
+//     the same millisecond as the previous write would set updated_at to the
+//     value already stored, which is exactly the condition
 //     trg_reports_touch_updated_at watches for — the trigger would then fire and
-//     rewrite the column from strftime('%s','now') * 1000, i.e. truncated to
-//     whole SECONDS. The result could land up to 999ms *before* created_at, so
-//     the share page would show "Updated" earlier than "Created". Because the
-//     +1 guarantees the column always changes, the trigger never fires on this
-//     path and its second-granularity stamp cannot leak into the data.
-//   - `MAX(now, ...)` means a backwards system clock cannot move the column
+//     rewrite the column from the database clock. That would make the
+//     "strictly increasing, never before created_at" invariant depend on the
+//     clock's resolution instead of on this statement.
+//   - `GREATEST(now, ...)` means a backwards system clock cannot move the column
 //     backwards either.
+//
+// SQLite's two-argument `max(a, b)` is PostgreSQL's `GREATEST`: `max()` here is
+// an aggregate function, so the naive translation would not even mean the same
+// thing.
 func (s *Store) UpdateReport(id string, patch domain.ReportPatch, nowMS int64) (*domain.Report, bool, error) {
 	var metadataJSON *string
 	if patch.Metadata != nil {
@@ -514,22 +376,12 @@ func (s *Store) UpdateReport(id string, patch domain.ReportPatch, nowMS int64) (
 		format = &f
 	}
 
-	res, err := s.db.Exec(
-		`UPDATE reports
-		    SET title      = COALESCE(?, title),
-		        category   = COALESCE(?, category),
-		        format     = COALESCE(?, format),
-		        content    = COALESCE(?, content),
-		        metadata   = COALESCE(?, metadata),
-		        updated_at = MAX(?, updated_at + 1)
-		  WHERE id = ?`,
-		patch.Title, patch.Category, format, patch.Content, metadataJSON, nowMS, id)
+	affected, err := s.q.UpdateReport(callCtx, storedb.UpdateReportParams{
+		Title: patch.Title, Category: patch.Category, Format: format,
+		Content: patch.Content, Metadata: metadataJSON, NowMs: nowMS, ID: id,
+	})
 	if err != nil {
 		return nil, false, fmt.Errorf("update report: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return nil, false, fmt.Errorf("update report rows: %w", err)
 	}
 	if affected == 0 {
 		return nil, false, nil
@@ -546,19 +398,14 @@ func (s *Store) UpdateReport(id string, patch domain.ReportPatch, nowMS int64) (
 // delete, so a repeated DELETE answers 404 rather than pretending to succeed.
 //
 // The report's share tokens go with it: share_tokens.report_id declares
-// ON DELETE CASCADE and the connection sets foreign_keys(1), so this single
-// statement is the whole operation. Without that pragma the cascade would be
-// dead code and orphaned tokens would linger — harmless to readers (the join
-// would find no report) but permanently unreachable rows, and a
-// `DELETE FROM reports` that silently leaves debris.
+// ON DELETE CASCADE and PostgreSQL always enforces foreign keys, so this single
+// statement is the whole operation. (SQLite needed a pragma for that; losing the
+// pragma there silently orphaned rows. PostgreSQL has no such switch, so the
+// cascade is now unconditional rather than configuration-dependent.)
 func (s *Store) DeleteReport(id string) (bool, error) {
-	res, err := s.db.Exec(`DELETE FROM reports WHERE id = ?`, id)
+	affected, err := s.q.DeleteReport(callCtx, id)
 	if err != nil {
 		return false, fmt.Errorf("delete report: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("delete report rows: %w", err)
 	}
 	return affected > 0, nil
 }

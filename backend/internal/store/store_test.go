@@ -1,28 +1,28 @@
 package store
 
 import (
-	"database/sql"
-	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/zeroicey/teleport/backend/internal/domain"
+	"github.com/zeroicey/teleport/backend/internal/store/storetest"
 )
 
-// newTestStore opens a fresh, migrated database in a temp directory.
+// newTestStore returns a store bound to a private schema that lives exactly as
+// long as this test.
 //
-// A file (rather than :memory:) is used deliberately: WAL mode, the pragmas and
-// the migration runner all behave differently on an in-memory database, and the
-// whole point is to test what production runs.
+// It used to open a temp-file SQLite database. The replacement is the shared
+// PostgreSQL harness (internal/store/storetest), which creates a schema from the
+// embedded migrations and drops it at cleanup. See
+// .ai/decisions/2026-10-16-p2-test-strategy.md: a schema that lives for one test
+// cannot drift away from the migration files the way a long-lived test database
+// did on 2026-10-16, and it gives the concurrency tests a private table to count
+// in.
+//
+// These tests therefore need TEST_PG_DSN. Without it they SKIP, which is why the
+// gate is two-tier: scripts/check.sh may skip, scripts/test-pg.sh refuses to.
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "test.db")
-	db, err := Open(path)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return New(db)
+	return New(storetest.Pool(t, MigratePG))
 }
 
 func floatPtr(f float64) *float64 { return &f }
@@ -30,49 +30,6 @@ func floatPtr(f float64) *float64 { return &f }
 func intPtr(i int) *int { return &i }
 
 func boolPtr(b bool) *bool { return &b }
-
-// TestMigrateIsIdempotent verifies that opening the same database twice does not
-// re-run the migration or fail on existing objects.
-func TestMigrateIsIdempotent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "test.db")
-
-	db1, err := Open(path)
-	if err != nil {
-		t.Fatalf("first Open: %v", err)
-	}
-	db1.Close()
-
-	db2, err := Open(path)
-	if err != nil {
-		t.Fatalf("second Open (migrations must be idempotent): %v", err)
-	}
-	defer db2.Close()
-
-	var count int
-	if err := db2.QueryRow(`SELECT COUNT(*) FROM schema_migrations`).Scan(&count); err != nil {
-		t.Fatalf("count migrations: %v", err)
-	}
-	// Compare against the number of embedded migrations rather than a literal.
-	// The point of this test is "re-opening does not replay migrations", and a
-	// hardcoded count turns every future migration into a spurious failure here
-	// — which trains people to bump the number instead of reading the test.
-	entries, err := migrationFS.ReadDir("migrations")
-	if err != nil {
-		t.Fatalf("list embedded migrations: %v", err)
-	}
-	want := 0
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
-			want++
-		}
-	}
-	if want == 0 {
-		t.Fatal("no migrations are embedded; the embed directive is broken")
-	}
-	if count != want {
-		t.Errorf("recorded %d migrations, want %d (one per embedded file)", count, want)
-	}
-}
 
 // TestCreateReportCreatesShareToken checks the report+token transaction and the
 // expiry arithmetic.
@@ -408,15 +365,15 @@ func TestMetadataRoundTrip(t *testing.T) {
 	})
 }
 
-// TestMetadataMustBeValidJSON verifies the schema's json_valid CHECK is active,
-// which is what guarantees the decode path never sees garbage in practice.
+// TestMetadataMustBeValidJSON verifies the schema's JSON CHECK is active, which
+// is what guarantees the decode path never sees garbage in practice.
 func TestMetadataMustBeValidJSON(t *testing.T) {
 	s := newTestStore(t)
-	_, err := s.db.Exec(
+	_, err := s.Pool().Exec(callCtx,
 		`INSERT INTO reports (id, title, category, format, content, metadata, created_at, updated_at)
 		 VALUES ('x', 't', 'c', 'markdown', 'body', 'notjson', 1, 1)`)
 	if err == nil {
-		t.Fatal("expected the json_valid CHECK constraint to reject invalid JSON")
+		t.Fatal("expected the metadata IS JSON CHECK constraint to reject invalid JSON")
 	}
 }
 
@@ -429,12 +386,12 @@ func TestUpdatedAtTrigger(t *testing.T) {
 	}
 
 	// Force a stale updated_at, then touch the row.
-	if _, err := s.db.Exec(
-		`UPDATE reports SET updated_at = 1000 WHERE id = ?`, report.ID); err != nil {
+	if _, err := s.Pool().Exec(callCtx,
+		`UPDATE reports SET updated_at = 1000 WHERE id = $1`, report.ID); err != nil {
 		t.Fatalf("reset updated_at: %v", err)
 	}
-	if _, err := s.db.Exec(
-		`UPDATE reports SET title = 'changed' WHERE id = ?`, report.ID); err != nil {
+	if _, err := s.Pool().Exec(callCtx,
+		`UPDATE reports SET title = 'changed' WHERE id = $1`, report.ID); err != nil {
 		t.Fatalf("update title: %v", err)
 	}
 
@@ -489,14 +446,14 @@ func TestCleanupExpired(t *testing.T) {
 	}
 }
 
-// TestForeignKeyCascade confirms the pragma is on and the schema's cascade works.
+// TestForeignKeyCascade confirms the schema's cascade works.
 func TestForeignKeyCascade(t *testing.T) {
 	s := newTestStore(t)
 	report, _, err := s.CreateReport(domain.CreateReportInput{Title: "t", Content: "c"}, 0)
 	if err != nil {
 		t.Fatalf("CreateReport: %v", err)
 	}
-	if _, err := s.db.Exec(`DELETE FROM reports WHERE id = ?`, report.ID); err != nil {
+	if _, err := s.Pool().Exec(callCtx, `DELETE FROM reports WHERE id = $1`, report.ID); err != nil {
 		t.Fatalf("delete report: %v", err)
 	}
 	tokens, err := s.ListShareTokens(report.ID)
@@ -508,7 +465,12 @@ func TestForeignKeyCascade(t *testing.T) {
 	}
 }
 
-// TestConcurrentWrites exercises the WAL + busy_timeout configuration.
+// TestConcurrentWrites exercises concurrent report creation.
+//
+// Under SQLite this also covered the WAL + busy_timeout configuration, which is
+// where the "database is locked" storms came from. PostgreSQL needs no such
+// tuning; what remains is the property that matters — N concurrent writers all
+// succeed and all N rows land.
 func TestConcurrentWrites(t *testing.T) {
 	s := newTestStore(t)
 	const n = 20
@@ -538,6 +500,3 @@ func waitForNextMillisecond() {
 	for NowMS() == start {
 	}
 }
-
-var _ = sql.ErrNoRows
-var _ = intPtr

@@ -3,11 +3,14 @@ package store
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/zeroicey/teleport/backend/internal/agentkey"
 
 	"github.com/zeroicey/teleport/backend/internal/store/storetest"
 )
@@ -282,5 +285,131 @@ func TestPGCascadeAndView(t *testing.T) {
 	}
 	if left != 0 {
 		t.Errorf("%d share_tokens survived the report deletion; the cascade is not active", left)
+	}
+}
+
+// TestPGCountersAre64Bit is the guard for translation (5) in the baseline header:
+// every counter stays 64-bit.
+//
+// SQLite's INTEGER is 64-bit and PostgreSQL's is 32-bit, so typing a counter
+// INTEGER narrows it rather than translating it. That is a silent behaviour
+// change that only appears once the counter gets large — in production, as an
+// insert error on a popular link. It happened on this baseline's first pass:
+// share_tokens.view_count was INTEGER while agent_keys.request_count was BIGINT,
+// and it had to be widened back.
+//
+// So this asserts a value above 2^31 round-trips *and* can be incremented, for
+// both counters, rather than merely that the columns exist.
+func TestPGCountersAre64Bit(t *testing.T) {
+	pool := storetest.Pool(t, MigratePG)
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+	const big = int64(3_000_000_000) // above the int32 ceiling
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO reports (id, title, category, format, content, metadata, created_at, updated_at)
+		VALUES ('r1', 't', 'general', 'markdown', 'body', '{}', $1, $1)`, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO share_tokens (token, report_id, created_at, expires_at, is_active, view_count)
+		VALUES ('tok', 'r1', $1, 0, 1, $2)`, now, big); err != nil {
+		t.Fatalf("view_count above 2^31: %v (is it INTEGER instead of BIGINT?)", err)
+	}
+	// The increment is the hot path (RecordView), so it is what must not overflow.
+	if _, err := pool.Exec(ctx,
+		`UPDATE share_tokens SET view_count = view_count + 1 WHERE token = 'tok'`); err != nil {
+		t.Fatalf("incrementing view_count above 2^31: %v", err)
+	}
+	var views int64
+	if err := pool.QueryRow(ctx,
+		`SELECT view_count FROM share_tokens WHERE token = 'tok'`).Scan(&views); err != nil {
+		t.Fatal(err)
+	}
+	if views != big+1 {
+		t.Errorf("view_count round-tripped as %d, want %d", views, big+1)
+	}
+
+	// request_count is the other counter the Go code increments.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO agent_keys (id, name, token_hash, token_prefix, created_at, request_count)
+		VALUES ('k1', 'n', 'h1', 'p', $1, $2)`, now, big); err != nil {
+		t.Fatalf("request_count above 2^31: %v (is it INTEGER instead of BIGINT?)", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE agent_keys SET request_count = request_count + 1 WHERE id = 'k1'`); err != nil {
+		t.Fatalf("incrementing request_count above 2^31: %v", err)
+	}
+	var requests int64
+	if err := pool.QueryRow(ctx,
+		`SELECT request_count FROM agent_keys WHERE id = 'k1'`).Scan(&requests); err != nil {
+		t.Fatal(err)
+	}
+	if requests != big+1 {
+		t.Errorf("request_count round-tripped as %d, want %d", requests, big+1)
+	}
+}
+
+// TestOpenPGBoundsLockWaits is the guard for the two server-side timeouts OpenPG
+// sets, and it pins the behaviour rather than just the setting.
+//
+// The store runs every call on context.Background() (store.callCtx), so it carries
+// no deadline. Four write paths take a transaction-scoped advisory lock to make a
+// count-then-insert atomic, and pg_advisory_xact_lock waits forever by default —
+// so without lock_timeout one wedged holder would stop all credential issuance
+// with no error and no log line. "Hangs forever" must become "fails visibly".
+//
+// The DSN's own lock_timeout wins over the default, which is both why the
+// behavioural half below is fast and a property worth pinning: an operator must be
+// able to tighten it without editing code.
+func TestOpenPGBoundsLockWaits(t *testing.T) {
+	_, schema := storetest.Schema(t, MigratePG)
+	dsn := storetest.ScopedDSN(t, schema) + "&lock_timeout=250ms"
+
+	pool, err := OpenPG(callCtx, dsn, 2)
+	if err != nil {
+		t.Fatalf("OpenPG: %v", err)
+	}
+	defer pool.Close()
+
+	for _, tc := range []struct {
+		param string
+		want  []string
+	}{
+		// Explicit in the DSN, so the default must not have overwritten it.
+		{"lock_timeout", []string{"250ms"}},
+		// Not in the DSN, so this is OpenPG's default. PostgreSQL normalises the
+		// displayed form (60s comes back as "1min"), so both spellings count.
+		{"idle_in_transaction_session_timeout", []string{"60s", "1min"}},
+	} {
+		var got string
+		if err := pool.QueryRow(callCtx, `SHOW `+tc.param).Scan(&got); err != nil {
+			t.Fatalf("SHOW %s: %v", tc.param, err)
+		}
+		if !slices.Contains(tc.want, got) {
+			t.Errorf("%s = %q, want one of %v", tc.param, got, tc.want)
+		}
+	}
+
+	// The whole point: a held lock must fail, not block forever.
+	held := holdAdvisoryLock(t, pool, LockPendingApplications)
+	defer held.release()
+
+	start := time.Now()
+	_, err = New(pool).CreateApplication(ApplicationInput{
+		Label: "bounded", ClaimHash: agentkey.HashToken("h"), TTL: 60_000,
+	}, 50, NowMS())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("the application succeeded while the advisory lock was held")
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("the lock wait took %s: it is not bounded by lock_timeout", elapsed)
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Errorf("got %v (SQLSTATE %s), want a 55P03 lock timeout — a different error means "+
+			"the wait ended for another reason", err, sqlStateOf(err))
 	}
 }

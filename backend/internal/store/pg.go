@@ -49,13 +49,31 @@ const (
 	LockPendingRenewals int64 = advisoryLockNamespace<<32 | 3
 )
 
+// lockCap takes the transaction-scoped advisory lock that serialises one
+// count-then-write decision.
+//
+// It must be called in the same transaction as, and before, the count it guards:
+// the lock is released on commit or rollback, so the count and the write that
+// depends on it cannot be separated. Taking more than one advisory lock in one
+// transaction is deliberately avoided, so lock ordering can never deadlock.
+func lockCap(ctx context.Context, tx pgx.Tx, key int64) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, key); err != nil {
+		return fmt.Errorf("take advisory lock %d: %w", key, err)
+	}
+	return nil
+}
+
 // pgMigrationFS embeds the PostgreSQL migrations, so the deployed binary carries
 // its own schema and cannot run against a directory that has drifted from it.
 //
-// The directory is named `migrations_pg` rather than `migrations` only while the
-// SQLite implementation still exists: the two engines need different DDL, and
-// both must be readable during the transition. When the SQLite side is deleted
-// (rewrite stage P2), this becomes `migrations/`.
+// The `_pg` suffix is now historical — the SQLite side was deleted in P2, so
+// this is the only migrations directory — and is kept deliberately: the
+// decision record and the readable snapshot (`schema.pg.sql` at the repository
+// root) both use the same name, and renaming the directory would make the
+// records disagree with the code for no behavioural gain.
+//
+// The same directory is `schema:` in backend/sqlc.yaml, so the generated queries
+// and the server read one description of the schema.
 //
 //go:embed migrations_pg/*.sql
 var pgMigrationFS embed.FS
@@ -71,6 +89,35 @@ func OpenPG(ctx context.Context, dsn string, maxConns int32) (*pgxpool.Pool, err
 	}
 	cfg.MaxConnIdleTime = 5 * time.Minute
 	cfg.MaxConnLifetime = time.Hour
+
+	// Two server-side timeouts, because the store deliberately runs every call on
+	// context.Background() (see store.callCtx) and therefore carries no deadline:
+	//
+	//   - lock_timeout bounds a wait for a lock. Four write paths take a
+	//     transaction-scoped advisory lock to make a count-then-insert atomic, and
+	//     pg_advisory_xact_lock waits indefinitely by default. Without this, one
+	//     wedged holder would block every credential issuance forever, with no
+	//     error and no log line — the availability cliff of the mechanism that
+	//     replaced SQLite's single writer.
+	//   - idle_in_transaction_session_timeout kills a connection that is holding a
+	//     transaction open and doing nothing. That is how a leaked transaction
+	//     becomes a wedged lock holder, and it is also how one abandoned client can
+	//     pin a connection on an instance shared with other services.
+	//
+	// They are generous relative to this workload (the critical sections are single
+	// statements) and they convert "hangs forever" into "fails, visibly".
+	// statement_timeout is deliberately NOT set: a large report insert is
+	// legitimate work, and a lock wait is the only thing here known to be able to
+	// block without progress.
+	if cfg.ConnConfig.RuntimeParams == nil {
+		cfg.ConnConfig.RuntimeParams = map[string]string{}
+	}
+	if _, ok := cfg.ConnConfig.RuntimeParams["lock_timeout"]; !ok {
+		cfg.ConnConfig.RuntimeParams["lock_timeout"] = "10s"
+	}
+	if _, ok := cfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"]; !ok {
+		cfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "60s"
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

@@ -21,7 +21,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -77,28 +76,26 @@ func main() {
 	setupLogging(cfg.Environment)
 
 	if len(os.Args) > 1 && os.Args[1] == "migrate" {
-		if err := ensureParentDir(cfg.DBPath); err != nil {
-			fatal("prepare database directory", err)
-		}
-		db, err := store.Open(cfg.DBPath)
+		pool, err := store.OpenPG(context.Background(), cfg.DatabaseURL, int32(cfg.DBMaxConns))
 		if err != nil {
 			fatal("open database", err)
 		}
-		defer db.Close()
-		slog.Info("migrations up to date", "db", cfg.DBPath)
+		pool.Close()
+		// The DSN is deliberately not logged: it contains the database password
+		// and this line goes to journalctl, which is neither secret nor rotated.
+		slog.Info("migrations up to date")
 		return
 	}
 
-	if err := ensureParentDir(cfg.DBPath); err != nil {
-		fatal("prepare database directory", err)
-	}
-
-	db, err := store.Open(cfg.DBPath)
+	pool, err := store.OpenPG(context.Background(), cfg.DatabaseURL, int32(cfg.DBMaxConns))
 	if err != nil {
 		fatal("open database", err)
 	}
-	defer db.Close()
-	slog.Info("database ready", "path", cfg.DBPath)
+	// The store owns the pool, so it owns releasing it. main holds the store rather
+	// than the pool for that reason.
+	st := store.New(pool)
+	defer st.Close()
+	slog.Info("database ready")
 
 	// Warn about the one configuration mistake that silently weakens the
 	// deployment: a non-Secure cookie on a public HTTPS origin, or the reverse.
@@ -117,7 +114,7 @@ func main() {
 	// a runtime configuration.
 	httpx.WarnIfTrustingCFAccess()
 
-	handler, err := api.New(cfg, store.New(db))
+	handler, err := api.New(cfg, st)
 	if err != nil {
 		fatal("build http handler", err)
 	}
@@ -209,19 +206,7 @@ func setupLogging(environment string) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 }
 
-// ensureParentDir creates the directory holding the database file. The schema
-// itself is created by the migration runner.
-func ensureParentDir(dbPath string) error {
-	if dbPath == ":memory:" || strings.HasPrefix(dbPath, "file:") {
-		return nil
-	}
-	dir := filepath.Dir(dbPath)
-	if dir == "." || dir == "" {
-		return nil
-	}
-	return os.MkdirAll(dir, 0o750)
-}
-
+// fatal logs and exits.
 func fatal(msg string, err error) {
 	slog.Error(msg, "error", err)
 	os.Exit(1)

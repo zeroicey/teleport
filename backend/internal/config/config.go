@@ -54,8 +54,21 @@ type Config struct {
 	// Empty disables static serving entirely, which is what tests want.
 	StaticDir string
 
-	// DBPath is the SQLite file path (or ":memory:" for tests).
-	DBPath string
+	// DatabaseURL is the PostgreSQL connection string. It replaced DB_PATH when
+	// the store moved from SQLite to pgx (P2).
+	//
+	// It is required rather than defaulted: a wrong-but-present default would
+	// point the service at some other database, and the failure would surface as
+	// missing data rather than as a startup error. The value contains a password,
+	// so it is never logged — see the note in main.go.
+	DatabaseURL string
+	// DBMaxConns bounds this service's connection pool.
+	//
+	// The PostgreSQL instance is shared with clip, registry and serenique, whose
+	// max_connections is 100 for everyone together. A pool is therefore a slice
+	// of a shared budget, not the whole instance, and the bound is explicit for
+	// that reason.
+	DBMaxConns int
 
 	DefaultShareHours int
 	MaxContentBytes   int64
@@ -123,7 +136,7 @@ func Load() (*Config, error) {
 		Addr:              env("LISTEN_ADDR", "127.0.0.1:8788"),
 		RoutePrefix:       normalizePrefix(env("ROUTE_PREFIX", "/yeciorez/teleport")),
 		PublicBaseURL:     strings.TrimRight(env("PUBLIC_BASE_URL", "http://127.0.0.1:8788"), "/"),
-		DBPath:            env("DB_PATH", "./data/teleport.db"),
+		DatabaseURL:       os.Getenv("DATABASE_URL"),
 		Environment:       env("ENVIRONMENT", "development"),
 		AgentSecretKey:    os.Getenv("AGENT_SECRET_KEY"),
 		SessionSecret:     os.Getenv("SESSION_SECRET"),
@@ -158,6 +171,9 @@ func Load() (*Config, error) {
 	if cfg.PublicBaseURL == "" {
 		return nil, fmt.Errorf("PUBLIC_BASE_URL must not be empty")
 	}
+	if cfg.DatabaseURL == "" {
+		return nil, fmt.Errorf("DATABASE_URL is required (postgres://user:password@host:5432/teleport?sslmode=disable)")
+	}
 	if cfg.SessionSecret == "" {
 		return nil, fmt.Errorf("SESSION_SECRET is required (generate: openssl rand -base64 48)")
 	}
@@ -184,6 +200,9 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if cfg.SessionTTL, err = envDuration("SESSION_TTL", 12*time.Hour); err != nil {
+		return nil, err
+	}
+	if cfg.DBMaxConns, err = envInt("DB_MAX_CONNS", 8); err != nil {
 		return nil, err
 	}
 	if cfg.KeyApplyPerHour, err = envInt("KEY_APPLY_PER_HOUR", 5); err != nil {
@@ -214,6 +233,9 @@ func Load() (*Config, error) {
 	}
 	if cfg.KeyMaxActive <= 0 {
 		return nil, fmt.Errorf("KEY_MAX_ACTIVE must be positive (got %d)", cfg.KeyMaxActive)
+	}
+	if cfg.DBMaxConns <= 0 {
+		return nil, fmt.Errorf("DB_MAX_CONNS must be positive (got %d)", cfg.DBMaxConns)
 	}
 	if cfg.KeyApplicationTTL <= 0 {
 		return nil, fmt.Errorf("KEY_APPLICATION_TTL must be positive (got %s)", cfg.KeyApplicationTTL)

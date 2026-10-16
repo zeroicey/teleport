@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -1679,12 +1680,9 @@ func TestStringFieldsRejectInvisibleAndControl(t *testing.T) {
 // for a negative duration that would silently mean the opposite.
 func expireKey(t *testing.T, cfg *config.Config, keyID string, expiresAt int64) {
 	t.Helper()
-	db, err := store.Open(cfg.DBPath)
-	if err != nil {
-		t.Fatalf("open store for expiry edit: %v", err)
-	}
-	defer db.Close()
-	if _, err := db.Exec(`UPDATE agent_keys SET expires_at = ? WHERE id = ?`, expiresAt, keyID); err != nil {
+	pool := testStoreHandle(t, cfg)
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE agent_keys SET expires_at = $1 WHERE id = $2`, expiresAt, keyID); err != nil {
 		t.Fatalf("expire key %s: %v", keyID, err)
 	}
 }

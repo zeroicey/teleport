@@ -1,5 +1,16 @@
 # Architecture
 
+> ## ⚠️ 重写进行中（P2.3 已完成，P3–P6 未做）
+>
+> 正在从 `net/http + SQLite` 重写为 `Gin + pgx/sqlc + PostgreSQL`，**在野契约逐字节不变**。
+>
+> 当前工作树：**存储已切到 PostgreSQL**（`internal/store` 是 pgx + sqlc，`DATABASE_URL`
+> 取代 `DB_PATH`，SQLite 驱动 / `schema.sql` / `migrations/` 已删除）；**HTTP 层仍是**
+> `net/http`（Gin 是 P3）。线上仍是旧版且已停（502）。
+>
+> 本文档中标注「旧版」的条目描述的是 **P2.3 之前**或**尚未重写**的部分。
+> 权威清单见 `.ai/decisions/2026-10-16-rewrite-on-gin-and-postgres.md`。
+
 ## 1. Purpose
 
 Teleport 是**个人 AI 报告展示与时效分享**平台。AI 在终端/工作框里完成复杂工作（安全渗透、
@@ -17,8 +28,8 @@ Teleport 是**个人 AI 报告展示与时效分享**平台。AI 在终端/工�
 | Layer | Technology | Version | Why this one |
 | --- | --- | --- | --- |
 | 前端 | Vue 3 + Vite + pnpm | Vue 3.5 · Vite 8 | 用户明确要 Vue（否决了 SvelteKit/Astro/Next）；SPA 而已，不需要 SSR 框架 |
-| 后端 | Go（stdlib `net/http`，无 Web 框架） | go 1.26 | 单静态二进制、交叉编译、systemd 友好；`ServeMux` 的 `{param}` + `PathValue` 够用 |
-| 数据库 | SQLite via `modernc.org/sqlite` | 1.60.1 | 纯 Go 驱动，**无 cgo** → `CGO_ENABLED=0` 才能成立（见 §5.6） |
+| 后端 | Go（stdlib `net/http`，无 Web 框架；P3 换 Gin） | go 1.26 | 单静态二进制、交叉编译、systemd 友好；`ServeMux` 的 `{param}` + `PathValue` 够用 |
+| 数据库 | PostgreSQL via `pgx/v5` + `sqlc`（P2.3 之前是 `modernc.org/sqlite`） | pgx 5.11 · sqlc 1.31 | 与本机 clip/registry/serenique 同实例；时间列仍是 BIGINT epoch 毫秒；两条 SQL 均在 `queries/*.sql` 单一真源下生成 |
 | 渲染 | goldmark + Chroma | 1.8.6 / 2.27.0 | 服务端 Markdown 渲染；`html:false` 天然 XSS 安全 |
 | 托管 | systemd + Caddy（docker 容器） | — | 服务器 3.5 GiB 内存、**没有 docker compose**，只有 `docker run` |
 | 图表 | Mermaid（客户端懒加载） | 12.1.0 | 打包后 5.3 MB，绝不能进 Worker/二进制；只在分享页动态 import |
@@ -36,7 +47,10 @@ Teleport 是**个人 AI 报告展示与时效分享**平台。AI 在终端/工�
 | `backend/internal/api/` | 路由挂载与 handler，全部挂在 `cfg.RoutePrefix` 下 | config, store, views, markdown, aidoc |
 | `backend/internal/httpx/` | 中间件链、响应封套、Session HMAC、Bearer 常量时间比较 | 无 |
 | `backend/internal/password/` | PBKDF2-HMAC-SHA256 | 无 |
-| `backend/internal/store/` | 全部 SQL、内嵌迁移、UUID/token 生成 | sqlite |
+| `backend/internal/store/` | 全部 SQL、内嵌迁移、UUID/token 生成、advisory lock | postgres |
+| `backend/internal/store/queries/` | sqlc 查询源（`*.sql`）—— SQL 的唯一真源 | 无 |
+| `backend/internal/store/storedb/` | `sqlc generate` 产物，**勿手改** | 无 |
+| `backend/internal/store/storetest/` | 每测一个 schema 的 PG 夹具 | postgres |
 | `backend/internal/markdown/` | goldmark + Chroma 渲染器 | 无 |
 | `backend/internal/validate/` | 请求体校验（**复刻 JS 语义**，见 §5.4） | 无 |
 | `backend/internal/views/` | 分享页 HTML + CSP 常量 | 无 |
@@ -44,8 +58,8 @@ Teleport 是**个人 AI 报告展示与时效分享**平台。AI 在终端/工�
 | `backend/internal/aidoc/` | 给 AI 读的使用说明（`guide.md` + 占位符替换） | config, markdown |
 | `backend/internal/webui/` | `//go:embed dist/`，构建标签 `embed_frontend` 切换桩实现 | 无 |
 | `web/src/` | Vue 面板（登录/列表/详情）+ 分享页客户端入口 | api.ts 封套 |
-| `scripts/` | `build.sh`（发布构建）、`check-schema-sync.mjs` | — |
-| `schema.sql` | DDL 快照，与内嵌迁移逐字节一致（CI 校验） | — |
+| `scripts/` | `build.sh`（发布构建）、`check.sh`（闸门）、`check-sqlc-sync.sh`（`sqlc diff`）、`test-pg.sh`（真库闸门） | — |
+| `schema.pg.sql` | DDL 快照，由 `migrations_pg/` 生成，逐字节一致（闸门校验） | — |
 
 ## 4. Core topology
 
@@ -55,7 +69,7 @@ Teleport 是**个人 AI 报告展示与时效分享**平台。AI 在终端/工�
                   Caddy(:443, docker)  handle /yeciorez/teleport*   ← 保留前缀，不 strip
                         │
                         ▼
-                  Go(:8788, 仅监听 docker 网桥 172.17.0.1) ─> SQLite(WAL)
+                  Go(:8788, 仅监听 docker 网桥 172.17.0.1) ─> PostgreSQL（旧版线上：SQLite/WAL）
                         ├─ /api/*      JSON API（统一封套）
                         ├─ /s/{token}  服务端渲染分享页（严格 CSP）
                         ├─ /k/{id}     服务端渲染「一步交接」领取页（无 JS 时惰性）
@@ -101,15 +115,17 @@ Cookie 是**第一方**的（不受 Safari ITP / Chrome 第三方 Cookie 淘汰�
    代价与隔离开关见 `decisions/2026-10-11-html-report-rendering.md`。**Enforced**：
    `api/router_test.go` 的 `TestHTMLReportRendersVerbatim` / `TestShareHTMLLinkSemantics`
    + `aidoc` 的双向绊线。
-6. **零 cgo**：`modernc.org/sqlite` 是纯 Go；`store.go` 里的 `_ "modernc.org/sqlite"`
-   **空导入不能删**（删掉仍编译、仍过 vet，运行时才 `unknown driver`）。**Enforced**：
-   `CGO_ENABLED=0` 发布构建 + 见 §6。
+6. **零 cgo**：pgx 与（P2.3 之前的）`modernc.org/sqlite` 都是纯 Go，`CGO_ENABLED=0`
+   因此仍然成立。**旧版注意事项**：`_ "modernc.org/sqlite"` 空导入删掉后仍编译、仍过 vet，
+   运行时才 `unknown driver` —— 该驱动已于 P2.3 移除。**Enforced**：`CGO_ENABLED=0` 发布构建。
 7. **时间统一 epoch 毫秒**，`expires_at = 0` = 永不过期。
 8. **未知 `/api/*` 必须仍是 JSON**，不能退化成 SPA 的 HTML 404。**Enforced**：
    `TestUnknownRouteWithSPAStaysJSON`（删掉两个更具体的兜底就会失败）。
 9. **`_`-前缀与 `_TEMPLATE.md` 是惰性的**：模板与示例，不被 dump/sync 视为记忆条目。
-10. **schema 不漂移**：`schema.sql` 与 `backend/internal/store/migrations/` 由
-    `pnpm run db:check-schema` 强制一致。
+10. **schema 与生成物都不漂移**：`schema.pg.sql` 必须等于 `migrations_pg/*.sql` 的拼接
+    （`scripts/check.sh` 的 shell 比对，防 `go test` 缓存），`storedb/` 必须等于
+    `queries/*.sql`（`sqlc diff`）。迁移文件的内容 sha256 记在 `schema_migrations`，
+    不匹配则**拒绝启动**。
 11. **一次性凭据只走 fragment，且页面无 JS 时是惰性的**：`/k/{id}#<secret>` 的 secret
     永不进 query（会入访问日志）；页面的领取按钮默认 `hidden`，只有能读到 fragment 的
     浏览器才显示它。**Enforced**：`TestKeyHandoffLinkCarriesTheSecretOnlyInTheFragment`
@@ -126,8 +142,12 @@ Cookie 是**第一方**的（不受 Safari ITP / Chrome 第三方 Cookie 淘汰�
   是 Go handler 而不是 Vue 路由的原因。
 - **大陆可达性是硬约束**：`api.hcyj.xyz` 是唯一入口；CF 前端已全部下线（Worker 删除、
   DNS 记录移除）。若未来重加 CDN，必须先验证大陆可达性，且只能用**大陆观测点**。
-- **未做的**：`format:'html'`；`CleanupExpired` 未挂定时任务；无删除报告 API；无 SQLite
-  自动备份；无多用户（单管理员密码）。
+- **未做的**：`format:'html'`；`CleanupExpired` 未挂定时任务；无删除报告 API；无数据库
+  自动备份（旧版是 SQLite 文件，重写版是 PostgreSQL `teleport` 库）；无多用户（单管理员密码）。
+- **共享 PostgreSQL 实例**：重写版与本机 clip / registry / serenique **同实例独立库**，
+  `max_connections=100` 是所有人共用的预算 → 应用池与测试夹具都必须显式设小上限
+  （`DB_MAX_CONNS` 默认 8，storetest 每测 1+4）。见
+  `.ai/pitfalls/cases/2026-10-16-test-harness-exhausted-shared-postgres-connections.md`。
 - **共享主机风险**：`api.hcyj.xyz` 同时承载另一个服务（兜底反代 :3000），所以
   Cookie `Path` 必须是应用前缀而不是 `/`；站点级安全头必须排除本前缀（`@notTeleport`），
   否则与后端的更严格策略重复冲突。

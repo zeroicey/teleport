@@ -18,7 +18,7 @@ detector does not know your conventions. Correct anything that does not match th
 - Root: `/data/dev/teleport-gin`
 - Detected stack: `node`, `node >=20.0.0`, `typescript`, `vue`, `vite`
 - Top-level directories: `backend/`, `scripts/`, `web/`
-- npm scripts: `build`, `build:release`, `dev`, `dev:web`, `typecheck`, `backend:build`, `backend:hash-password`, `backend:test`, `backend:vet`, `check`, `db:check-schema`
+- npm scripts: `build`, `build:release`, `dev`, `dev:web`, `typecheck`, `db:gen-sqlc`, `backend:build`, `backend:hash-password`, `backend:test`, `backend:test-pg`, `backend:vet`, `check`
 - Git repository: yes
 - No AI rule file exists yet: create them.
 

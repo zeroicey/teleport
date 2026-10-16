@@ -132,11 +132,13 @@ func TestUpdateReportReportsMissingRow(t *testing.T) {
 
 // TestDeleteReportRemovesItsShareTokens is the cascade guard at the store layer.
 //
-// SQLite enforces ON DELETE CASCADE only when foreign_keys is on, and it is off
-// by default — so the pragma in Open() is the single thing standing between a
-// clean delete and permanently orphaned token rows. Checking the tokens
-// directly, rather than inferring from a lookup that joins through reports, is
-// what makes an orphan visible.
+// PostgreSQL always enforces foreign keys, so the cascade is unconditional here —
+// the schema declares it and nothing can switch it off. (Under SQLite this was
+// configuration: the cascade was dead code unless the connection set
+// foreign_keys(1), and that pragma was the only thing standing between a clean
+// delete and permanently orphaned token rows.) Checking the tokens directly,
+// rather than inferring from a lookup that joins through reports, is what makes
+// an orphan visible either way.
 func TestDeleteReportRemovesItsShareTokens(t *testing.T) {
 	s := newTestStore(t)
 	report := seedReport(t, s, "cascade")
@@ -155,12 +157,15 @@ func TestDeleteReportRemovesItsShareTokens(t *testing.T) {
 	}
 
 	var orphans int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM share_tokens WHERE report_id = ?`, report.ID).Scan(&orphans); err != nil {
+	if err := s.Pool().QueryRow(callCtx, `SELECT COUNT(*) FROM share_tokens WHERE report_id = $1`, report.ID).Scan(&orphans); err != nil {
 		t.Fatalf("count orphans: %v", err)
 	}
+	// The foreign key is now unconditional (PostgreSQL always enforces it), so
+	// the only way this can fail is the cascade itself being dropped from the
+	// schema.
 	if orphans != 0 {
 		t.Errorf("orphaned share tokens = %d, want 0: ON DELETE CASCADE did not fire, "+
-			"so foreign_keys(1) is missing from the DSN", orphans)
+			"so the cascade is missing from share_tokens.report_id", orphans)
 	}
 
 	if again, err := s.DeleteReport(report.ID); err != nil || again {

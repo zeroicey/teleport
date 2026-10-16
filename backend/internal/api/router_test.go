@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,9 +11,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/zeroicey/teleport/backend/internal/config"
 	"github.com/zeroicey/teleport/backend/internal/password"
 	"github.com/zeroicey/teleport/backend/internal/store"
+	"github.com/zeroicey/teleport/backend/internal/store/storetest"
 	"github.com/zeroicey/teleport/backend/internal/views"
 )
 
@@ -49,13 +53,22 @@ func testServerWith(t *testing.T, mutate func(*config.Config)) (http.Handler, *c
 		t.Fatalf("hash password: %v", err)
 	}
 
+	// The store now lives in PostgreSQL, so the fixture's database is a private
+	// schema created from the embedded migrations by the shared harness (see
+	// .ai/decisions/2026-10-16-p2-test-strategy.md). cfg.DatabaseURL is the
+	// scoped DSN — the test's own schema — so helpers that need a second handle
+	// onto the same rows can open one, exactly as they used to reopen the temp
+	// SQLite file through cfg.DBPath.
+	pool, schema := storetest.Schema(t, store.MigratePG)
+
 	cfg := &config.Config{
 		Addr:              "127.0.0.1:0",
 		RoutePrefix:       testPrefix,
 		PublicBaseURL:     testPublicOrigin,
 		AssetBaseURL:      testPublicOrigin + testPrefix,
 		FrontendOrigins:   []string{testPublicOrigin},
-		DBPath:            filepath.Join(t.TempDir(), "test.db"),
+		DatabaseURL:       storetest.ScopedDSN(t, schema),
+		DBMaxConns:        4,
 		DefaultShareHours: 168,
 		MaxContentBytes:   1 << 20,
 		AgentSecretKey:    testAgentSecret,
@@ -81,17 +94,36 @@ func testServerWith(t *testing.T, mutate func(*config.Config)) (http.Handler, *c
 		mutate(cfg)
 	}
 
-	db, err := store.Open(cfg.DBPath)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-
-	handler, err := New(cfg, store.New(db))
+	handler, err := New(cfg, store.New(pool))
 	if err != nil {
 		t.Fatalf("build handler: %v", err)
 	}
 	return handler, cfg
+}
+
+// testStoreHandle opens a second handle onto the test's own database.
+//
+// Several tests must look at rows the HTTP handler wrote without going through
+// the API — to prove that a refused request wrote nothing, or to age a row the
+// API cannot age. Before the port they reopened the temp SQLite file via
+// cfg.DBPath; cfg.DatabaseURL is the same idea with a safer identifier, because
+// its search_path names this test's private schema and nothing else.
+//
+// The budget is one connection. This instance is shared with other services, and
+// these handles are opened per helper call rather than per test.
+func testStoreHandle(t *testing.T, cfg *config.Config) *pgxpool.Pool {
+	t.Helper()
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		t.Fatalf("parse test DSN: %v", err)
+	}
+	poolCfg.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(context.Background(), poolCfg)
+	if err != nil {
+		t.Fatalf("open test store handle: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
 }
 
 // do issues a request against the handler.
@@ -994,21 +1026,13 @@ func testServerWithFrontend(t *testing.T) (http.Handler, *config.Config) {
 		t.Fatalf("write asset: %v", err)
 	}
 
-	h, cfg := testServer(t)
-	_ = h
-
-	cfg.StaticDir = dir
-	db, err := store.Open(filepath.Join(t.TempDir(), "frontend.db"))
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-
-	handler, err := New(cfg, store.New(db))
-	if err != nil {
-		t.Fatalf("build handler with frontend: %v", err)
-	}
-	return handler, cfg
+	// StaticDir is read once, in New, so the fixture must set it before the
+	// handler is built. testServerWith's mutate hook is exactly that: the same
+	// server as testServer, with the SPA directory already in place. This used to
+	// build a second handler over a second throwaway database, which the port
+	// removes: cfg already carries this test's scoped DSN, so there is one
+	// database and one handler.
+	return testServerWith(t, func(cfg *config.Config) { cfg.StaticDir = dir })
 }
 
 // TestMethodNotAllowed checks that a wrong verb on a known path is neither

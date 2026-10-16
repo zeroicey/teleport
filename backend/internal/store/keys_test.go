@@ -3,10 +3,11 @@ package store
 import (
 	"errors"
 	"math"
-	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/zeroicey/teleport/backend/internal/agentkey"
 	"github.com/zeroicey/teleport/backend/internal/domain"
@@ -72,7 +73,7 @@ func TestApplicationApprovalAndClaim(t *testing.T) {
 	}
 
 	var stored string
-	if err := s.DB().QueryRow(`SELECT token_hash FROM agent_keys WHERE id = ?`, key.ID).Scan(&stored); err != nil {
+	if err := s.Pool().QueryRow(callCtx, `SELECT token_hash FROM agent_keys WHERE id = $1`, key.ID).Scan(&stored); err != nil {
 		t.Fatalf("read token_hash: %v", err)
 	}
 	if stored == token {
@@ -102,8 +103,20 @@ func TestNoPlaintextCollected(t *testing.T) {
 		t.Fatalf("CreateManualKey: %v", err)
 	}
 
-	// Dump every text column of every table and look for the two live secrets.
-	rows, err := s.DB().Query(`SELECT name FROM sqlite_master WHERE type='table'`)
+	// Dump every column of every table in this test's schema and look for the two
+	// live secrets.
+	//
+	// This is the mechanism behind a FROZEN contract — a plaintext secret never
+	// reaches storage — and it is the one place the port had to change *how* the
+	// property is checked rather than only which dialect the check is written in:
+	// SQLite enumerates its tables through sqlite_master, PostgreSQL through
+	// information_schema. The property asserted is unchanged, and deliberately
+	// left blunt (every column of every table, whatever its type) so a new column
+	// that leaks a secret is caught without anyone remembering to add it here.
+	rows, err := s.Pool().Query(callCtx, `
+		SELECT table_name FROM information_schema.tables
+		 WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'
+		 ORDER BY table_name`)
 	if err != nil {
 		t.Fatalf("list tables: %v", err)
 	}
@@ -111,34 +124,40 @@ func TestNoPlaintextCollected(t *testing.T) {
 	for rows.Next() {
 		var n string
 		if err := rows.Scan(&n); err != nil {
+			rows.Close()
 			t.Fatal(err)
 		}
 		tables = append(tables, n)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("list tables: %v", err)
+	}
+	if len(tables) == 0 {
+		t.Fatal("no tables in this test's schema; the search_path did not take effect, " +
+			"so this test would silently check nothing")
+	}
 
 	for _, table := range tables {
-		cols, err := s.DB().Query(`SELECT * FROM ` + table)
+		// Identifier quoting, so a table name can never be read as SQL.
+		cols, err := s.Pool().Query(callCtx, `SELECT * FROM `+pgx.Identifier{table}.Sanitize())
 		if err != nil {
-			continue // virtual/system table with no scannable columns
+			continue // a table with no scannable columns
 		}
-		names, _ := cols.Columns()
+		names := cols.FieldDescriptions()
 		for cols.Next() {
-			vals := make([]any, len(names))
-			ptrs := make([]any, len(names))
-			for i := range vals {
-				ptrs[i] = &vals[i]
-			}
-			if err := cols.Scan(ptrs...); err != nil {
+			vals, err := cols.Values()
+			if err != nil {
 				continue
 			}
 			for i, v := range vals {
-				s, ok := v.(string)
+				text, ok := v.(string)
 				if !ok {
 					continue
 				}
-				if s == token || s == manualToken || s == claim {
-					t.Fatalf("%s.%s holds a plaintext secret", table, names[i])
+				if text == token || text == manualToken || text == claim {
+					cols.Close()
+					t.Fatalf("%s.%s holds a plaintext secret", table, names[i].Name)
 				}
 			}
 		}
@@ -224,7 +243,7 @@ func TestConcurrentClaimHasExactlyOneWinner(t *testing.T) {
 	// And exactly one key row exists, so a losing goroutine cannot have leaked a
 	// half-created credential.
 	var count int
-	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM agent_keys`).Scan(&count); err != nil {
+	if err := s.Pool().QueryRow(callCtx, `SELECT COUNT(*) FROM agent_keys`).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	if count != 1 {
@@ -742,7 +761,7 @@ func TestConcurrentClaimsRespectActiveCap(t *testing.T) {
 		}
 	}
 	var active int
-	if err := s.DB().QueryRow(
+	if err := s.Pool().QueryRow(callCtx,
 		`SELECT COUNT(*) FROM agent_keys WHERE revoked_at = 0`).Scan(&active); err != nil {
 		t.Fatal(err)
 	}
@@ -805,7 +824,7 @@ func TestConcurrentApplicationsRespectPendingCap(t *testing.T) {
 			"(a raw error here becomes a 500 in production)", err)
 	}
 	var stored int
-	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM key_applications`).Scan(&stored); err != nil {
+	if err := s.Pool().QueryRow(callCtx, `SELECT COUNT(*) FROM key_applications`).Scan(&stored); err != nil {
 		t.Fatal(err)
 	}
 	if stored != cap {
@@ -911,25 +930,37 @@ func TestRenewalOnlyExtends(t *testing.T) {
 	})
 }
 
-// TestConcurrentWritesDoNotSurfaceSQLiteBusy is the guard for a bug that a
+// TestConcurrentWritesDoNotSurfaceRawDriverErrors pins the property that a
 // weaker version of TestConcurrentApplicationsRespectPendingCap could not see.
 //
 // With a small pending cap, most concurrent applicants are rejected at the
-// SELECT COUNT step and never reach their INSERT — so they never perform the
-// read→write snapshot upgrade that SQLite can refuse with SQLITE_BUSY_SNAPSHOT
-// (517). A cap large enough that every goroutine reaches the write is what
+// COUNT step and never reach their INSERT — so the write path is barely
+// exercised. A cap large enough that every goroutine reaches the write is what
 // exposes it, and that is exactly the configuration an attacker would use.
 //
-// Measured before _txlock=immediate: 226 of 360 attempts failed (139x
-// "database is locked (5)", 87x "(517)"). busy_timeout does not help, because a
-// stale snapshot is not a lock wait. This test would have caught it.
-func TestConcurrentWritesDoNotSurfaceSQLiteBusy(t *testing.T) {
+// Under SQLite this test caught a real bug: the read→write snapshot upgrade
+// failed with SQLITE_BUSY_SNAPSHOT (measured 226 of 360 attempts failing). That
+// specific failure is historical now, but the property is not — a concurrent
+// write must never surface a raw driver error, because the API maps typed
+// sentinels to status codes and anything else becomes a 500. On PostgreSQL the
+// equivalent risks are a serialization failure or a deadlock, and the advisory
+// lock that replaced SQLite's single writer must not introduce one.
+//
+// It reuses ONE store and truncates between rounds, rather than calling
+// newTestStore per round. That is not style: a store's pool holds its
+// connections until the *test* ends, this PostgreSQL instance is shared with
+// other services, and opening a pool per round is how a test starves them. See
+// .ai/pitfalls/cases/2026-10-16-test-harness-exhausted-shared-postgres-connections.md.
+func TestConcurrentWritesDoNotSurfaceRawDriverErrors(t *testing.T) {
 	const (
 		goroutines = 24
 		rounds     = 10
 	)
+	s := newTestStore(t)
 	for round := 0; round < rounds; round++ {
-		s := newTestStore(t)
+		if _, err := s.Pool().Exec(callCtx, `TRUNCATE key_applications`); err != nil {
+			t.Fatalf("round %d: truncate: %v", round, err)
+		}
 
 		var mu sync.Mutex
 		problems := []string{}
@@ -962,18 +993,21 @@ func TestConcurrentWritesDoNotSurfaceSQLiteBusy(t *testing.T) {
 	}
 }
 
-// TestConcurrentWritesNeverLeakSQLiteText asserts the raw driver text never
-// reaches a caller: a BUSY that still slipped through (a writer holding the lock
-// longer than busy_timeout) must be a typed error a handler can map to 503, not
-// an opaque string that becomes a 500.
-func TestConcurrentWritesNeverLeakSQLiteText(t *testing.T) {
+// TestConcurrentWritesNeverLeakDriverText asserts the raw driver text never
+// reaches a caller.
+//
+// Under SQLite a BUSY that outlasted busy_timeout had to be a typed error a
+// handler could map to 503, not an opaque string that becomes a 500, and this
+// test looked for "SQLITE_BUSY" / "database is locked" in the message. Those
+// strings cannot appear now, so the check is on the property the message search
+// was standing in for: a sequential write must simply not fail at all. If it
+// ever does, the failure is an error the API has no typed mapping for — which is
+// exactly the 500 this guards.
+func TestConcurrentWritesNeverLeakDriverText(t *testing.T) {
 	s := newTestStore(t)
 	for i := 0; i < 200; i++ {
 		if _, err := s.CreateApplication(ApplicationInput{Label: "x"}, 1000, NowMS()); err != nil {
-			if strings.Contains(err.Error(), "SQLITE_BUSY") ||
-				strings.Contains(err.Error(), "database is locked") {
-				t.Fatalf("raw sqlite text leaked to caller: %v", err)
-			}
+			t.Fatalf("sequential write %d failed with an unmapped error: %v", i, err)
 		}
 	}
 }
@@ -981,7 +1015,7 @@ func TestConcurrentWritesNeverLeakSQLiteText(t *testing.T) {
 func countApplications(t *testing.T, s *Store) int {
 	t.Helper()
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM key_applications`).Scan(&n); err != nil {
+	if err := s.Pool().QueryRow(callCtx, `SELECT COUNT(*) FROM key_applications`).Scan(&n); err != nil {
 		t.Fatalf("count applications: %v", err)
 	}
 	return n
@@ -1014,8 +1048,8 @@ func TestClaimPreservesDecidedAt(t *testing.T) {
 
 	var storedDecided int64
 	var keyID string
-	if err := s.db.QueryRow(
-		`SELECT decided_at, issued_key_id FROM key_applications WHERE id = ?`, app.ID,
+	if err := s.Pool().QueryRow(callCtx,
+		`SELECT decided_at, issued_key_id FROM key_applications WHERE id = $1`, app.ID,
 	).Scan(&storedDecided, &keyID); err != nil {
 		t.Fatal(err)
 	}
@@ -1025,7 +1059,7 @@ func TestClaimPreservesDecidedAt(t *testing.T) {
 
 	// The claim time must still be recoverable — from the key it created.
 	var keyCreatedAt int64
-	if err := s.db.QueryRow(`SELECT created_at FROM agent_keys WHERE id = ?`, key.ID).Scan(&keyCreatedAt); err != nil {
+	if err := s.Pool().QueryRow(callCtx, `SELECT created_at FROM agent_keys WHERE id = $1`, key.ID).Scan(&keyCreatedAt); err != nil {
 		t.Fatal(err)
 	}
 	if keyCreatedAt != claimedAt {

@@ -23,11 +23,18 @@ import (
 // stop accepting such claims on faith. So this file first *demonstrates* the
 // hazard deterministically, then validates the lock that will replace it.
 //
-// They deliberately drive raw SQL rather than store methods: internal/store is
-// still the SQLite implementation at this stage, so the store cannot be the
-// subject yet. What is pinned here is the *pattern* the ported store must use,
-// keyed on the exported Lock* constants in pg.go — the same constants
-// CreateApplication and friends will pass to pg_advisory_xact_lock.
+// They deliberately drive raw SQL rather than store methods, because what they pin
+// is the *pattern*, keyed on the exported Lock* constants in pg.go — the same
+// constants CreateApplication and friends pass to pg_advisory_xact_lock. The
+// store's own use of those locks is guarded separately and deterministically in
+// lock_guard_pg_test.go: while another transaction holds a lock, the store method
+// that must take it has to block. These two files answer different questions, and
+// "the store takes the lock" is the one neither this file nor the statistical
+// concurrency tests could answer — a deleted lockCap call was measured to slip
+// past the statistical tests most of the time.
+//
+// (This comment used to say the store was still the SQLite implementation, so it
+// could not be the subject yet. That stopped being true when P2.3 landed.)
 
 const (
 	// countPendingApplicationsSQL is the exact predicate CreateApplication uses

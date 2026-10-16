@@ -1,0 +1,32 @@
+---
+version: "2"
+sql:
+  - engine: "postgresql"
+    # The migrations ARE the schema: sqlc reads the same files the server
+    # applies at startup, so a query that type-checks here cannot be checking
+    # against a schema that differs from the one that will run. The migration
+    # directory is also what the binary embeds (see pg.go), so there is exactly
+    # one description of the schema and both the generator and the server read
+    # it.
+    schema: "internal/store/migrations_pg"
+    queries: "internal/store/queries"
+    gen:
+      go:
+        package: "storedb"
+        out: "internal/store/storedb"
+        sql_package: "pgx/v5"
+        emit_json_tags: false
+        emit_prepared_queries: false
+        emit_empty_slices: true
+        # Pointers, not pgtype wrappers, for nullable values. This is a
+        # deliberate difference from clip's config: teleport's three PATCH
+        # queries take `sqlc.narg` parameters, and a nil pointer is exactly the
+        # "field absent" the store's frozen patch types (*string, *int64, ...)
+        # already carry. With pgtype.Text the store would have to translate
+        # twice, and the translation is where a nil/zero distinction gets lost.
+        #
+        # This is not about columns: every column here is NOT NULL, so the flag
+        # would not change a model field. It only affects parameters — plus the
+        # one generated view row (VLiveShare.NotExpired is *bool, because a view
+        # expression can be null), which nothing uses.
+        emit_pointers_for_null_types: true
