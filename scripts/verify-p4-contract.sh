@@ -37,6 +37,33 @@ trap 'rm -f "$JAR"' EXIT
 REQ_EXTRA=()
 pass=0
 fail=0
+# grep_q / grep_qF / grep_qE — grep a large string for a pattern WITHOUT a pipe.
+#
+# `printf '%s' "$BIG" | grep -q PATTERN` is a trap under `set -o pipefail`: grep -q
+# exits at the FIRST match, the writer then takes SIGPIPE, and the pipeline's status
+# becomes non-zero even though the pattern matched. Measured during the P6 cut-over:
+# the AI guide contained its base URL 13 times and the check still reported FAIL,
+# intermittently (~1 run in 10), because whether the writer is still flushing when
+# the reader exits depends on timing. The pipe buffer is 4 KB and the guide is 39 KB.
+#
+# It is worse in the other direction: for a check phrased "must NOT contain X", the
+# same SIGPIPE makes the pipeline non-zero exactly when X IS present, so the check
+# silently PASSES. Those are the XSS and placeholder-leak checks.
+#
+# Handing grep a FILE removes the race: the reader never closes the writer's pipe.
+grep_q() { # <text> <pattern> [grep flags...]
+  local text="$1" pattern="$2"; shift 2
+  local f rc
+  f="$(mktemp)" || return 2
+  printf '%s' "$text" > "$f"
+  grep -q "$@" -- "$pattern" "$f"
+  rc=$?
+  rm -f "$f"
+  return $rc
+}
+grep_qF() { local t="$1" p="$2"; grep_q "$t" "$p" -F; }
+grep_qE() { local t="$1" p="$2"; grep_q "$t" "$p" -E; }
+
 check() { # name, ok(0=pass), detail
   if [ "$2" = "0" ]; then
     printf 'PASS  %s\n' "$1"; pass=$((pass + 1))
@@ -136,7 +163,7 @@ else
   # the root of api.hcyj.xyz, which is a different service.
   req GET "$BASE/yeciorez/teleport/api/health" ""
   check "the OLD prefix is not serving the API (no JSON envelope)" \
-    "$([ "$CODE" = 200 ] && printf '%s' "$BODY" | grep -q '"ok":true' && echo 1 || echo 0)" \
+    "$([ "$CODE" = 200 ] && grep_qF "$BODY" '"ok":true' && echo 1 || echo 0)" \
     "got $CODE ${BODY:0:60}"
 fi
 
@@ -146,7 +173,7 @@ check "an unauthenticated call is 401 with {ok:false,error:{code,message},reques
 
 req GET "$API/api/definitely-not-a-route" "$AGENT_H"
 check "an unknown /api/* path is still JSON, not the SPA's HTML" \
-  "$([ "$CODE" = 404 ] && printf '%s' "$BODY" | grep -q '"ok"' && echo 0 || echo 1)" "got $CODE ${BODY:0:80}"
+  "$([ "$CODE" = 404 ] && grep_qF "$BODY" '"ok"' && echo 0 || echo 1)" "got $CODE ${BODY:0:80}"
 
 echo
 echo "==> 2. create a report with a real credential (request camelCase -> response snake_case)"
@@ -178,15 +205,15 @@ echo
 echo "==> 3. markdown never renders raw HTML"
 PAGE=$(curl -sS "$API/s/$TOK")
 check "the share page contains no live <script>alert(1)</script>" \
-  "$(printf '%s' "$PAGE" | grep -q '<script>alert(1)</script>' && echo 1 || echo 0)"
+  "$(grep_qF "$PAGE" '<script>alert(1)</script>' && echo 1 || echo 0)"
 # The contract is that raw HTML is never rendered — not that any particular
 # placeholder appears. The frozen markdown tests assert exactly this way (they ban
 # `<script>` and the payload); the renderer is custom, so its placeholder text is an
 # implementation detail and asserting it would pin the wrong thing.
 check "the injected payload is not emitted as markup" \
-  "$(printf '%s' "$PAGE" | grep -qE '<[^>]*alert\(1\)' && echo 1 || echo 0)"
+  "$(grep_qE "$PAGE" '<[^>]*alert\(1\)' && echo 1 || echo 0)"
 check "the report's own markdown content IS rendered" \
-  "$(printf '%s' "$PAGE" | grep -q 'hello' && echo 0 || echo 1)"
+  "$(grep_qF "$PAGE" 'hello' && echo 0 || echo 1)"
 
 echo
 echo "==> 4. dashboard session, and link semantics (unknown 404 / revoked 404 / expired 410)"
@@ -243,10 +270,10 @@ check "the owner's report survived all three attempts" \
   "$([ "$CODE" = 200 ] && [ "$(jget "$BODY" 'd["data"]["title"]')" = "$STAMP patched" ] && echo 0 || echo 1)" "got $CODE $(jget "$BODY" 'd["data"]["title"]')"
 req GET "$API/api/reports" "$OTHER_H"
 check "the other key's listing does not leak the first key's report" \
-  "$(printf '%s' "$BODY" | grep -q "$RID" && echo 1 || echo 0)" "listing=${BODY:0:120}"
+  "$(grep_qF "$BODY" "$RID" && echo 1 || echo 0)" "listing=${BODY:0:120}"
 req GET "$API/api/reports" "$AGENT_H"
 check "root's own listing DOES contain it" \
-  "$(printf '%s' "$BODY" | grep -q "$RID" && echo 0 || echo 1)"
+  "$(grep_qF "$BODY" "$RID" && echo 0 || echo 1)"
 req GET "$API/api/reports" ""
 check "the listing without a credential is 401, not an empty list" \
   "$([ "$CODE" = 401 ] && echo 0 || echo 1)" "got $CODE"
@@ -273,13 +300,13 @@ HID=$(jget "$BODY" 'd["data"]["id"]')
 HSECRET=$(jget "$BODY" 'd["data"]["claim_secret"]')
 HURL=$(jget "$BODY" 'd["data"]["url"]')
 check "the hand-off link carries the secret in the fragment" \
-  "$(printf '%s' "$HURL" | grep -q "k/$HID#" && echo 0 || echo 1)" "got $HURL"
+  "$(grep_qF "$HURL" "k/$HID#" && echo 0 || echo 1)" "got $HURL"
 check "the hand-off URL has no query string (a fragment never reaches the server)" \
-  "$(printf '%s' "$HURL" | grep -q '?' && echo 1 || echo 0)" "got $HURL"
+  "$(grep_qF "$HURL" '?' && echo 1 || echo 0)" "got $HURL"
 
 PAGE=$(curl -sS "$API/k/$HID")
 check "the hand-off page's claim button is hidden without JavaScript" \
-  "$(printf '%s' "$PAGE" | grep -q 'hidden' && echo 0 || echo 1)"
+  "$(grep_qF "$PAGE" 'hidden' && echo 0 || echo 1)"
 
 CLAIM_H="X-Teleport-Claim: $HSECRET"
 
@@ -314,7 +341,7 @@ req GET "$API/api/agent-keys/me" "Authorization: Bearer $CLAIMED"
 check "the claimed token authenticates against the agent API" \
   "$([ "$CODE" = 200 ] && echo 0 || echo 1)" "got $CODE $BODY"
 check "the key is reported with a prefix, never the full token" \
-  "$(printf '%s' "$BODY" | grep -q "$CLAIMED" && echo 1 || echo 0)"
+  "$(grep_qF "$BODY" "$CLAIMED" && echo 1 || echo 0)"
 
 # Second attempt: the credential is single-use, and the refusal is folded into 404 so
 # it cannot confirm that the id exists.
@@ -349,14 +376,30 @@ for path in /ai /ai.md /llms.txt; do
 done
 GUIDE=$(curl -sS "$API/ai.md")
 check "the guide's placeholders are all substituted (no '{{' left)" \
-  "$(printf '%s' "$GUIDE" | grep -q '{{' && echo 1 || echo 0)" "left=$(printf '%s' "$GUIDE" | grep -o '{{[A-Z_]*}}' | head -3 | tr '\n' ' ')"
+  "$(grep_qF "$GUIDE" '{{' && echo 1 || echo 0)" "left=$(grep -o -m3 '{{[A-Z_]*}}' "$GUIDE_FILE" 2>/dev/null | tr '\n' ' ')"
+# The guide is ~39 KB. It goes to a file once and every read is a FILE read: see
+# the grep_q helper for why piping a large body into `grep -q` is a pipefail trap.
+GUIDE_FILE="$(mktemp)"; printf '%s' "$GUIDE" > "$GUIDE_FILE"
+GUIDE_OK="$(grep_qF "$GUIDE" "$API" && echo 0 || echo 1)"
 check "the guide states the live base URL (AppBaseURL = origin + prefix)" \
-  "$(printf '%s' "$GUIDE" | grep -qF "$API" && echo 0 || echo 1)" "len=${#GUIDE} want=$API"
+  "$GUIDE_OK" "len=${#GUIDE} want=$API"
+if [ "$GUIDE_OK" != 0 ]; then
+  # Keep the evidence: this check failed intermittently during the P6 cut-over and
+  # the body was not retained, which left the cause undecidable. A check that
+  # reports a failure must leave the input that produced it.
+  mkdir -p bin/e2e 2>/dev/null || true
+  cp "$GUIDE_FILE" bin/e2e/guide-failed.md 2>/dev/null || true
+  echo "  (saved the failing body to bin/e2e/guide-failed.md)"
+fi
 
 SHELL_HTML=$(curl -sS "$API/")
+SHELL_HTML_FILE="$(mktemp)"; printf '%s' "$SHELL_HTML" > "$SHELL_HTML_FILE"
 check "the prefix root serves the SPA shell (not an API 404)" \
-  "$(printf '%s' "$SHELL_HTML" | grep -qE "$APP_ID_RE" && echo 0 || echo 1)" "${SHELL_HTML:0:80}"
-ASSET=$(printf '%s' "$SHELL_HTML" | grep -oE "$P/assets/[A-Za-z0-9._-]+\.js" | head -1)
+  "$(grep_qE "$SHELL_HTML" "$APP_ID_RE" && echo 0 || echo 1)" "${SHELL_HTML:0:80}"
+# -m1 rather than `| head -1`: head closing the pipe early sends SIGPIPE upstream and
+# pipefail then reports the substitution as failed, which would extract an EMPTY
+# asset URL and make the next check test an empty string instead of the asset.
+ASSET=$(grep -oE -m1 "$P/assets/[A-Za-z0-9._-]+\.js" "$SHELL_HTML_FILE" || true)
 check "the shell references a hashed asset under the prefix" "$([ -n "$ASSET" ] && echo 0 || echo 1)" "got '$ASSET'"
 if [ -n "$ASSET" ]; then
   req GET "$BASE$ASSET" ""
@@ -367,12 +410,19 @@ fi
 # header, and it is the header that constrains the iframe the page embeds.
 CSPHEAD=$(curl -sSI "$API/s/$HTOK" | tr -d '\r' | awk 'tolower($1)=="content-security-policy:"{ sub(/^[^:]*: /,""); print }')
 check "the share page carries a deny-by-default CSP" \
-  "$(printf '%s' "$CSPHEAD" | grep -q "default-src 'none'" && echo 0 || echo 1)" "got '$CSPHEAD'"
+  "$(grep_qF "$CSPHEAD" "default-src 'none'" && echo 0 || echo 1)" "got '$CSPHEAD'"
 check "the CSP allows only same-origin frames and scripts" \
-  "$(printf '%s' "$CSPHEAD" | grep -q "frame-src 'self'" && printf '%s' "$CSPHEAD" | grep -q "script-src 'self'" && echo 0 || echo 1)" "got '$CSPHEAD'"
+  "$(grep_qF "$CSPHEAD" "frame-src 'self'" && grep_qF "$CSPHEAD" "script-src 'self'" && echo 0 || echo 1)" "got '$CSPHEAD'"
+# The share body must NOT contain the SPA's app element. Fetched to a file (not
+# `curl | grep -q`) for the same SIGPIPE reason as everything above: in a
+# "must not contain X" check, a killed grep reports failure exactly when X is
+# present, which silently turns the check into a PASS.
+SHARE_BODY_FILE="$(mktemp)"; curl -sS -o "$SHARE_BODY_FILE" "$API/s/$HTOK"
 check "the share page body is server-rendered, not the SPA shell" \
-  "$(curl -sS "$API/s/$HTOK" | grep -qE "$APP_ID_RE" && echo 1 || echo 0)"
+  "$(grep_qE "$(cat "$SHARE_BODY_FILE")" "$APP_ID_RE" && echo 1 || echo 0)"
 
+rm -f "$GUIDE_FILE" "$SHELL_HTML_FILE" "$SHARE_BODY_FILE" 2>/dev/null || true
 echo
 echo "----- P4 contract: $pass passed, $fail failed -----"
-[ "$fail" = 0 ] || exit 1
+if [ "$fail" != 0 ]; then exit 1; fi
+exit 0
