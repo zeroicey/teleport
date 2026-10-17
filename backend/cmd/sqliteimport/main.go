@@ -46,6 +46,10 @@ const usage = `sqliteimport — move SQLite data into the PostgreSQL schema, and
   verify   read-only. Compare every row, every count, the report digests and the
            link semantics (permanent stays permanent, revoked stays 404) between
            the source and the target.
+           This is a post-import check. Once the service is live, the usage
+           counters (view_count, request_count, last_used_at) legitimately differ
+           from the frozen source, because serving traffic increments them; those
+           differences are not drift.
 
   -dsn defaults to $DATABASE_URL. The source is opened read-only and immutable;
   -source is never written to, and a -wal sidecar next to it is a refusal.

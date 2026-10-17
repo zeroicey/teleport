@@ -75,6 +75,14 @@ func (v *Verifier) Report() *VerifyReport { return v.rep }
 // cannot be read at all). A check that finds a discrepancy is recorded as a
 // failure, not an error, so one run reports everything wrong rather than the
 // first thing.
+//
+// It is a POST-IMPORT check, and that matters once the service is live: the row
+// comparison includes the mutable usage counters (share_tokens.view_count,
+// agent_keys.request_count/last_used_at), which a serving deployment increments on
+// its own. Measured right after the P6 cut-over: view_count 7 -> 11 on a permanent
+// link, purely because the link was fetched during verification. That is traffic,
+// not drift. On a live database compare the immutable columns instead (or expect
+// exactly these counters to differ).
 func Verify(ctx context.Context, src Reader, pool *pgxpool.Pool) (*VerifyReport, error) {
 	v := NewVerifier(src, pool)
 	if err := v.run(ctx); err != nil {

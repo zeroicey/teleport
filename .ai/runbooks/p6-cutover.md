@@ -1,6 +1,7 @@
 # P6 切换 runbook（teleport 从 hcyj 旧版 → hpcore 新版）
 
-**Status:** 💭 待人类审阅（**只写过，未执行任何一步**） · **Created:** 2026-10-16
+**Status:** ✅ 已执行（2026-10-17 完成切换，线上验证通过） · **Created:** 2026-10-16
+· **执行记录见文末**（含三处与原计划的偏差）
 · **双入口问题已裁决**（单一根路径，旧前缀弃用）：见 `2026-10-16-p6-single-root-entry.md`
 · **Related:** `2026-10-16-rewrite-on-gin-and-postgres.md`（纲领，P6 段）、
 `2026-10-16-teleport-own-hostname.md`（新域名裁决）、`deploy-teleport.md`（常规部署）、
@@ -183,6 +184,10 @@ sudo install -m 0600 -o root -g root /dev/null /data/services/teleport/teleport.
 sudo tee /data/services/teleport/teleport.env >/dev/null <<'EOF'
 ENVIRONMENT=production
 LISTEN_ADDR=127.0.0.1:8788
+# Gin 没有任何从 ENVIRONMENT 推导 mode 的代码；它读 GIN_MODE。
+# 不设这个，服务在 production 下仍跑 debug 模式，每次启动把整张路由表打进 journal
+# （P6 切换时实测到 61 行 GIN-debug）。
+GIN_MODE=release
 # ── 新域名挂根路径 ──
 # ⚠️ 写 "/" ，**不要写空值**：空的 ROUTE_PREFIX 会被当成「未设置」而回落到默认值
 #    （仍是 /yeciorez/teleport）。实测（启动日志里的 prefix=）：
@@ -395,7 +400,7 @@ curl -so /dev/null -w '%{http_code}\n' https://teleport.hcyj.xyz/s/jOrlqf4gcF7lD
 | 3 | 🔴 | 轮换 `SESSION_SECRET` → **所有已发出的 agent 密钥失效**（派生） | agent 的请求开始 401 | 从旧 env **原样复制**；已经轮换就只能重发密钥 |
 | 4 | 🔴 | 生产库灌错或灌重复 | `import` 会拒绝非空目标；`verify` 20 项 | `-replace` **会 TRUNCATE**，生产上不要用；宁可用新库重来 |
 | 5 | 🟠 | `teleport.env` 残留 `DB_PATH`、缺 `DATABASE_URL` | 启动即失败并明确报 `DATABASE_URL is required` | 修 env 重启（这是好的失败方式） |
-| 6 | 🟠 | 证书签发失败（ACME 限流 / DNS） | `curl teleport.hcyj.xyz` → 000 | 旧入口不受影响；查 Caddy 日志后重试 |
+| 6 | 🟠 | **证书签发卡住（实测发生了）**：hcyj 到 Let's Encrypt 的出网**间歇可达**（目录 4/6 成功），`POST /acme/new-order` 反复超时；Caddy 回落到 ZeroSSL 后 http-01 也没下文 | `curl https://teleport.hcyj.xyz/` → **000（curl exit 35）**；证书目录里没有该名字 | **重启 Caddy 重新签发**（实测第一次重启 10 秒内签下 LE 证书）。旧站点不受影响。细节与判断顺序见 `.ai/pitfalls/cases/2026-10-17-acme-intermittently-unreachable-from-hcyj.md` |
 | 7 | 🟠 | 新实例的连接池挤占共享 PostgreSQL | 别的服务报 `too many clients` | `DB_MAX_CONNS=8`；实例 `max_connections=100` 是四家共享 |
 | 8 | 🟠 | 回滚到旧版依赖 hcyj 的 SQLite 文件 | —— | **别删** `/data/services/teleport/teleport.db` 与 `teleport.prev-*` |
 | 9 | 🟠 | 前端构建错前缀（base 烧死） | 根路径下页面白屏、资源 404 | 必须 `VITE_ROUTE_PREFIX=/` 重新构建 |
@@ -430,3 +435,57 @@ curl -so /dev/null -w '%{http_code}\n' https://teleport.hcyj.xyz/s/jOrlqf4gcF7lD
   回到双入口方案（A：旧前缀 API 转发 + 页面 301 ／ C：两个实例同一个库）。
 - 如果 `verify-p4.sh` 能在 `ROUTE_PREFIX=""` 下跑绿 → 可以据此缩小第 9 条风险的未知度。
 - 如果 `teleport.db-wal` 出现在 hcyj → 取源方式改为 `sqlite3 .backup` 并重评。
+
+---
+
+## 七、执行记录（2026-10-17，实际怎么跑的）
+
+全部步骤都执行了。结果：**线上从「旧版已停、502」切到「hpcore 新版 + PostgreSQL + 自有域名根路径」，
+两个大陆观测点验证通过。**
+
+| 步骤 | 结果 |
+| --- | --- |
+| 0 前置 | 旧版 `inactive`+`disabled`（无写者）、无 `-wal/-shm/-journal`、源 sha256 与钉住值一致、生产库 0 张表 |
+| 1 构建 | `VITE_ROUTE_PREFIX=/ bash scripts/build.sh` → `version=c9be0ec`、`frontend: embedded` |
+| — 额外 | **先在根路径上跑通全链路验证**：`P4_ROUTE_PREFIX=/ bash scripts/verify-p4.sh` → 契约 **64/64** + 浏览器 **15/15**（这是 P6 之前最大的未知数） |
+| 3 数据 | `sqliteimport import` → 17 行、单事务；`verify` → **20/20** |
+| 4 env | 三个密钥从旧文件**逐字搬运**（先比对过 hcyj 与 hpcore 两份的哈希，完全一致）；`DB_PATH` 删除；`ROUTE_PREFIX="/"` |
+| 5 服务 | 装了 systemd unit（模板 `clip.service`）+ 二进制；`active`+`enabled`；日志 `prefix="" appBaseUrl=https://teleport.hcyj.xyz environment=production` |
+| 6 隧道 | user unit + 新配置（token 从 clip 那份逐字复制）；hcyj 的 8788 随即被 frps 绑上，经隧道 `/api/health` → 200 |
+| 7 Caddy | 备份 → 上传 → **宿主/容器 md5 一致** → `caddy adapt` exit 0 → 重启；`api`/`clip` 仍 200，旧前缀 **410** |
+| 8 验证 | 见下 |
+
+### 三处与原计划的偏差（都值得知道）
+
+1. **`ROUTE_PREFIX` 的空值陷阱**（原计划里是风险 13，实测确认）：写 `ROUTE_PREFIX=` 会**静默回落**
+   到 `/yeciorez/teleport`（`env()` 把空值当未设置），必须写 `"/"`。已在 env 文件里注明。
+2. **`GIN_MODE=release` 原本漏了**：Gin 不读 `ENVIRONMENT`，所以 production 下仍打整张路由表
+   （61 行 `GIN-debug`）。已补进本文的 env 片段，并在真实 env 里加上。
+3. **证书签发卡住**（风险 6 实测发生）：hcyj 到 LE 间歇可达，`new-order` 超时。**重启 Caddy**
+   后 10 秒内签下 LE 证书。详见其 pitfall。
+
+### 步骤 8 的实际验证结果
+
+| 检查 | 结果 |
+| --- | --- |
+| `/api/health`、`/ai.md`、`/llms.txt`、`/`、`/dashboard/reports` | 全 200 |
+| 永久链接 `/s/Du01mf3JsO9utq69xtKcBw` | **200**（`expires_at=0` 的链接在新域名下可读） |
+| 已吊销 `/s/jOrlqf4gcF7lDUDrkUjxmg` | **404**（不是 403，不泄漏状态） |
+| 未知 token | 404 |
+| `/.git/config`、`/.env` | 404（站点级探针） |
+| 旧前缀三个路径 | **410** + `teleport moved to https://teleport.hcyj.xyz/` |
+| `api.hcyj.xyz/` 兜底、`clip.hcyj.xyz` | 仍 **200**（没被改坏） |
+| 证书 | Let's Encrypt，`CN=teleport.hcyj.xyz`，2026-10-17 → 2027-01-15 |
+| 真 agent 密钥 `POST /api/reports` | **201**（root 密钥在新域名下鉴权成功） |
+| 真实浏览器（CDP，公网新域名） | **10 passed / 5 failed**，5 项失败**全部**是「需要管理员明文口令」的那些（我只持有哈希）；分享页 SSR、Vue 挂载、**Mermaid 在真实 CSP 下渲成 SVG**、无失败请求都通过 |
+| 大陆观测点 | hpcore（家宽）与 koma 各一次：`/api/health` 200、永久链接 200、已吊销 404、旧前缀 410；h2、证书链校验通过。`bjbuwe` 当前不可 ssh |
+| 生产库完整性 | 删掉验证时造的那条测试报告后，与源比对：**不可变列逐字节一致**、reports=5。`verify` 报 2 项差异，是 `view_count` 7→11 —— 我验证时**真实访问**留下的使用计数，属预期（见下） |
+
+### 两个遗留的「未验证」
+
+- ⛔ **面板登录没在 P6 验证**：需要管理员**明文**口令，而库里只有哈希。P4 时用一次性口令在
+  临时实例上验过；本次能确认的是登录端点可达且正常拒绝错口令（401）。要用真人口令复验一次。
+- ⚠️ **`sqliteimport verify` 在活库上会报使用计数的差异**：它是「搬运后一次性核对」的工具，
+  比对 `view_count`/`request_count`/`last_used_at` 这些**可变列**。库一旦开始服务，
+  这些列就会与冻结的源不同 —— 那不是穿透，是流量。活库上应当只比**不可变列**
+  （或接受这几项差异）。

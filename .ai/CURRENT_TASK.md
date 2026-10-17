@@ -4,9 +4,9 @@
 HTTP 层是 **Gin**，**全链路已在真二进制上验过**：HTTP 契约 **64/64** + 真实浏览器 **15/15**
 （`scripts/verify-p4.sh`，第三档闸门），并做了 **旧树 vs 新树的差分跑：108 请求只有 1 处已知差异**。
 **数据搬运已在临时 schema 上彩排通过（`scripts/verify-p5.sh`，15/15 + 负向对照）。**
-四档闸门全绿。**P6（切换）未做，且必须先问人类；线上仍是旧版且已停（502）。**
-**P6 的双入口阻塞点已裁决**（单一根路径入口、旧前缀弃用，见
-`2026-10-16-p6-single-root-entry.md`），并把步骤与风险写成了 `.ai/runbooks/p6-cutover.md`。
+四档闸门全绿。**P6（切换）已完成并线上验证**：`https://teleport.hcyj.xyz/`（根路径）
+由 hpcore 的新版服务 + frpc 隧道 + hcyj 的 Caddy 提供服务，数据来自 PostgreSQL 生产库。
+**线上不再是旧版，也不再是 502。** 切换记录见 `.ai/runbooks/p6-cutover.md` 的「执行记录」。
 
 **P2.3 交付物**：`internal/store/` 的 `queries.go` + `keys.go` 改为 pgx；新增
 `internal/store/queries/*.sql`（sqlc 源）+ `internal/store/storedb/`（生成物）+ `backend/sqlc.yaml` +
@@ -251,19 +251,21 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 
 ---
 
-## 线上现状（2026-10-16 实测）
+## 线上现状（2026-10-17 **切换后**实测）
 
 | 事实 | 值 |
 | --- | --- |
-| teleport 的公网入口 | 仍是 `https://api.hcyj.xyz/yeciorez/teleport`（hcyj 的 Caddy `handle /yeciorez/teleport*` → `172.17.0.1:8788`，前缀保留） |
-| 现在是什么状态 | **502**。hcyj 上 `teleport` unit ：`disabled` + `inactive`；frps 只监听 `8790`（clip），`8788` 无监听。**用户 2026-10-16 再次裁决：继续停着，等新版上线**（不临时恢复） |
-| `teleport.hcyj.xyz` | **不存在**。DNS 解析到同一个 IP，但 hcyj 的 Caddyfile 里**没有任何 site block**、也没有证书 → TLS 直接失败（`code=000`，`no peer certificate available`）。全仓库与记忆库里搜不到这个字符串 |
-| 有自己独立域名的那个是 | **clip**（`clip.hcyj.xyz`）。Caddyfile 注释里写着 `A whole host of its own, unlike teleport` —— 很可能就是这行造成了「teleport 也有自己的域名」的印象 |
-| `https://api.hcyj.xyz/` 的 200 | 那是 Caddy 的 fallback `handle` → `172.17.0.1:3000`（**别的服务**），不是 teleport。链路/TLS 健康不等于 teleport 可用 |
+| teleport 的公网入口 | **`https://teleport.hcyj.xyz/`（根路径）** —— 自有域名，与 clip 形态一致 |
+| 现在是什么状态 | **在线**。hpcore 上 `teleport.service`（systemd，用户 `relay`）`active`+`enabled`，监听 `127.0.0.1:8788`；`frpc-relay-teleport`（user unit）把 hcyj 的 8788 隧道到这里；hcyj 的 Caddy 终结 TLS 并反代到 `172.17.0.1:8788` |
+| 证书 | **Let's Encrypt**（`CN = teleport.hcyj.xyz`，2026-10-17 签发，2027-01-15 到期），与 api/clip 同一个 CA —— 没有引入新依赖 |
+| 数据 | 生产库 `teleport`：5 报告 / 6 分享链接 / 2 密钥 / 4 申请 / 0 续期，与源**逐字节一致**（不可变列已比对；只有使用计数因真实访问而变化） |
+| 旧前缀 `api.hcyj.xyz/yeciorez/teleport*` | **410 Gone** + `teleport moved to https://teleport.hcyj.xyz/`（已裁决的 break change，见 `2026-10-16-p6-single-root-entry.md`） |
+| `https://api.hcyj.xyz/` 的 200 | 那是 Caddy 的 fallback `handle` → `172.17.0.1:3000`（**别的服务**），从来不是 teleport |
+| 未受影响 | `clip.hcyj.xyz` 与 `api.hcyj.xyz` 的兜底服务都仍 200（改 Caddy 时逐项验过） |
+| 旧版回滚材料 | hcyj 上 `teleport` unit 仍 `disabled`+`inactive`，`teleport.db` 与 `teleport.prev-*` 都在（**别删**） |
 
-要临时恢复旧版（让 8788 重新有服务）：`ssh hcyj 'systemctl enable --now teleport'`。
-**当前裁决是「不恢复」** —— 用户确认无人使用，等重写版就绪再切，所以 502 是预期状态，不是事故。
-代价（已接受）：`expires_at=0` 的在野永久链接现在打不开；P5 搬运后无法马上拿旧版做对账。
+大陆观测点：**hpcore（家宽）与 koma 各测一次**都通过（`/api/health` 200、永久链接 200、
+已吊销 404、旧前缀 410；h2 + 证书链校验通过）。`bjbuwe` 当前不可 ssh。
 
 **新域名 `teleport.hcyj.xyz` 已裁决**（见 `2026-10-16-teleport-own-hostname.md`）：
 新版挂在**根路径**，**P6 与切换一起做**（现在不加 Caddy，否则新域名也是 502）。
@@ -308,7 +310,7 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 | **P3** | ✅ 完成：Gin 路由表 + `gin.HandlerFunc` handler（`c.Param`）；`internal/httpx` 的认证中间件用 `httpx.GinMiddleware` 适配成 Gin 中间件；信封/session/principal 仍是框架无关的纯函数。**零测试改动**通过。决策与 gin 版本证据见 `2026-10-16-p3-gin-integration.md` | 封套与状态码逐条对齐 —— 已逐条验证 |
 | **P4** | ✅ 完成：全链路起新版（Gin + pgx + 内嵌 SPA + 真 PG），HTTP 契约 **64/64** + 真实浏览器 **15/15**；另做**差分跑**（P3 之前的树 vs 新版，108 请求 / 1 处已知差异）。第三档闸门 `scripts/verify-p4.sh`。**未做：大陆观测点（要等 P6 切换后）** | 切换前的最后一道闸 —— 已过，但外部校验（P5/P6）仍在 |
 | **P5** | ✅ 完成：`internal/sqlitemigrate` + `cmd/sqliteimport`（**单事务、默认拒绝非空目标、`-replace` 需 `-yes`**）+ `scripts/verify-p5.sh`（第四档闸门）。**schema 由应用自己的迁移器建，工具从不发 DDL；P5 不建生产库的 schema**（决策记录 `2026-10-16-p5-schema-ownership.md`）。真源真库彩排 15/15 + 负向对照按名字变红。**未做：真往生产库灌**（属 P6） | 切换当天不能靠猜 —— 现在不用猜了，但**生产的第一次仍然在 P6** |
-| P6 | 切到 hpcore（frpc 隧道 8788）。**runbook 已写好**：`.ai/runbooks/p6-cutover.md`（逐步命令 + 每步验证/回滚 + 12 条风险，全部标了「实测过 ✅ / 只在纸上跑过 ❓」）。**入口形态已裁决为单一根路径**（`teleport.hcyj.xyz`，旧前缀弃用 —— `2026-10-16-p6-single-root-entry.md`），因为侦察发现「一个二进制无法同时服务两个前缀」（前端 base 构建期烧死 + 分享页资产/iframe 是 `PUBLIC_BASE_URL` 的绝对地址 + CSP `'self'`）。**必须先问人类确认窗口**。P6 之前的头号未知数：`ROUTE_PREFIX=""` 这个分支从未跑过 → 应先用 `verify-p4.sh` 那套在空前缀 + `VITE_ROUTE_PREFIX=/` 的产物上跑绿一次 | 用户要的最终形态：hcyj 只转发；新域名挂在根路径 |
+| **P6** | ✅ **完成（2026-10-17 执行）**：线上切到 hpcore 的新版（Gin + pgx + PostgreSQL），入口是 **`https://teleport.hcyj.xyz/`（根路径）**；hcyj 只做 TLS 终结与转发（frpc 隧道 8788）。旧前缀 `api.hcyj.xyz/yeciorez/teleport*` → **410**（已裁决的 break change）。两个大陆观测点验证通过；旧站点 `clip.hcyj.xyz` 与 `api.hcyj.xyz` 兜底都未受影响。**完整执行记录与三处偏差见 `.ai/runbooks/p6-cutover.md` 第七节**。⛔ 唯一未验的是面板登录（需管理员明文口令，我只有哈希） | 用户要的最终形态已达成：hcyj 只转发，teleport 有自己的域名且在根路径 |
 
 **保持冻结的线上环境**：重写期间**不要**改 hcyj 的 Caddy、不要升级本机 Postgres、
 **绝对不要轮换 `SESSION_SECRET`**（它会让所有派生密钥失效）。
@@ -319,8 +321,11 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   （`store.OpenPG` → `MigratePG`）建，搬运工具**从不发 DDL**；**P5 不建生产库 schema**，
   生产 `teleport` 保持 0 张表到 P6；读旧库用 `sqlite3` shell（**零新增依赖**）。
   P6 的顺序是 `migrate` → `import` → `verify`（都在同一个窗口里，不存在「提前建好却静默变旧」的间隔）。
-- **P6 之前必须问人类**：切到 hpcore、改 hcyj 的 Caddy（加 `teleport.hcyj.xyz` site block + 证书）、
-  frpc 隧道 8788。P5 全程没有碰线上（Caddy / frpc / 8788 一次未动），也没有碰生产意图库。
+- **P6 已执行（2026-10-17，用户批准「改 caddy 挂一会没事的」）**：切换、Caddy 改动、frpc 隧道、
+  生产库灌数据全部完成并验证。P5 期间没有碰线上，这次是用户明确批准后才动的。
+  回滚材料都还在：hcyj 的 `teleport` unit 仍 `disabled`+`inactive`，`teleport.db` 与
+  `teleport.prev-*` 未删；hpcore 上旧二进制是 `/data/services/teleport/teleport.prev-*`，
+  旧 env 是 `teleport.env.pre-p6-*`，hcyj 的旧 Caddyfile 是 `Caddyfile.pre-p6-*`。
 - **P6 的实际工作量比纲领预想的多**（只读侦察实测，细节见 runbook）：hpcore 上**没有** teleport
   的 systemd unit（要新建，模板是 `clip.service`）；`/data/services/teleport/teleport.env` **仍是
   旧配置**（含 `DB_PATH`、没有 `DATABASE_URL`）；frpc 是 **user unit**（用户 `oicey`），
@@ -333,7 +338,12 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   `ssh hcyj sha256sum` → 检查无 `-wal/-shm/-journal` → `scp` → 本地再 `sha256sum` 比对。
   已实测的源：`sha256 0b3855d7b130e30d7ca2128afce7c9dd30dfaf7eba5f7a57293347a2cbbeb24d`
   （P6 建议用 `P5_EXPECT_SHA256=` 把它钉住）。**只读**：hcyj 上没有任何写入。
-- **P5 未做**：真往生产库灌、旧新对账（旧版已停）、大陆观测点/浏览器（属 P6）。
+- **P5 未做 → P6 已补**：真往生产库灌（已做，20/20）、大陆观测点（已做，两个观测点）、
+  真实浏览器（已在公网新域名上跑，见 runbook）。**旧新对账仍未做**（旧版已停，ADR 早记过这个代价）。
+- ⚠️ **`sqliteimport verify` 在活库上会报使用计数差异**：它比对 `view_count`/`request_count`/
+  `last_used_at` 这些**可变列**，而库一旦开始服务这些列就会偏离冻结的源 —— 那不是穿透，是流量。
+  P6 切换后就实测到这一条（`view_count` 7→11，因为验证时真的访问了那个永久链接）。
+  活库上应只比**不可变列**。
 - **⚠️ P5 的独立复审没拿到（要如实知道）。** 四种尝试全部因**环境**失败：
   `bg_delegate` × 2 在 35 次工具调用后被 24 turn 上限截断（`child_turn_limit`，未交答案）；
   `fusion_validate` × 2 的三个候选各自读了文件后以**空响应**告终
