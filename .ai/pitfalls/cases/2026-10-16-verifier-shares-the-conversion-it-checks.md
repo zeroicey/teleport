@@ -22,7 +22,7 @@
   verify: 15 passed, 0 failed                       exit=0   ← 全绿
 ```
 
-`row_equality[...]`、`db_rendered_text[...]` 之外的所有检查都通过了。**唯一能发现它的那条检查
+`row_equality[...]`、`db_hex_bytes[...]` 之外的所有检查都通过了。**唯一能发现它的那条检查
 当时还不存在。**
 
 ## Root cause
@@ -71,7 +71,7 @@ if f >= maxInt64Exclusive || f < minInt64Inclusive {
 }
 ```
 
-**结构性**（`verify.go` 的 `checkDatabaseRenderedText`，新增 5 项检查）：让**两个数据库各自**
+**结构性**（`verify.go` 的 `checkDatabaseHexBytes`，新增 5 项检查）：让**两个数据库各自**
 把值渲染成文本，再比字符串，**全程不经过 `convertValue`**：
 
 ```sql
@@ -97,7 +97,7 @@ SELECT id::text, created_at::text, ... FROM t;
 `integral` 的范围拒绝仍在。夹具里现在也有一个真正需要 17 位的值（`0.30000000000000004`）,
 `TestImportPreservesRealPrecision` 用 PG 的 `float8send` 比 IEEE754 字节。
 
-`db_rendered_text` 也因此改名并升级为 **`db_hex_bytes`**：比的是**字节**
+`db_hex_bytes` 也因此改名并升级为 **`db_hex_bytes`**：比的是**字节**
 （源 `lower(hex(col))` vs 目标 `lower(encode(convert_to(col::text,'UTF8'),'hex'))`），
 因为文本渲染本身也要经过 `sqlite3 -json` + `encoding/json`，而 Go 的 JSON 解码器会把**非法 UTF-8
 替换成 U+FFFD** —— 那条路上一侧的替换会在另一侧同样发生，**比文本永远发现不了**。字节能发现。
@@ -114,9 +114,9 @@ SELECT id::text, created_at::text, ... FROM t;
 - `TestImportRefusesAValueThatWouldWrap`：端到端——把夹具里一个值改成 2^63，
   要求导入**拒绝**（错误里要点出 `does not fit` 与列名），且目标**一行都没提交**。
   **反证过**（同上一次反证覆盖）。这条比单元测试重要：它证明的是「停下来了、没写坏值」。
-- `TestCompareRenderedText`：纯函数层面的反证，含「NULL 不等于空字符串」「缺行/多行要报」。
+- `TestCompareRenderedBytes`：纯函数层面的反证，含「NULL 不等于空字符串」「缺行/多行要报」。
 - `scripts/verify-p5.sh` 的真源彩排现在有 **20 项**检查，其中 5 项是
-  `db_rendered_text[...]`（真源上共 157 个格子）。
+  `db_hex_bytes[...]`（真源上共 157 个格子）。
 
 **规则（三条，都可以机械检查）：**
 

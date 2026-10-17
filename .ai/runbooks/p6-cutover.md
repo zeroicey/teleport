@@ -228,6 +228,14 @@ Description=Teleport (AI report publishing + expiring share links)
 After=network-online.target docker.service
 Wants=network-online.target
 
+# StartLimit* are [Unit] keys. In [Service] systemd ignores them SILENTLY (it logs
+# "Unknown key … ignoring" and keeps the defaults), which is exactly what happened on
+# the first attempt here: the limit stayed at the default 5-in-10s. With it, a
+# PostgreSQL outage longer than ~10s trips the limiter and systemd stops retrying —
+# the unit sits in `failed` until a human runs `systemctl reset-failed`. Verify with
+# `systemctl show teleport -p StartLimitIntervalUSec` (0 = disabled).
+StartLimitIntervalSec=0
+
 [Service]
 Type=simple
 User=relay
@@ -479,7 +487,22 @@ curl -so /dev/null -w '%{http_code}\n' https://teleport.hcyj.xyz/s/jOrlqf4gcF7lD
 | 真 agent 密钥 `POST /api/reports` | **201**（root 密钥在新域名下鉴权成功） |
 | 真实浏览器（CDP，公网新域名） | **10 passed / 5 failed**，5 项失败**全部**是「需要管理员明文口令」的那些（我只持有哈希）；分享页 SSR、Vue 挂载、**Mermaid 在真实 CSP 下渲成 SVG**、无失败请求都通过 |
 | 大陆观测点 | hpcore（家宽）与 koma 各一次：`/api/health` 200、永久链接 200、已吊销 404、旧前缀 410；h2、证书链校验通过。`bjbuwe` 当前不可 ssh |
-| 生产库完整性 | 删掉验证时造的那条测试报告后，与源比对：**不可变列逐字节一致**、reports=5。`verify` 报 2 项差异，是 `view_count` 7→11 —— 我验证时**真实访问**留下的使用计数，属预期（见下） |
+| 生产库完整性 | 删掉验证时造的那条测试报告后，与源比对：**不可变列逐字节一致**、reports=5。`verify` 报 2 项差异，是永久链接的 `view_count` 增长 —— 我验证时**真实访问**留下的使用计数，属预期（见下） |
+
+### 执行之后才发现的部署缺陷（已修）
+
+- **🔴 systemd 重启限流陷阱**：unit 用 `Restart=always` + `RestartSec=2`，而
+  `StartLimitBurst` 默认 5 / 间隔默认 10s —— 5 次重启正好卡在窗口上。`main.go` 在
+  `store.OpenPG` 失败时 `fatal()` 退出，而 unit 只 `After=docker.service`（docker 的 socket，
+  **不是** PostgreSQL 就绪）。所以一次超过约 10 秒的数据库不可用就可能触发限流 →
+  unit 变 `failed` 且 **systemd 不再重试**，直到有人 `systemctl reset-failed`。
+  已加 `StartLimitIntervalSec=0`（**必须放在 `[Unit]`**：放 `[Service]` 会被静默忽略，
+  我第一次就放错了，靠 `journalctl` 的 "Unknown key … ignoring" 才发现）。
+  实测生效：`StartLimitIntervalUSec=0`。**共享主机的 `clip.service` 有同样的形状**（不在本仓库，
+  未改——但那台机器上的服务值得一起看）。
+- **🔴 一个仍在生效的凭据躺在 644 文件里**：`/data/dev/research/.tmp/teleport/claim.json`
+  （含明文 token，前缀 `VPQ1AJLS`，对应 `agent_keys` 里 `revoked_at=0` 的那把「agent 测试」密钥）
+  权限是 644。已 `chmod 600`；**是否吊销那把密钥需要人类决定**（吊销会与「目标 == 源」不一致）。
 
 ### 两个遗留的「未验证」
 

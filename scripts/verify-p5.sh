@@ -324,7 +324,11 @@ means nothing."
   echo "  verification failed as required, at both named checks (see ${NEG_LOG#$REPO/})"
   NEGATIVE_RAN=1
 
-  psql_admin "DROP SCHEMA IF EXISTS $NEG_SCHEMA CASCADE" >/dev/null
+  # Guarded, and NOT removed from the cleanup list until the drop is confirmed: an
+  # unguarded drop followed by removing it from CREATED_SCHEMAS would let a failed
+  # drop leave p5_neg behind while the script still printed PASSED.
+  psql_admin "DROP SCHEMA IF EXISTS $NEG_SCHEMA CASCADE" >/dev/null \
+    || die "could not drop the negative-control schema $NEG_SCHEMA"
   CREATED_SCHEMAS=("$SCHEMA")
 fi
 

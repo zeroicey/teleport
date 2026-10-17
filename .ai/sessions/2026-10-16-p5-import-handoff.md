@@ -43,7 +43,7 @@ P5_SKIP_NEGATIVE=1 ...                         # 只跳过负向对照（**别�
 | 档 | 结果 |
 | --- | --- |
 | 真源 → 真 schema 搬运 | 17 行 / 5 张表，单事务 |
-| 行为核对（`sqlitemigrate verify`） | **20 / 20**（含 5 项 `db_rendered_text[...]`：两个数据库各自渲染、共 157 个格子） |
+| 行为核对（`sqlitemigrate verify`） | **20 / 20**（含 5 项 `db_hex_bytes[...]`：两个数据库各自渲染字节、共 157 个格子） |
 | 独立计数（`sqlite3` vs `psql`，对着人给的 5/6/2/4/0） | 全对上 |
 | 负向对照（篡改目标） | 按名字变红：`revoked_links_stay_404` + `permanent_links_stay_permanent` |
 | Go 侧篡改用例 | 18 个（含「多一列」「改列名」「删视图」「root 归属被改」这类**静默丢数据**形状）——**20 项检查每一项都有反证** |

@@ -1,8 +1,20 @@
-# 部署 Teleport 到 hcyj
+# 部署 Teleport（**P6 之后：hpcore**；本文其余部分是 hcyj 时代的流程）
 
-**Applies to:** 生产（hcyj / `api.hcyj.xyz`，旧版 SQLite） · **Owner:** lead · **Last verified:** 2026-10-11
+**Applies to:** 生产现状 = **hpcore（本机）**，入口 `https://teleport.hcyj.xyz/` ·
+**Owner:** lead · **Last verified:** 2026-10-11（hcyj 时代）
 
-> ## ⚠️ 本手册描述的是 **P2.3 之前**的线上版本（SQLite）
+> ## ⛔ 先读这条：服务已经不在 hcyj 上了
+>
+> **2026-10-17 的 P6 切换把服务搬到了 hpcore（本机）**：systemd unit `teleport`（用户 `relay`）、
+> 数据在本机的 PostgreSQL 库 `teleport`、公网流量由 hcyj 的 Caddy 终结 TLS 后经 **frpc 隧道
+> 8788** 送到本机。hcyj 上那个 unit 现在是 `disabled`+`inactive`（保留作为回滚材料）。
+>
+> **因此下面正文里的 `ssh hcyj` / `scp … hcyj:` / 交叉编译后上传 的步骤描述的是 P6 之前的部署，
+> 照它做会部署到一台已经不再运行 teleport 的机器上，而线上毫无变化。**
+> 当前流程（构建、装二进制、写 env、frpc 隧道、改 Caddy、数据搬运、每步验证与回滚）见
+> **`.ai/runbooks/p6-cutover.md`**，执行记录在其第七节。
+>
+> ## ⚠️ 本文其余部分描述的是 **P2.3 之前**的线上版本（SQLite）
 >
 > 重写版（P2.3 起）的存储是 **PostgreSQL**，启动需要 `DATABASE_URL`，
 > 备份对象是 database 而不是文件。下面的 §4.2 与 §4.4 已给出 PostgreSQL 变体，

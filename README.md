@@ -3,35 +3,30 @@
 个人 AI 报告展示与时效分享平台。在终端 / 工作框中完成复杂工作（安全渗透、架构设计、
 开发进度等）后，通过一次 API 调用把报告发布为在线网页，并得到一条**带时效的分享链接**。
 
-> ## ⚠️ P6 之前：入口即将变更（2026-10-16 用户裁决）
+> ## ✅ 重写已完成，线上已切换（2026-10-17）
 >
-> teleport 将迁到 **`https://teleport.hcyj.xyz/`（根路径）**，且**旧前缀
-> `api.hcyj.xyz/yeciorez/teleport` 弃用**（break change：连 `expires_at=0` 的永久链接
-> 也会失效，用户已知情）。因此**本文里的旧前缀 URL 描述的是 P6 之前的形态**。
-> 裁决理由与后果见 `.ai/decisions/2026-10-16-p6-single-root-entry.md`，
-> 切换步骤见 `.ai/runbooks/p6-cutover.md`。
+> 本仓库已从 `net/http + SQLite` 重写为 **Gin + pgx/sqlc + PostgreSQL**，**在野契约逐字节不变**，
+> 并已在 **2026-10-17** 完成切换：
 >
-> ## ⚠️ 重写进行中（P2.3 已完成，P3–P6 未做）
+> - **入口**：**`https://teleport.hcyj.xyz/`（根路径，自有域名）**。
+> - **服务**：跑在 **hpcore**（本机）上；hcyj 只做 TLS 终结与转发（frpc 隧道 8788）。
+> - **数据**：PostgreSQL 库 `teleport`，由 `sqlitemigrate` 从旧 SQLite 逐字节搬入并核对。
+> - **旧前缀 `api.hcyj.xyz/yeciorez/teleport*` 已弃用**，返回 **410**（用户裁决的 break change：
+>   连 `expires_at=0` 的永久链接也失效，已知情）。见
+>   `.ai/decisions/2026-10-16-p6-single-root-entry.md`。
 >
-> 本仓库正在从 `net/http + SQLite` 重写为 `Gin + pgx/sqlc + PostgreSQL`，**在野契约逐字节不变**。
-> 当前状态：
->
-> - **代码已切到 PostgreSQL**：`internal/store` 是 pgx + sqlc，`DATABASE_URL` 取代了 `DB_PATH`，
->   SQLite 驱动与 `schema.sql` 已删除。
-> - **线上仍是旧版**（hcyj 上的 SQLite 构建，目前已 `disabled`，公网入口 502）。
->   新版在 P6 才切换，届时还会同时启用新域名 `teleport.hcyj.xyz` 根路径。
-> - 因此**下面「部署」「运行手册」等章节描述的是线上旧版**，与当前工作树不完全一致；
->   P6 之前不要照它去部署本仓库的代码。以 `.ai/CURRENT_TASK.md` 为准。
->
-> 权威文档：`.ai/decisions/2026-10-16-rewrite-on-gin-and-postgres.md`（纲领 + 冻结清单）。
+> **本文仍有若干章节描述 P6 之前的形态**（尤其是「部署」「Caddy 分流」「已知陷阱」
+> 与文末的验证记录）——它们保留下来是因为里面的经验仍然有效，但**不要照它们部署**。
+> 当前形态与切换记录：`.ai/runbooks/p6-cutover.md`（第七节是执行记录）；
+> 当前状态：`.ai/CURRENT_TASK.md`；纲领：`.ai/decisions/2026-10-16-rewrite-on-gin-and-postgres.md`。
 
 **当前架构：单二进制（Go 内嵌前端）**
 
 | 层 | 技术 | 部署位置 |
 |---|---|---|
 | 前端 | Vue 3 + Vite（pnpm） | **编译进 Go 二进制**（`go:embed`） |
-| 后端 | Go + pgx/sqlc（PostgreSQL；旧版线上仍是 SQLite） | 国内云服务器 hcyj — Caddy 分流至 `/yeciorez/teleport` |
-| 入口 | **P6 起**单一来源：`https://teleport.hcyj.xyz/`（根路径）；P6 之前是 `api.hcyj.xyz/yeciorez/teleport/` | 前端、API、分享页同源同前缀 |
+| 后端 | Go + pgx/sqlc（PostgreSQL） | **hpcore（本机）** — 监听 `127.0.0.1:8788` |
+| 入口 | **单一来源：`https://teleport.hcyj.xyz/`（根路径）** | 前端、API、分享页同源；hcyj 的 Caddy 终结 TLS 后经 frpc 隧道反代到 hpcore |
 
 前端与后端**构建为同一个可执行文件**：Vite 产物写进 `backend/internal/webui/dist/`，
 由 `//go:embed` 打进二进制。部署就是上传一个文件、重启服务，服务器上不需要
@@ -119,19 +114,22 @@ teleport/
 ### 请求路径
 
 ```
-浏览器 ──https──> api.hcyj.xyz/yeciorez/teleport/...
+浏览器 ──https──> teleport.hcyj.xyz/...            （根路径，没有前缀）
                         │
-                    Caddy(:443)  handle /yeciorez/teleport*
-                        │         （保留前缀，不 strip）
+                    hcyj: Caddy(:443)  site block teleport.hcyj.xyz
+                        │                （TLS 终结；旧前缀 api.hcyj.xyz/yeciorez/teleport* → 410）
                         ▼
-                  Go(:8788, 仅监听 docker 网桥) ─> PostgreSQL（旧版线上：SQLite）
+                  hcyj: frps 172.17.0.1:8788  ←── frpc 隧道（hpcore 主动拨出）
+                        │
+                        ▼
+                  hpcore: Go(:127.0.0.1:8788) ─> PostgreSQL（库 teleport，本机）
                         ├─ /api/*        JSON API
                         ├─ /s/{token}    服务端渲染的分享页
                         ├─ /s/{token}/html  html 报告的正文（逐字节原样，供分享页 iframe）
                         └─ 其余         内嵌的 Vue SPA（客户端路由回退）
 ```
 
-**只有一个来源，没有第二个入口。** 前端、API 与分享页同源同前缀，因此：
+**只有一个来源、一个入口。** 前端、API 与分享页同源，因此：
 
 - 会话 Cookie 是**第一方**的，不受 Safari ITP / Chrome 第三方 Cookie 淘汰影响；
 - 分享页的 `script-src 'self'` 有实际意义（脚本确实来自同一来源）；
@@ -144,8 +142,8 @@ teleport/
 
 ## 接口一览
 
-所有路径都以 `/yeciorez/teleport` 为前缀挂在 `api.hcyj.xyz` 上。
-下表中的路径是**相对前缀**的；浏览器与 API 客户端都用同一个前缀访问，
+所有路径都挂在 **`https://teleport.hcyj.xyz` 的根路径**下（`ROUTE_PREFIX="/"`，即无前缀）。
+下表中的路径就是完整路径；浏览器与 API 客户端访问同一个来源，
 前端、接口与分享页完全同源。
 
 | 方法 | 路径 | 鉴权 | 说明 |
@@ -178,7 +176,7 @@ teleport/
 
 ```bash
 # 把这一条给 AI 就够了
-https://api.hcyj.xyz/yeciorez/teleport/ai.md
+https://teleport.hcyj.xyz/ai.md
 ```
 
 **为什么必须是服务端渲染的独立路由**，而不是 SPA 的一页、也不是一条分享链接：
@@ -326,7 +324,7 @@ token    = base64url(HMAC-SHA256(K_derive, "teleport/agent-key/v1|" + appID + "|
 ### 上报示例
 
 ```bash
-curl -X POST https://api.hcyj.xyz/yeciorez/teleport/api/reports \
+curl -X POST https://teleport.hcyj.xyz/api/reports \
   -H "Authorization: Bearer $TELEPORT_KEY" \
   -H "Content-Type: application/json" \
   -d '{
@@ -349,7 +347,7 @@ curl -X POST https://api.hcyj.xyz/yeciorez/teleport/api/reports \
     "share": {
       "token": "R1Ku0lg0YNoMXVfJgGuzYA",
       "expires_at": 1791390719094,
-      "url": "https://api.hcyj.xyz/yeciorez/teleport/s/R1Ku0lg0YNoMXVfJgGuzYA"
+      "url": "https://teleport.hcyj.xyz/s/R1Ku0lg0YNoMXVfJgGuzYA"
     }
   }
 }
@@ -411,7 +409,7 @@ cd backend
 go run . hash-password 'your password'
 
 LISTEN_ADDR=127.0.0.1:8788 \
-  ROUTE_PREFIX=/yeciorez/teleport \
+  ROUTE_PREFIX="/" \
   PUBLIC_BASE_URL=http://127.0.0.1:5173 \
   COOKIE_SECURE=false \
   SESSION_SECRET=dev-session-secret \
@@ -421,7 +419,7 @@ LISTEN_ADDR=127.0.0.1:8788 \
   go run .
 
 # ── 终端 2：前端（HMR） ────────────────────────────────────────
-pnpm run dev:web    # http://127.0.0.1:5173/yeciorez/teleport/
+pnpm run dev:web    # http://127.0.0.1:5173/
 ```
 
 `vite.config.ts` 把 `<前缀>/api` 与 `<前缀>/s` 代理到 `127.0.0.1:8788`，**且不做 rewrite**：
@@ -488,34 +486,32 @@ pnpm run build:release          # → bin/teleport-linux-amd64
 
 编译完成后会打印版本、体积、SHA256，并自检 `version --frontend`（应为 `embedded`）。
 
-### 后端（Go + SQLite，hcyj）
+### 后端（Go + PostgreSQL，**hpcore**）
 
-服务器上没有 Go 工具链，因此**在本地交叉编译**后上传。因为前端已经在二进制里，
-上传的东西只有这一个文件：
+> **P6 之后服务不在 hcyj 上了。** 现在跑在 **hpcore（本机）**，用 systemd unit `teleport`
+> （用户 `relay`），数据在**本机的 PostgreSQL**（库 `teleport`）。**hcyj 只做 TLS 终结与转发。**
+> 完整步骤、风险与执行记录见 **`.ai/runbooks/p6-cutover.md`**。
+
+发布构建在**本机**做，产物落地即部署（不需要 scp 到别的机器）：
 
 ```bash
-# 1. 本地编译（纯静态、无 cgo；自动把 git revision 编进二进制）
-pnpm run build:release         # → bin/teleport-linux-amd64
+# 1. 构建（纯静态、无 cgo；把 git revision 编进二进制）
+#    ⚠️ VITE_ROUTE_PREFIX 必须与后端 ROUTE_PREFIX="/" **成对**：前端基址是构建期烧进产物的
+VITE_ROUTE_PREFIX=/ pnpm run build:release      # → bin/teleport-linux-amd64
 
-# 2. 服务器准备（首次）
-ssh hcyj
-useradd --system --no-create-home --shell /usr/sbin/nologin teleport
-mkdir -p /data/services/teleport && chown teleport:teleport /data/services/teleport
+# 2. 装二进制（同目录 mv 是原子替换；直接写目标文件会让运行中的服务看到残缺可执行文件）
+sudo install -m 0750 -o relay -g relay bin/teleport-linux-amd64 /data/services/teleport/teleport.new
+sudo mv /data/services/teleport/teleport /data/services/teleport/teleport.prev-$(date +%Y%m%d-%H%M%S)
+sudo mv /data/services/teleport/teleport.new /data/services/teleport/teleport
 
-# 3. 上传二进制与 unit
-scp bin/teleport-linux-amd64 hcyj:/data/services/teleport/teleport.new
-scp backend/deploy/teleport.service hcyj:/etc/systemd/system/teleport.service
-
-# 4. 写环境文件（含密钥，600 root:root）
-scp backend/deploy/teleport.env.example hcyj:/data/services/teleport/teleport.env
-#   编辑填入 AGENT_SECRET_KEY / SESSION_SECRET / ADMIN_PASSWORD_HASH
-#   哈希用：./teleport hash-password '你的密码'
-
-# 5. 原子替换 + 启动
-ssh hcyj 'cd /data/services/teleport && chmod 700 teleport.new && chown teleport:teleport teleport.new \
-          && mv teleport.new teleport && systemctl restart teleport'
+# 3. 环境文件（含密钥，600 root:root，EnvironmentFile 的值是字面量不做展开）
+#    参考 backend/deploy/teleport.env.example；必须提供 DATABASE_URL（缺了启动即失败）
+sudo systemctl restart teleport
 journalctl -u teleport -f
 ```
+
+> 首次切换（建 unit、写 env、开 frpc 隧道、改 hcyj 的 Caddy、数据搬运）的全部命令与
+> 每步的验证/回滚都在 `.ai/runbooks/p6-cutover.md`。本节的旧 scp 到 hcyj 的流程已作废。
 
 > **升级时用 `mv` 覆盖而不是 `scp` 直接写目标文件**：`scp` 会以截断方式打开
 > 目标文件，若服务此刻正在运行，会短暂看到一个残缺的可执行文件；`mv` 是同目录
@@ -529,21 +525,40 @@ journalctl -u teleport -f
 > `-dirty` 表示构建时工作区有未提交改动。构建可复现 —— 同一 revision + 同一
 > `-X main.version` 会得到**逐字节相同**的二进制，可用 `sha256sum` 对比本地与线上产物。
 
-服务监听 `172.17.0.1:8788`（docker 网桥网关），**不对公网暴露**，只有 Caddy 能访问。
-数据目录 `/data/services/teleport/`。
+服务监听 **`127.0.0.1:8788`**（仅 loopback），**不对公网暴露**：公网流量由 hcyj 的 Caddy
+终结 TLS 后经 frpc 隧道（hcyj:8788 → hpcore:127.0.0.1:8788）到达。
+数据目录 `/data/services/teleport/`；数据库是**本机的 PostgreSQL 库 `teleport`**
+（与 clip / registry / serenique 同实例，`max_connections=100` 是四家共用的预算，
+所以 `DB_MAX_CONNS=8`）。
 
-> 旧版（线上当前形态）的数据库是 SQLite，文件在 `/data/services/teleport/`，使用 WAL 模式。
-> 重写版改为 PostgreSQL（与本机 clip / registry / serenique 同实例、独立 database `teleport`）。
+> 旧版（P6 之前）的数据库是 SQLite，文件在 hcyj 的 `/data/services/teleport/teleport.db`。
+> 它现在是**回滚材料**，别删。
 
 unit 内已启用 `ProtectSystem=strict`、`NoNewPrivileges`、`MemoryDenyWriteExecute` 等沙箱选项，
 并把 `/data/services/teleport` 设为唯一可写路径。
 
-### Caddy 分流（hcyj）
+### Caddy（hcyj）—— **P6 之后的形态**
 
-`api.hcyj.xyz` 由 docker 容器 `caddy` 占用 443 端口。项目在自己的路径前缀上分流：
+> 下面描述的是当前形态。P6 之前的旧前缀分流（`handle /yeciorez/teleport*` → 8788）
+> 已被**有意取代**：那条路径现在返回 410。原因与后果见
+> `.ai/decisions/2026-10-16-p6-single-root-entry.md`；改 Caddy 的纪律（备份 → `docker cp`
+> + `md5sum` 比对 → `caddy adapt` → 重启 → 三个方向都验）见
+> `.ai/runbooks/caddy-routing-on-shared-host.md`。
+
+`teleport.hcyj.xyz` 有自己的 site block（照 `clip.hcyj.xyz` 那个写）：
 
 ```caddyfile
-handle /yeciorez/teleport* {
+https://teleport.hcyj.xyz {
+    tls { /* 与 clip 相同的协议/套件；证书由 Caddy 自动签发 */ }
+    # 后端自己发更严格的 CSP/nosniff/noindex/no-store；这里只加 TLS 层的 HSTS
+    header {
+        Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+    }
+    respond /.git* 404
+    respond /.env* 404
+    respond /.*.bak 404
+    # 172.17.0.1:8788 是 hcyj 上的 frps，隧道到 hpcore 的 teleport。
+    # 根路径：没有前缀，所以也不存在「保留还是剥掉」的问题。
     reverse_proxy 172.17.0.1:8788 {
         header_up Host {host}
         header_up X-Real-IP {remote}
@@ -553,15 +568,21 @@ handle /yeciorez/teleport* {
 }
 ```
 
+而 `api.hcyj.xyz` 上原来的那一块变成了**明确的 410**：
+
+```caddyfile
+handle /yeciorez/teleport* {
+    respond "teleport moved to https://teleport.hcyj.xyz/" 410
+}
+```
+
 三个关键点：
 
-1. **用 `handle` 而不是 `handle_path`** —— 前缀必须**保留**。Go 服务的所有路由都挂在
-   `/yeciorez/teleport` 下（含前端资源与分享页），且分享链接里也写死了该前缀；
-   在此处剥掉会让所有路由 404。
-2. **站点级安全响应头要排除该前缀**（`@notTeleport not path /yeciorez/teleport*`）。
-   后端对公开分享页发的是更严格的策略（`default-src 'none'`、`X-Frame-Options: DENY`），
-   两边同时下发会产生重复且互相冲突的头。
-3. Caddy 按路径**最长匹配**选 `handle`，因此该块优先于兜底块，`api.hcyj.xyz` 原有服务不受影响。
+1. **`teleport.hcyj.xyz` 的 block 里不要加站点级 `log`**：本服务的一次性凭据走
+   `X-Teleport-Claim` 请求头，而 Caddy 只脱敏 `Authorization` 与 `Cookie`。
+2. **旧前缀必须显式应答 410，而不是删掉那一块**：删掉后会落到 `api.hcyj.xyz` 的兜底上游
+   （另一个服务），返回莫名结果；而转发到挂根的后端会命中 SPA 回退返回 200 的 HTML 外壳。
+3. **`api.hcyj.xyz` 的兜底服务不受影响**（P6 切换时逐项验过）。
 
 > 该容器原先 `restart=no`，重启机器后整个 `api.hcyj.xyz` 都会消失。
 > 已改为 `docker update --restart unless-stopped caddy`。
@@ -715,9 +736,9 @@ Vite 的 `root` 指向 `web/`，`build.outDir` 直接输出到
 | `/dashboard/reports` | `ReportsView` | 报告列表 + 客户端搜索 |
 | `/dashboard/reports/:id` | `ReportDetailView` | 报告详情 + 分享 Token 管理 |
 
-路由的 `history` 基址取自 `import.meta.env.BASE_URL`（即 Vite 的 `base`，
-也就是 `/yeciorez/teleport/`），因此地址栏始终保留前缀，
-且 `router.push` 不会导航到应用之外。
+路由的 `history` 基址取自 `import.meta.env.BASE_URL`（即 Vite 的 `base`）。
+**P6 之后 `base` 是 `/`**（根路径部署），所以地址栏没有前缀；机制不变，
+且 `router.push` 仍不会导航到应用之外。
 
 深链接可刷新的保证来自 `internal/spa`：任何未匹配到实体文件、且不属于
 `/api/`、`/s/`、`/k/` 的路径都会返回 `index.html`。
@@ -762,7 +783,11 @@ P2.3 把 store 换成 pgx + sqlc（见本页顶部说明），这段历史只对
 
 见「部署 / Caddy 分流」第 1 条：前缀是路由的一部分，必须用 `handle`。
 
-### 4. 共享主机上的 Cookie 作用域
+### 4. 共享主机上的 Cookie 作用域（**P6 之前的问题；现在已消失**）
+
+> P6 之后 teleport 有自己的主机名（`teleport.hcyj.xyz`）且挂在根路径，
+> 所以 `CookiePath` 就是 `/`，不再需要靠前缀把 Cookie 限制在共享主机的某一段路径上。
+> 下面这段保留下来，是因为它解释了当初为什么必须那样做。
 
 `api.hcyj.xyz` **不是本项目独占的**——它同时承载另一个服务（兜底反代到 :3000）。
 因此会话 Cookie 的 `Path` 必须是应用前缀 `/yeciorez/teleport`，而不是 `/`。
@@ -811,7 +836,7 @@ CF 官方的大陆加速（China Network）需要企业版 + 域名 ICP 备案�
 > 于是误判为「本地上游运营商的偶发抖动」。**境外观测点无法检测大陆封锁。**
 > 判断大陆可达性必须用大陆观测点，且要多点交叉验证。
 
-### 6. Vite 的 `base` 必须跟着部署前缀走
+### 6. Vite 的 `base` 必须跟着部署前缀走（**P6 之后仍是这条规则，只是前缀变成了 `/`**）
 
 应用挂在 `/yeciorez/teleport/` 而不是域名根路径下，如果 Vite 用默认的 `base: '/'`，
 `index.html` 会引用 `/assets/index-xxx.js`——这个路径在共享主机上会打到**别的服务**，
@@ -913,7 +938,11 @@ systemctl restart teleport && systemctl is-active teleport
 
 ## 已验证行为
 
-### 生产环境（2026-10-10 实测）
+> **下面的记录是 2026-10-10 对 P6 之前那套（hcyj + SQLite + 前缀）的实测。**
+> P6 之后的验证记录在 `.ai/runbooks/p6-cutover.md` 第七节与
+> `.ai/sessions/2026-10-17-p6-cutover-handoff.md`。
+
+### 生产环境（2026-10-10 实测，P6 之前）
 
 链路：`https://api.hcyj.xyz/yeciorez/teleport/...` → Caddy → Go(:8788，内嵌前端) → SQLite
 

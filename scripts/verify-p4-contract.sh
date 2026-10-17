@@ -22,13 +22,26 @@ set -uo pipefail
 # whole point here — the same distinction the ROUTE_PREFIX env reader gets wrong
 # for empty strings (see .ai/runbooks/p6-cutover.md risk 13).
 if [ $# -lt 2 ]; then
-  echo "usage: $0 BASE PREFIX AGENT_SECRET ADMIN_PASSWORD   (PREFIX may be empty for a root-path deployment)" >&2
+  echo "usage: P4_ADMIN_PASSWORD=... $0 BASE PREFIX AGENT_SECRET   (PREFIX may be empty for a root-path deployment)" >&2
   exit 2
 fi
 BASE="$1"
 P="$2"
 AGENT="${3:?agent secret (AGENT_SECRET_KEY) required}"
-ADMIN_PASSWORD="${4:?admin password required}"
+# The admin password arrives in the ENVIRONMENT rather than on argv: argv is visible
+# to any local `ps` on this shared host (scripts/verify-p5.sh keeps its credential
+# out of argv for the same reason).
+ADMIN_PASSWORD="${P4_ADMIN_PASSWORD:-}"
+if [ -z "$ADMIN_PASSWORD" ]; then
+  echo "usage: P4_ADMIN_PASSWORD=... $0 BASE PREFIX AGENT_SECRET" >&2
+  exit 2
+fi
+
+# The grep_q helpers below write through mktemp. A broken/unwritable TMPDIR would
+# make them fail open — every "must NOT contain X" check would silently PASS — so
+# that condition is detected once, loudly, before any check runs.
+TMP_PROBE="$(mktemp 2>/dev/null)" || { echo "FAIL  mktemp is unusable (TMPDIR?) — refusing to run" >&2; exit 3; }
+rm -f "$TMP_PROBE"
 
 API="$BASE$P"
 JAR="$(mktemp)"
@@ -211,7 +224,7 @@ check "the share page contains no live <script>alert(1)</script>" \
 # `<script>` and the payload); the renderer is custom, so its placeholder text is an
 # implementation detail and asserting it would pin the wrong thing.
 check "the injected payload is not emitted as markup" \
-  "$(grep_qE "$PAGE" '<[^>]*alert\(1\)' && echo 1 || echo 0)"
+  "$(grep_qE "$PAGE" '<script[^>]*>alert\(1\)' && echo 1 || echo 0)"
 check "the report's own markdown content IS rendered" \
   "$(grep_qF "$PAGE" 'hello' && echo 0 || echo 1)"
 
@@ -289,7 +302,7 @@ RAW=$(curl -sS "$API/s/$HTOK/html")
 check "GET /s/{token}/html returns the bytes unchanged (no escaping, no nonce)" \
   "$([ "$RAW" = "$HTMLBODY" ] && echo 0 || echo 1)" "got ${RAW:0:90}"
 check "the html body is framed by the share page, not the SPA" \
-  "$(curl -sS "$API/s/$HTOK" | grep -q 'report-frame' && echo 0 || echo 1)"
+  "$(grep_qF "$(curl -sS "$API/s/$HTOK")" 'report-frame' && echo 0 || echo 1)"
 req GET "$API/s/aaaaaaaaaaaaaaaaaaaaaa/html" ""
 check "an unknown token's /html is 404" "$([ "$CODE" = 404 ] && echo 0 || echo 1)" "got $CODE"
 
@@ -375,11 +388,15 @@ for path in /ai /ai.md /llms.txt; do
   check "GET $path is 200 with no credentials" "$([ "$CODE" = 200 ] && echo 0 || echo 1)" "got $CODE"
 done
 GUIDE=$(curl -sS "$API/ai.md")
-check "the guide's placeholders are all substituted (no '{{' left)" \
-  "$(grep_qF "$GUIDE" '{{' && echo 1 || echo 0)" "left=$(grep -o -m3 '{{[A-Z_]*}}' "$GUIDE_FILE" 2>/dev/null | tr '\n' ' ')"
 # The guide is ~39 KB. It goes to a file once and every read is a FILE read: see
 # the grep_q helper for why piping a large body into `grep -q` is a pipefail trap.
+# ASSIGNED BEFORE FIRST USE — an earlier revision referenced it in the detail
+# argument below before creating it, so under `set -u` that command substitution
+# died with "unbound variable" and the evidence this argument exists to leave was
+# always empty.
 GUIDE_FILE="$(mktemp)"; printf '%s' "$GUIDE" > "$GUIDE_FILE"
+check "the guide's placeholders are all substituted (no '{{' left)" \
+  "$(grep_qF "$GUIDE" '{{' && echo 1 || echo 0)" "left=$(grep -o -m3 '{{[A-Z_]*}}' "$GUIDE_FILE" 2>/dev/null | tr '\n' ' ')"
 GUIDE_OK="$(grep_qF "$GUIDE" "$API" && echo 0 || echo 1)"
 check "the guide states the live base URL (AppBaseURL = origin + prefix)" \
   "$GUIDE_OK" "len=${#GUIDE} want=$API"
@@ -400,7 +417,14 @@ check "the prefix root serves the SPA shell (not an API 404)" \
 # pipefail then reports the substitution as failed, which would extract an EMPTY
 # asset URL and make the next check test an empty string instead of the asset.
 ASSET=$(grep -oE -m1 "$P/assets/[A-Za-z0-9._-]+\.js" "$SHELL_HTML_FILE" || true)
-check "the shell references a hashed asset under the prefix" "$([ -n "$ASSET" ] && echo 0 || echo 1)" "got '$ASSET'"
+# The needle includes the quote that precedes the attribute value. `grep -o` alone
+# cannot discriminate: it prints only the matched substring, so a shell baked with
+# the OLD prefix (`src="/yeciorez/teleport/assets/index-x.js"`) still "matches" a
+# root-path run and the follow-up request for /assets/index-x.js succeeds because
+# that file exists in the root-mode dist — i.e. the check passed while the page's
+# real asset URL was wrong, which is the one mismatch this check exists to catch.
+check "the shell references a hashed asset under the prefix" \
+  "$(grep_qF "$SHELL_HTML" "\"$P/assets/" && echo 0 || echo 1)" "got '$ASSET'"
 if [ -n "$ASSET" ]; then
   req GET "$BASE$ASSET" ""
   check "the referenced asset is served" "$([ "$CODE" = 200 ] && echo 0 || echo 1)" "got $CODE for $ASSET"
@@ -417,11 +441,25 @@ check "the CSP allows only same-origin frames and scripts" \
 # `curl | grep -q`) for the same SIGPIPE reason as everything above: in a
 # "must not contain X" check, a killed grep reports failure exactly when X is
 # present, which silently turns the check into a PASS.
-SHARE_BODY_FILE="$(mktemp)"; curl -sS -o "$SHARE_BODY_FILE" "$API/s/$HTOK"
+SHARE_BODY_FILE="$(mktemp)"; curl -sS -o "$SHARE_BODY_FILE" "$API/s/$HTOK" || true
+# A failed fetch must not become a PASS: with an empty file the "must NOT contain"
+# check below would see nothing and report success.
+check "the share page body was fetched" "$([ -s "$SHARE_BODY_FILE" ] && echo 0 || echo 1)" \
+  "bytes=$(wc -c < "$SHARE_BODY_FILE" 2>/dev/null || echo 0)"
 check "the share page body is server-rendered, not the SPA shell" \
   "$(grep_qE "$(cat "$SHARE_BODY_FILE")" "$APP_ID_RE" && echo 1 || echo 0)"
 
 rm -f "$GUIDE_FILE" "$SHELL_HTML_FILE" "$SHARE_BODY_FILE" 2>/dev/null || true
+# A run that shrank must not look green: a section deleted in a refactor, an early
+# `exit`, or the abort branch above would otherwise print "N passed, 0 failed" and
+# exit 0. The count is the number of `check` calls in this file; raise it when you
+# add one.
+EXPECT_CHECKS=65
+RAN=$((pass + fail))
+if [ "$RAN" -lt "$EXPECT_CHECKS" ]; then
+  echo "FAIL  only $RAN check(s) ran, expected at least $EXPECT_CHECKS — a section was skipped or the script exited early"
+  fail=$((fail + 1))
+fi
 echo
 echo "----- P4 contract: $pass passed, $fail failed -----"
 if [ "$fail" != 0 ]; then exit 1; fi

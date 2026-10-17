@@ -53,6 +53,9 @@ const usage = `sqliteimport — move SQLite data into the PostgreSQL schema, and
 
   -dsn defaults to $DATABASE_URL. The source is opened read-only and immutable;
   -source is never written to, and a -wal sidecar next to it is a refusal.
+
+Exit codes: 0 ok, 1 error or a failed check, 2 usage, 3 -replace was given
+without -yes (nothing was written).
 `
 
 func main() {
@@ -283,7 +286,14 @@ func reportWhatReplaceWouldDelete(ctx context.Context, pool *pgxpool.Pool) error
 			// it comes from the same map the verifier uses rather than being
 			// assumed to be `id`.
 			key := sqlitemigrate.PrimaryKey[table]
-			rows, err := pool.Query(ctx, `SELECT `+key+`::text FROM `+table+` ORDER BY `+key+` LIMIT 10`)
+			// For share_tokens the primary key IS the bearer credential: printing it in
+			// full would put working links into the terminal and into whatever log the
+			// operator keeps. A prefix is enough to recognise which links would go.
+			expr := key + "::text"
+			if table == "share_tokens" {
+				expr = "left(" + key + "::text, 8) || '…'"
+			}
+			rows, err := pool.Query(ctx, `SELECT `+expr+` FROM `+table+` ORDER BY `+key+` LIMIT 10`)
 			if err == nil {
 				var ids []string
 				for rows.Next() {
@@ -325,7 +335,25 @@ func describeDSN(dsn string) string {
 		}
 		return scheme + "***" + dsn[at:]
 	}
-	return dsn
+	// A keyword/value DSN ("host=… user=… password=…") has no '@', and returning it
+	// unchanged printed the password — the first version did exactly that, despite
+	// this function's own promise. Redact the two credential-bearing keys and keep
+	// the rest, which is what an operator needs to see.
+	if !strings.Contains(dsn, "=") {
+		return dsn
+	}
+	fields := strings.Fields(dsn)
+	for i, f := range fields {
+		eq := strings.Index(f, "=")
+		if eq < 0 {
+			continue
+		}
+		switch strings.ToLower(f[:eq]) {
+		case "password", "passfile":
+			fields[i] = f[:eq+1] + "***"
+		}
+	}
+	return strings.Join(fields, " ")
 }
 
 func shortSHA(sum string) string {

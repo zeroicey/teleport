@@ -31,11 +31,13 @@ const BASE = process.argv[2] || 'http://127.0.0.1:8788';
 // run against the old prefix (the same trap as ROUTE_PREFIX="" in the Go config,
 // see .ai/runbooks/p6-cutover.md risk 13).
 const PREFIX = process.argv.length > 3 ? process.argv[3] : '/yeciorez/teleport';
-const PASSWORD = process.argv[4];
-const SHARE = process.argv[5] || '';
+// The admin password comes from the ENVIRONMENT, not argv: argv is visible to any
+// local `ps` on this shared host.
+const PASSWORD = process.env.P4_ADMIN_PASSWORD || '';
+const SHARE = process.argv[4] || '';
 
 if (!PASSWORD) {
-  console.error('usage: verify-teleport-browser.cjs <base-url> <prefix> <admin-password> [share-token]');
+  console.error('usage: P4_ADMIN_PASSWORD=... verify-teleport-browser.cjs <base-url> <prefix> [share-token]');
   process.exit(2);
 }
 
@@ -186,8 +188,13 @@ async function newPage(port) {
   const s = new Session(ws);
   await s.send('Page.enable');
   await s.send('Runtime.enable');
-  await s.send('Log.enable').catch(() => {});
-  await s.send('Network.enable').catch(() => {});
+  // These two enable the channels that feed the "no unexpected console errors" and
+  // "no failed network requests" checks. Swallowing their failure would leave
+  // session.console/session.failed empty and make BOTH checks pass vacuously, so a
+  // failure is recorded and reported instead.
+  s.observabilityErrors = [];
+  await s.send('Log.enable').catch((e) => s.observabilityErrors.push(`Log.enable: ${e.message}`));
+  await s.send('Network.enable').catch((e) => s.observabilityErrors.push(`Network.enable: ${e.message}`));
   return s;
 }
 
@@ -324,6 +331,10 @@ async function main() {
       errors.slice(0, 4).join(' | '));
     const failed = session.failed.filter((f) => !/favicon/i.test(f));
     check('no failed network requests', failed.length === 0, failed.slice(0, 4).join(' | '));
+    // If either channel failed to enable, the two checks above compared nothing.
+    check('the console and network channels were actually enabled',
+      (session.observabilityErrors || []).length === 0,
+      (session.observabilityErrors || []).join(' | '));
   } finally {
     try {
       if (session) session.ws.close();

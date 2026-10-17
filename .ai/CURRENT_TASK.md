@@ -98,9 +98,9 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 **P4 已实测 / 未实测**：
 - ✅ 三档闸门绿；环境干净（`teleport_test` 只剩 `public`；生产意图库 `teleport` 仍 **0 张表**；
   clip 的 8790 未被碰；无残留进程）。
-- ⛔ **未做：大陆观测点**（P4 全程 loopback；ADR 验收第 4 条只能等 P6 之后）。
+- ✅ **大陆观测点已做**（P6 切换当天，两个观测点：hpcore 家宽与 koma）。
 - ⛔ **未做：截图未经人眼确认**（当前模型不支持看图；结论来自 DOM 断言，比截图强，但截图本身未目视）。
-- ⛔ **未做：`ENVIRONMENT=production` 的 Gin release 模式**；`format:"html"` 的字节比较用了 `$(...)`
+- ✅ **`ENVIRONMENT=production` 的 Gin release 模式已验证**（P6 实测：`GIN_MODE=release` 后 journal 里 `GIN-debug` 行数为 0）；`format:"html"` 的字节比较用了 `$(...)`
   （会吃掉尾部换行，需 `cmp` 才算字节级证据）；合同 14 只在 API 侧间接覆盖（DB 侧由
   `TestNoPlaintextCollected` 盯着）。
 
@@ -108,7 +108,7 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 - `backend/internal/sqlitemigrate/`：`source.go`（**通过 `sqlite3` 命令行 shell 的 `-json` 模式**读旧库，
   另有 `RenderedText`：让 **SQLite 自己**用 `CAST(col AS TEXT)` 渲染值，供校验器做与 Go 无关的比对），
   `mode=ro&immutable=1` URI，**零新增 Go 依赖** —— 发布产物一个字节未变）、`target.go`（目标自省 +
-  `OpenTargetPool`）、`import.go`（单事务搬运 + 提交前行数核对）、`verify.go`（15 项只读检查）。
+  `OpenTargetPool`）、`import.go`（单事务搬运 + 提交前行数核对）、`verify.go`（20 项只读检查）。
 - `backend/cmd/sqliteimport/`：`import` / `verify` 两个子命令；`-replace` 必须**同时**给 `-yes`
   才会 TRUNCATE，否则只打印「将要删掉什么」并以码 3 退出。
 - `backend/internal/sqlitemigrate/testdata/legacy_sqlite_schema.sql`：**冻结的旧 SQLite DDL**，
@@ -139,7 +139,7 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   `int64(float64)` 在超范围时结果未定义、本平台回绕成 `-9223372036854775808`，
   **写进了 PG 而且导入 exit=0**；更糟的是**校验也全绿** —— 因为校验器和搬运工具共用
   `convertValue`，两侧错得一模一样，错误互相抵消。已修两层：① `integral()` 加显式范围检查
-  （拒绝）；② 新增 5 项 `db_rendered_text[...]` 检查，让**两个数据库各自**把值渲染成文本再比
+  （拒绝）；② 新增 5 项 `db_hex_bytes[...]` 检查，让**两个数据库各自**把值渲染成文本再比
   字符串，**全程不经过 `convertValue`**（真源上共 157 个格子）。两道反证都做过：
   把范围检查 `if false &&` 掉 → 单元测试 5 个子用例变红并打出回绕值；端到端那条也变红。
   见 pitfall `2026-10-16-verifier-shares-the-conversion-it-checks.md`。
@@ -183,7 +183,7 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 
 - 🟠 **文本比较的两侧出自同一条有损管道**（`sqlite3 -json` + `encoding/json`；Go 的 JSON 解码器会把
   **非法 UTF-8 替换成 U+FFFD**），于是含非法字节的文本会被**两侧同样替换**、比较相等、报绿。
-  **已修**：`db_rendered_text` 升级为 **`db_hex_bytes`**，比的是**字节**
+  **已修**：`db_hex_bytes` 升级为 **`db_hex_bytes`**，比的是**字节**
   （源 `lower(hex(col))` vs 目标 `lower(encode(convert_to(col::text,'UTF8'),'hex'))`），
   两侧都由各自的数据库产生。**实测真源 0 个文本格子含非法 UTF-8** —— 是潜在洞而非活洞。
 - 🟠 **DOUBLE PRECISION 完全没有独立检查**（原先故意把 REAL 排除在渲染比较之外），而且夹具里的
@@ -236,7 +236,7 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 - ✅ 负向对照：把目标里 2 个被吊销的链接改活、2 个永久链接加上过期时间 → 验证**按名字**变红
   （`revoked_links_stay_404` + `permanent_links_stay_permanent`），并且篡改行数被断言 `>= 1`
   （防止空对照）。
-- ✅ **20 项**检查（`db_rendered_text[...]` 5 项是新增的独立比对）+ **15 个** Go 侧篡改用例
+- ✅ **20 项**检查（`db_hex_bytes[...]` 5 项是新增的独立比对）+ **15 个** Go 侧篡改用例
   （`TestVerifyDetectsEachKindOfTamper`），含「多一列」「改列名」「删视图」「root 归属被改」这类
   **静默丢数据**的形状 —— 每一项检查都有对应的反证用例。
 - ⛔ **未做：真的往生产意图库 `teleport` 灌数据**（P6，且要先问人类）。生产库现在仍是 **0 张表**。
@@ -308,7 +308,7 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
 | ↳ **P2.2b** | ✅ 迁移内容哈希守卫：`schema_migrations` 记 sha256，库与文件不符就拒绝启动（含旧迁移器建的库）。4 个测试 + 端到端反证（改文件→拒绝，撤销→通过，文件与 HEAD 逐字节相同） | 把 2026-10-16 那次事故从「靠守卫事后发现」变成「源头不可能发生」 |
 | ↳ **P2.3** | ✅ 完成：`queries.go` + `keys.go` 改 pgx；sqlc 生成 `storedb`（两张动态 `SET` 列表用 `COALESCE(sqlc.narg(...))` + `CASE` 表达为单条静态语句——ADR 的 Revisit 条款担心的那点已被实测证明可行）；三处上限用已验证的 advisory lock；`SELECT ... FOR UPDATE` 未被采用（无法锁不存在的行）。断言未为了变绿而重写：唯一改断言机制的一处是 `TestNoPlaintextCollected` 的 `sqlite_master` → `information_schema`（PG 无 sqlite 元数据表），**被断言的性质（明文永不入库）原样保留** | P2 的主体 |
 | **P3** | ✅ 完成：Gin 路由表 + `gin.HandlerFunc` handler（`c.Param`）；`internal/httpx` 的认证中间件用 `httpx.GinMiddleware` 适配成 Gin 中间件；信封/session/principal 仍是框架无关的纯函数。**零测试改动**通过。决策与 gin 版本证据见 `2026-10-16-p3-gin-integration.md` | 封套与状态码逐条对齐 —— 已逐条验证 |
-| **P4** | ✅ 完成：全链路起新版（Gin + pgx + 内嵌 SPA + 真 PG），HTTP 契约 **64/64** + 真实浏览器 **15/15**；另做**差分跑**（P3 之前的树 vs 新版，108 请求 / 1 处已知差异）。第三档闸门 `scripts/verify-p4.sh`。**未做：大陆观测点（要等 P6 切换后）** | 切换前的最后一道闸 —— 已过，但外部校验（P5/P6）仍在 |
+| **P4** | ✅ 完成：全链路起新版（Gin + pgx + 内嵌 SPA + 真 PG），HTTP 契约 **64/64** + 真实浏览器 **15/15**；另做**差分跑**（P3 之前的树 vs 新版，108 请求 / 1 处已知差异）。第三档闸门 `scripts/verify-p4.sh`。**大陆观测点已于 P6 补做**（两个观测点） | 切换前的最后一道闸 —— 已过 |
 | **P5** | ✅ 完成：`internal/sqlitemigrate` + `cmd/sqliteimport`（**单事务、默认拒绝非空目标、`-replace` 需 `-yes`**）+ `scripts/verify-p5.sh`（第四档闸门）。**schema 由应用自己的迁移器建，工具从不发 DDL；P5 不建生产库的 schema**（决策记录 `2026-10-16-p5-schema-ownership.md`）。真源真库彩排 15/15 + 负向对照按名字变红。**未做：真往生产库灌**（属 P6） | 切换当天不能靠猜 —— 现在不用猜了，但**生产的第一次仍然在 P6** |
 | **P6** | ✅ **完成（2026-10-17 执行）**：线上切到 hpcore 的新版（Gin + pgx + PostgreSQL），入口是 **`https://teleport.hcyj.xyz/`（根路径）**；hcyj 只做 TLS 终结与转发（frpc 隧道 8788）。旧前缀 `api.hcyj.xyz/yeciorez/teleport*` → **410**（已裁决的 break change）。两个大陆观测点验证通过；旧站点 `clip.hcyj.xyz` 与 `api.hcyj.xyz` 兜底都未受影响。**完整执行记录与三处偏差见 `.ai/runbooks/p6-cutover.md` 第七节**。⛔ 唯一未验的是面板登录（需管理员明文口令，我只有哈希） | 用户要的最终形态已达成：hcyj 只转发，teleport 有自己的域名且在根路径 |
 
@@ -342,7 +342,8 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   真实浏览器（已在公网新域名上跑，见 runbook）。**旧新对账仍未做**（旧版已停，ADR 早记过这个代价）。
 - ⚠️ **`sqliteimport verify` 在活库上会报使用计数差异**：它比对 `view_count`/`request_count`/
   `last_used_at` 这些**可变列**，而库一旦开始服务这些列就会偏离冻结的源 —— 那不是穿透，是流量。
-  P6 切换后就实测到这一条（`view_count` 7→11，因为验证时真的访问了那个永久链接）。
+  P6 切换后就实测到这一条（永久链接的 `view_count` 因为验证时的**真实访问**而增长）。
+  引用具体数字没用——它会随访问继续变。
   活库上应只比**不可变列**。
 - **⚠️ P5 的独立复审没拿到（要如实知道）。** 四种尝试全部因**环境**失败：
   `bg_delegate` × 2 在 35 次工具调用后被 24 turn 上限截断（`child_turn_limit`，未交答案）；
@@ -360,7 +361,7 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   **被断言的性质（明文永不入库）一字未变**；② 冻结契约测试随全套件对真库绿；
   ③ 三处上限用已验证的 advisory lock；④ 未用 `SELECT ... FOR UPDATE`；
   ⑤ **P4 已做**（契约 64/64 + 浏览器 15/15 + 旧树差分 108 请求 / 1 处已知差异）；
-  **P5/P6 仍是外部校验，尚未做**。
+  **P5/P6 已做**（P5 彩排 20/20、P6 切换并线上验证）。
 - **P2.3 已实测 / 未实测**：
   - ✅ `env -u TEST_PG_DSN bash scripts/check.sh` 通过（含 gofmt / vet / schema 快照 / sqlc 漂移）。
   - ✅ `bash scripts/test-pg.sh` 通过（强制真库，且自检夹具仍拒绝非 test 库）。
@@ -369,8 +370,7 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
     `COALESCE(sqlc.narg(...))` + `CASE` 表达为单条静态语句 —— ADR 的 Revisit 条件未触发。
   - ✅ **P4 已补上**：HTTP 端到端契约实测已在真二进制上做完（`scripts/verify-p4-contract.sh`，64/64），
     含真 agent 密钥 POST / 读分享页 / PATCH / DELETE / 过期 410 / 未知 404 / `HEAD` 领取 405。
-  - ✅ 真实浏览器已做（15/15）。⛔ **未做：大陆观测点（P4 全程 loopback）、数据搬运核对、部署**
-    —— P5/P6。
+  - ✅ 真实浏览器已做（15/15）。✅ **大陆观测点、数据搬运核对、部署都已在 P6 完成**（见 runbook 第七节）。
 - **P2.3 期间修掉的自身缺陷**（已记 pitfall）：`ClaimApplication` 的失败分支里，
   `diagnoseClaim` 在事务未提交时又向**连接池**要第二条连接；测试池只有 4 条、8 个竞争者
   ⇒ 持有一半等另一半，**永久挂死**（pgxpool 无超时）。已改为读事务自己的 query set。
@@ -401,7 +401,7 @@ query set 读取。见 pitfall `2026-10-16-store-nested-pool-acquire-deadlocks.m
   2026-10-16 核实：当时记忆库里记着「还不存在」，是错的 —— remote 一直有，只是本地领先 7 个
   未推提交；P2.3 已把这些连同本次改动一起推上去（`ddce6b2..e74ebf3`）。
   **本地与远端的分支名是 `main`，不是 `master`**（早期交接文档写成 master，已改正）。
-- 线上仍是旧版（hcyj，SQLite + net/http）。**但旧版目前已停掉（disabled+inactive），公网入口 502** —— 用户裁决「等重写版就绪再切」。
+- **线上已不是旧版**：2026-10-17 切到 hpcore 的新版（入口 `teleport.hcyj.xyz` 根路径）。hcyj 上的旧 unit 仍 `disabled`+`inactive`，**保留作回滚材料**。
 - 与 clip 共享的基础设施改动要**同时想两边**（hcyj 的 Caddyfile 同时服务两个站点）。
 
 ## 长期约束（改动前必须知道）

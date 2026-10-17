@@ -658,8 +658,18 @@ func (v *Verifier) checkShareSemantics(source map[string]*Table) {
 		{"live_links_still_resolve", live},
 		{"expired_links_stay_410", expired},
 	} {
-		v.add(check.name, len(check.group.failures) == 0, "%s%s", inventory,
-			prefixIf(len(check.group.failures) > 0, " — "+strings.Join(check.group.failures, "; ")))
+		detail := inventory
+		if len(check.group.tokens) == 0 {
+			// Say it out loud. With no token in this category the check compared
+			// nothing, and a green line must not read as "every link of this kind was
+			// verified". (Measured on the real source: expired=0 when P5 ran, and the
+			// category only became non-empty once a live link actually expired.)
+			detail += " — this check compared nothing: the source has no token in that category"
+		}
+		if len(check.group.failures) > 0 {
+			detail += " — " + strings.Join(check.group.failures, "; ")
+		}
+		v.add(check.name, len(check.group.failures) == 0, "%s", detail)
 	}
 }
 
@@ -705,6 +715,23 @@ func (v *Verifier) checkAgentKeys(source map[string]*Table) {
 			unusable = append(unusable, id)
 			if key != nil {
 				failures = append(failures, fmt.Sprintf("%s: revoked_at=%d expires_at=%d but still authenticates", id, revokedAt, expiresAt))
+				continue
+			}
+			// "Does not authenticate" must not be confused with "is not in the target".
+			// A DELETED revoked key would otherwise be counted as merely unusable and
+			// this check would stay green (only row_counts/row_equality would notice).
+			stored, err := v.st.GetAgentKey(id)
+			if err != nil {
+				failures = append(failures, fmt.Sprintf("%s: read target key: %v", id, err))
+				continue
+			}
+			if stored == nil {
+				failures = append(failures, fmt.Sprintf("%s: missing from the target", id))
+				continue
+			}
+			if stored.RevokedAt != revokedAt || stored.ExpiresAt != expiresAt {
+				failures = append(failures, fmt.Sprintf("%s: revoked_at/expires_at is %d/%d in the source but %d/%d in the target",
+					id, revokedAt, expiresAt, stored.RevokedAt, stored.ExpiresAt))
 			}
 			continue
 		}
@@ -733,7 +760,15 @@ func compareRows(ctx context.Context, q querier, source *Table, columns []Target
 	for rowNum, row := range source.Rows {
 		parts := make([]string, len(columns))
 		for i, c := range columns {
-			value, err := convertValue(row[index[c.Name]], c)
+			pos, ok := index[c.Name]
+			if !ok {
+				// A target column the source does not have must be an ERROR, not a
+				// silent read of column 0: sourceColumnIndex returns the zero value for
+				// a missing key, so the id cell would be compared against this column
+				// and the difference would be reported against the wrong column.
+				return nil, fmt.Errorf("table %s has no source column %s", source.Name, c.Name)
+			}
+			value, err := convertValue(row[pos], c)
 			if err != nil {
 				return nil, fmt.Errorf("row %d column %s: %w", rowNum, c.Name, err)
 			}

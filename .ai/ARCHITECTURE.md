@@ -1,15 +1,15 @@
 # Architecture
 
-> ## ⚠️ 重写进行中（P2.3 已完成，P3–P6 未做）
+> ## ✅ 重写已完成，线上已切换（2026-10-17）
 >
-> 正在从 `net/http + SQLite` 重写为 `Gin + pgx/sqlc + PostgreSQL`，**在野契约逐字节不变**。
+> 已从 `net/http + SQLite` 迁到 `Gin + pgx/sqlc + PostgreSQL`，**在野契约逐字节不变**。
+> 线上：服务跑在 **hpcore（本机）**，入口 **`https://teleport.hcyj.xyz/`（根路径）**，
+> **hcyj 只做 TLS 终结与转发**（frpc 隧道 8788）；旧前缀 `api.hcyj.xyz/yeciorez/teleport*`
+> 返回 **410**（用户裁决的 break change）。数据在**本机的 PostgreSQL 库 `teleport`**。
 >
-> 当前工作树：**存储已切到 PostgreSQL**（`internal/store` 是 pgx + sqlc，`DATABASE_URL`
-> 取代 `DB_PATH`，SQLite 驱动 / `schema.sql` / `migrations/` 已删除）；**HTTP 层仍是**
-> `net/http`（Gin 是 P3）。线上仍是旧版且已停（502）。
->
-> 本文档中标注「旧版」的条目描述的是 **P2.3 之前**或**尚未重写**的部分。
-> 权威清单见 `.ai/decisions/2026-10-16-rewrite-on-gin-and-postgres.md`。
+> 本文档中标注「旧版」的条目描述的是**历史形态**；当前状态见 `.ai/CURRENT_TASK.md`，
+> 切换记录见 `.ai/runbooks/p6-cutover.md`，权威清单见
+> `.ai/decisions/2026-10-16-rewrite-on-gin-and-postgres.md`。
 
 ## 1. Purpose
 
@@ -71,7 +71,8 @@ Teleport 是**个人 AI 报告展示与时效分享**平台。AI 在终端/工�
                   Caddy(:443, docker)  handle /yeciorez/teleport*   ← 保留前缀，不 strip
                         │
                         ▼
-                  Go(:8788, 仅监听 docker 网桥 172.17.0.1) ─> PostgreSQL（旧版线上：SQLite/WAL）
+                  Go(:8788, 仅监听 loopback 127.0.0.1；公网经 hcyj 的 Caddy + frpc 隧道)
+                                                       ─> PostgreSQL（库 teleport，本机）
                         ├─ /api/*      JSON API（统一封套）
                         ├─ /s/{token}  服务端渲染分享页（严格 CSP）
                         ├─ /k/{id}     服务端渲染「一步交接」领取页（无 JS 时惰性）

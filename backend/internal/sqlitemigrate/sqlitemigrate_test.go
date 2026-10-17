@@ -22,8 +22,16 @@ import (
 type fakeReader struct {
 	versions    []string
 	tables      []Table
+	unknown     []string
+	unknownErr  error
 	versionsErr error
 	tablesErr   error
+}
+
+// UnknownTables is part of the Reader interface: the source-side equivalent of the
+// target's "refuse a table I do not recognise" check.
+func (f *fakeReader) UnknownTables(context.Context) ([]string, error) {
+	return f.unknown, f.unknownErr
 }
 
 func (f *fakeReader) MigrationVersions(context.Context) ([]string, error) {
@@ -503,5 +511,128 @@ func TestHasRealAffinity(t *testing.T) {
 		if got := hasRealAffinity(tc.declType); got != tc.want {
 			t.Errorf("hasRealAffinity(%q) = %v, want %v", tc.declType, got, tc.want)
 		}
+	}
+}
+
+// TestImportRefusesAnUnknownSourceTable closes the one loss no other check can see:
+// a table the importer never reads leaves its rows behind while every count still
+// matches. The nil querier is the assertion that the refusal happens before the
+// target is touched.
+func TestImportRefusesAnUnknownSourceTable(t *testing.T) {
+	src := &fakeReader{
+		versions: []string{"0001_init", "0002_agent_keys"},
+		unknown:  []string{"old_notes"},
+	}
+	_, err := Import(context.Background(), src, nil, false)
+	if err == nil {
+		t.Fatal("Import accepted a source holding a table it does not read")
+	}
+	if !strings.Contains(err.Error(), "old_notes") {
+		t.Errorf("error %q does not name the table", err)
+	}
+}
+
+// TestAnyToInt64RefusesAPlainOutOfRangeLiteral pins the asymmetry the float path
+// used to have: +2^63 was refused, but the double nearest to -9223372036854775809 is
+// exactly -2^63, which is the INCLUSIVE lower bound, so the value was accepted as
+// MinInt64 with no error.
+func TestAnyToInt64RefusesAPlainOutOfRangeLiteral(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		value   string
+		want    int64
+		wantErr bool
+	}{
+		{name: "int64 max", value: "9223372036854775807", want: math.MaxInt64},
+		{name: "int64 min", value: "-9223372036854775808", want: math.MinInt64},
+		{name: "one above max", value: "9223372036854775808", wantErr: true},
+		{name: "one below min", value: "-9223372036854775809", wantErr: true},
+		{name: "far below min", value: "-99999999999999999999", wantErr: true},
+		// Exponent/decimal spellings are how a REAL in an INTEGER-affinity column
+		// arrives, so those still go through the float path and its range check.
+		{name: "exponent form of an in-range value", value: "1.791563326606e12", want: 1791563326606},
+		{name: "exponent form out of range", value: "9.2233720368547758e+18", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := anyToInt64(json.Number(tc.value), "created_at")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("anyToInt64(%s) = %d, want an error", tc.value, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("anyToInt64(%s): %v", tc.value, err)
+			}
+			if got != tc.want {
+				t.Errorf("anyToInt64(%s) = %d, want %d", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAnyToFloat64RefusesNonFiniteText: ParseFloat accepts "inf"/"nan" spellings, so
+// a TEXT value in a REAL-affinity column spelled that way became Infinity/NaN in the
+// target — and nothing could see it, because REAL columns are excluded from the byte
+// comparison and row_equality would agree (both sides parsed the same string).
+func TestAnyToFloat64RefusesNonFiniteText(t *testing.T) {
+	for _, spelling := range []string{"inf", "Inf", "+Inf", "-inf", "infinity", "INFINITY", "nan", "NaN"} {
+		t.Run(spelling, func(t *testing.T) {
+			got, err := anyToFloat64(spelling, "requested_hours")
+			if err == nil {
+				t.Fatalf("anyToFloat64(%q) = %v, want an error: a non-finite value must not be imported silently", spelling, got)
+			}
+		})
+	}
+	if got, err := anyToFloat64("720.5", "requested_hours"); err != nil || got != 720.5 {
+		t.Errorf("anyToFloat64(720.5) = %v, %v; want 720.5, nil", got, err)
+	}
+}
+
+func TestIsIntegerLiteral(t *testing.T) {
+	for _, tc := range []struct {
+		in   string
+		want bool
+	}{
+		{"0", true}, {"-1", true}, {"+42", true}, {"9223372036854775808", true},
+		{"", false}, {"-", false}, {"+", false}, {"1.0", false}, {"1e3", false}, {"0x10", false}, {" 1", false},
+	} {
+		if got := isIntegerLiteral(tc.in); got != tc.want {
+			t.Errorf("isIntegerLiteral(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestTypeClassesMatch is the guard for "names alone let a target column be retyped
+// invisibly": with names equal, a BIGINT turned into TEXT would store the same
+// decimal digits and compare equal, so both import and verify would stay green.
+func TestTypeClassesMatch(t *testing.T) {
+	for _, tc := range []struct {
+		declType string
+		dataType string
+		wantSame bool
+	}{
+		{"INTEGER", "bigint", true},
+		{"INTEGER", "integer", true},
+		{"TEXT", "text", true},
+		{"TEXT", "character varying", true},
+		{"REAL", "double precision", true},
+		{"REAL", "real", true},
+		{"INTEGER", "text", false},
+		{"TEXT", "bigint", false},
+		{"REAL", "bigint", false},
+	} {
+		same := sqliteAffinityClass(tc.declType) == pgTypeClass(tc.dataType)
+		if same != tc.wantSame {
+			t.Errorf("sqliteAffinityClass(%q)=%q vs pgTypeClass(%q)=%q: same=%v, want %v",
+				tc.declType, sqliteAffinityClass(tc.declType), tc.dataType, pgTypeClass(tc.dataType), same, tc.wantSame)
+		}
+	}
+
+	// And end to end: same names, different class → refused.
+	source := []Column{{Name: "created_at", DeclType: "INTEGER"}}
+	target := []TargetColumn{{Name: "created_at", DataType: "text"}}
+	if err := checkColumnsMatch("reports", source, target); err == nil {
+		t.Error("checkColumnsMatch accepted the same column names with different type classes")
 	}
 }

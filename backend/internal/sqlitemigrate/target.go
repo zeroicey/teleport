@@ -236,11 +236,83 @@ func checkColumnsMatch(table string, source []Column, target []TargetColumn) err
 	sort.Strings(sourceNames)
 	sort.Strings(targetNames)
 	if strings.Join(sourceNames, ",") == strings.Join(targetNames, ",") {
+		// Names match, so also compare the TYPE CLASS. Names alone let a target
+		// column be retyped (BIGINT -> TEXT) invisibly: convertValue would take the
+		// text branch, store the same decimal digits, and db_hex_bytes would compare
+		// equal — import and verify both green while the column is no longer a
+		// number. The comparison is by affinity class, not by exact type, because
+		// SQLite's declared types do not map one-to-one onto PostgreSQL's.
+		targetByName := make(map[string]string, len(target))
+		for _, c := range target {
+			targetByName[c.Name] = pgTypeClass(c.DataType)
+		}
+		var mismatched []string
+		for _, c := range source {
+			want, got := sqliteAffinityClass(c.DeclType), targetByName[c.Name]
+			// Skip when the source's declared type constrains nothing, or when the
+			// target type is unknown.
+			//
+			// SQLite gives a column with no declared type BLOB affinity, and BLOB
+			// affinity means "store whatever comes, do not coerce" — it can hold any
+			// storage class, so comparing it against the target's class would be a
+			// false refusal (a legacy `CREATE TABLE t(a)` mapped to a TEXT column is a
+			// perfectly good import). What guards that case is the value-level refusal
+			// in convertValue, which keys off the TARGET type.
+			if want == "blob" || got == "" {
+				continue
+			}
+			if want != got {
+				mismatched = append(mismatched, fmt.Sprintf("%s (source %s/%q, target %s/%q)",
+					c.Name, want, c.DeclType, got, targetByName[c.Name]))
+			}
+		}
+		if len(mismatched) > 0 {
+			return fmt.Errorf("table %s: column type classes differ: %s",
+				table, strings.Join(mismatched, ", "))
+		}
 		return nil
 	}
 	return fmt.Errorf("table %s: the SQLite source and the PostgreSQL target do not have the "+
 		"same columns.\n  source: %s\n  target: %s",
 		table, strings.Join(sourceNames, ", "), strings.Join(targetNames, ", "))
+}
+
+// sqliteAffinityClass reduces a SQLite declared type to one of SQLite's own
+// affinity classes (INTEGER, TEXT, BLOB, REAL, NUMERIC), using the documented rules
+// rather than a guess: the declared type is the only thing SQLite offers.
+func sqliteAffinityClass(declType string) string {
+	upper := strings.ToUpper(declType)
+	switch {
+	case strings.Contains(upper, "INT"):
+		return "integer"
+	case strings.Contains(upper, "CHAR"), strings.Contains(upper, "CLOB"), strings.Contains(upper, "TEXT"):
+		return "text"
+	case upper == "" || strings.Contains(upper, "BLOB"):
+		return "blob"
+	case strings.Contains(upper, "REAL"), strings.Contains(upper, "FLOA"), strings.Contains(upper, "DOUB"):
+		return "real"
+	default:
+		return "numeric"
+	}
+}
+
+// pgTypeClass reduces a PostgreSQL data_type to the same vocabulary, so the two
+// sides can be compared without pretending the type names are the same.
+func pgTypeClass(dataType string) string {
+	switch dataType {
+	case "bigint", "integer", "smallint", "int8", "int4", "int2":
+		return "integer"
+	case "double precision", "real", "float8", "float4":
+		return "real"
+	case "numeric", "decimal":
+		return "numeric"
+	case "text", "character varying", "character", "varchar", "char":
+		return "text"
+	case "bytea":
+		return "blob"
+	default:
+		return dataType
+	}
 }
 
 // sourceColumnIndex maps column name -> position in a source row.

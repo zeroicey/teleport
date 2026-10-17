@@ -60,8 +60,8 @@ Go 工具链：`go 1.26` 模块在 `backend/`，本机 `go` 在 `/usr/local/go/b
 ## 硬约定
 
 - **`pnpm` only。** 不引 npm/yarn；`pnpm-lock.yaml` 是唯一锁文件，`pnpm-workspace.yaml` 不要改。
-- **前缀只写一处。** 服务挂在 **`teleport.hcyj.xyz` 根路径**（`ROUTE_PREFIX=""`，用户 2026-10-16
-  裁决，见 `.ai/decisions/2026-10-16-p6-single-root-entry.md`）。前缀仍由 `ROUTE_PREFIX` 推导，
+- **前缀只写一处。** 服务挂在 **`teleport.hcyj.xyz` 根路径**（**`ROUTE_PREFIX="/"`**，用户
+  2026-10-16 裁决，见 `.ai/decisions/2026-10-16-p6-single-root-entry.md`）。前缀仍由 `ROUTE_PREFIX` 推导，
   Go 路由、`vite.config.ts` 的 `base`、`web/src/api.ts` 的 `BASE_URL`、分享链接全部从它来。
   ⚠️ **根路径要写 `ROUTE_PREFIX="/"`，不能写空值** —— `env()` 把「设为空」当成「未设置」并回落到
   默认的 `/yeciorez/teleport`（实测：`""→/yeciorez/teleport`、`"/"→""`）。

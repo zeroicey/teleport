@@ -35,7 +35,12 @@ type Report struct {
 // the rewritten service will serve from, `expires_at = 0` links are permanent
 // and cannot be re-created from anywhere else, and a half-imported set would be
 // indistinguishable from a complete one by looking at the dashboard. A failure
-// leaves the target byte-identical to how it was found.
+// leaves the five tables byte-identical to how they were found.
+//
+// That guarantee covers the ROWS. The CLI opens the target through store.OpenPG,
+// which applies the schema migrations *before* this function runs, so a failed
+// import can still leave a freshly migrated (empty) schema behind — the
+// deployment's intended state, not a data change.
 //
 // replace is the explicit opt-in that allows importing over existing rows. The
 // default refuses a non-empty target: a second import must be a decision, not
@@ -54,6 +59,16 @@ func Import(ctx context.Context, src Reader, q querier, replace bool) (*Report, 
 	}
 	if err := CheckSourceMigrations(versions); err != nil {
 		return nil, err
+	}
+	// Refuse a source holding tables this importer does not read. Nothing else can
+	// see this loss: the counts match, every row matches, and the extra table's rows
+	// are simply gone.
+	if unknown, err := src.UnknownTables(ctx); err != nil {
+		return nil, err
+	} else if len(unknown) > 0 {
+		return nil, fmt.Errorf("the source contains table(s) this importer does not read: %s. "+
+			"Refusing, because importing only the known tables would leave those rows behind "+
+			"silently — every count would still match", strings.Join(unknown, ", "))
 	}
 
 	source, err := src.Tables(ctx)
@@ -354,6 +369,16 @@ func anyToInt64(v any, column string) (int64, error) {
 		if i, err := value.Int64(); err == nil {
 			return i, nil
 		}
+		// A PLAIN integer literal that Int64() rejected is out of range, so it is
+		// refused here rather than sent through float64. The bound was asymmetric
+		// otherwise: +2^63 is caught by integral()'s exclusive upper bound, but the
+		// double nearest to -9223372036854775809 is exactly -2^63, which is the
+		// INCLUSIVE lower bound — so it would have been accepted as MinInt64 with no
+		// error at all. Only spellings with a fraction or exponent need the float
+		// path (a REAL in an INTEGER-affinity column).
+		if isIntegerLiteral(value.String()) {
+			return 0, fmt.Errorf("column %s: %s does not fit in a 64-bit integer", column, value.String())
+		}
 		f, err := value.Float64()
 		if err != nil {
 			return 0, fmt.Errorf("column %s: cannot convert %s to an integer: %w", column, value.String(), err)
@@ -384,6 +409,14 @@ func anyToFloat64(v any, column string) (float64, error) {
 		f, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
 		if err != nil {
 			return 0, fmt.Errorf("column %s: cannot parse %q as a number: %w", column, value, err)
+		}
+		// ParseFloat accepts "inf", "infinity" and "nan" without error, so a TEXT
+		// value in a REAL-affinity column spelled that way would become Infinity/NaN
+		// in the target — and no check could see it, because REAL columns are excluded
+		// from the byte comparison and row_equality would agree (both sides parsed the
+		// same string). Non-finite is refused instead.
+		if math.IsInf(f, 0) || math.IsNaN(f) {
+			return 0, fmt.Errorf("column %s: %q is not a finite number", column, value)
 		}
 		return f, nil
 	default:
@@ -425,6 +458,30 @@ func integral(f float64, column string) (int64, error) {
 			"and converting it would wrap silently", column, f)
 	}
 	return int64(f), nil
+}
+
+// isIntegerLiteral reports whether s is a plain decimal integer literal: an
+// optional sign followed by digits, with no fraction and no exponent.
+//
+// It exists to tell "this integer is out of range" (refuse) from "this is a REAL
+// that happens to be spelled without a fraction" (go through the float path and let
+// integral() decide).
+func isIntegerLiteral(s string) bool {
+	if s == "" {
+		return false
+	}
+	if s[0] == '+' || s[0] == '-' {
+		s = s[1:]
+	}
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // parseInt parses a decimal integer, refusing anything with a fractional part.

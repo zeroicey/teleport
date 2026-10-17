@@ -39,7 +39,15 @@ PORT="${P4_PORT:-8788}"
 # "no prefix" — an EMPTY value is treated as "unset" by the env reader and falls
 # back to the default prefix, which would silently test the wrong thing
 # (measured; see .ai/runbooks/p6-cutover.md risk 13).
-PREFIX="${P4_ROUTE_PREFIX:-/yeciorez/teleport}"
+# `${VAR:-default}` substitutes on UNSET **or EMPTY**, which is exactly the
+# env()-falls-back-to-the-default trap this variable is about: `P4_ROUTE_PREFIX=`
+# would silently run the OLD-prefix shape and go green, i.e. a false green for the
+# one property a root-path run exists to check. Use `${VAR-default}` (unset only)
+# and normalise "" and "/" to the root path explicitly.
+case "${P4_ROUTE_PREFIX-/yeciorez/teleport}" in
+  ""|"/") PREFIX="/" ;;
+  *)      PREFIX="${P4_ROUTE_PREFIX-/yeciorez/teleport}" ;;
+esac
 # The Go side wants "/" for "no prefix"; the URL-building side wants "" (so that
 # "$BASE$URL_PREFIX/api/health" has no double slash).
 if [ "$PREFIX" = "/" ]; then URL_PREFIX=""; else URL_PREFIX="$PREFIX"; fi
@@ -67,9 +75,10 @@ cleanup() {
       && echo "dropped schema $SCHEMA" || true
   fi
 }
-trap cleanup EXIT
-SCHEMA_DROPPABLE=0
-
+# The cleanup trap is installed AFTER the symbols it uses are defined: it reads
+# SCHEMA_DROPPABLE, SCHEMA and the psql_q function, and a signal arriving in the
+# window between `trap` and their definitions made the trap itself fail under
+# `set -u` (masking the original failure and skipping the schema drop).
 # ---------------------------------------------------------------- database ----
 PGPW="${P4_PGPASSWORD:-}"
 if [ -z "$PGPW" ] && [ -r /data/services/teleport/.pgpassword.tmp ]; then
@@ -78,6 +87,7 @@ fi
 if [ -z "$PGPW" ] && sudo -n true 2>/dev/null; then
   PGPW="$(sudo -n cat /data/services/teleport/.pgpassword.tmp 2>/dev/null || true)"
 fi
+SCHEMA_DROPPABLE=0
 
 psql_q() { # <db> <sql>
   if command -v psql >/dev/null 2>&1; then
@@ -86,6 +96,7 @@ psql_q() { # <db> <sql>
     docker exec -e PGPASSWORD="$PGPW" postgres psql -U teleport -d "$1" -tAc "$2"
   fi
 }
+trap cleanup EXIT
 
 if [ -n "${P4_DATABASE_URL:-}" ]; then
   DB_URL="$P4_DATABASE_URL"
@@ -205,7 +216,7 @@ say "HTTP contract over a real socket"
 # Kept on disk: a green run's output is not interesting, but a failure that only shows
 # up once in several runs is impossible to diagnose after the terminal has scrolled.
 CONTRACT_LOG="$REPO/bin/e2e/p4-contract.log"
-bash scripts/verify-p4-contract.sh "$BASE" "$URL_PREFIX" "$AGENT_SECRET_KEY" "$ADMIN_PASSWORD" 2>&1 | tee "$CONTRACT_LOG"
+P4_ADMIN_PASSWORD="$ADMIN_PASSWORD" bash scripts/verify-p4-contract.sh "$BASE" "$URL_PREFIX" "$AGENT_SECRET_KEY" 2>&1 | tee "$CONTRACT_LOG"
 CONTRACT=${PIPESTATUS[0]}
 [ "$CONTRACT" = 0 ] || die "the HTTP contract check failed (full output: ${CONTRACT_LOG#$REPO/})"
 
@@ -254,7 +265,7 @@ except Exception:
 
   say "real browser verification (headless Chromium over CDP)"
   BROWSER_LOG="$REPO/bin/e2e/p4-browser.log"
-  node scripts/verify-teleport-browser.cjs "$BASE" "$URL_PREFIX" "$ADMIN_PASSWORD" "$BROWSER_SHARE" 2>&1 | tee "$BROWSER_LOG"
+  P4_ADMIN_PASSWORD="$ADMIN_PASSWORD" node scripts/verify-teleport-browser.cjs "$BASE" "$URL_PREFIX" "$BROWSER_SHARE" 2>&1 | tee "$BROWSER_LOG"
   BROWSER=${PIPESTATUS[0]}
   [ "$BROWSER" = 0 ] || die "the browser verification failed (full output: ${BROWSER_LOG#$REPO/})"
 fi

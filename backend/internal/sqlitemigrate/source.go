@@ -105,6 +105,12 @@ type Reader interface {
 	// produced by this package's own conversion; see
 	// Verifier.checkDatabaseHexBytes for why that matters.
 	RenderedHex(ctx context.Context, table string, columns []string) (map[string][]RenderedValue, error)
+	// UnknownTables returns source tables this importer does not know about.
+	// The target side refuses unrecognised tables (checkTargetTables); this is
+	// the source-side equivalent, and it closes the one loss no other check can
+	// see: a table the importer never reads leaves its rows behind while every
+	// count still matches.
+	UnknownTables(ctx context.Context) ([]string, error)
 }
 
 // ErrSourceHasWAL means a SQLite sidecar file was found next to the source.
@@ -153,6 +159,15 @@ func OpenSource(ctx context.Context, path string) (*Source, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("resolve source path: %w", err)
+	}
+	// The read-only URI is assembled by string concatenation and SQLite parses it as
+	// a URI: a '%' is percent-decoded, and a '?' or '#' starts the query/fragment, so
+	// such a path can open a DIFFERENT file (or truncate the path) while
+	// mode=ro&immutable=1 still applies. Refusing is cheaper than escaping every
+	// segment correctly, and this tool is handed one known file.
+	if strings.ContainsAny(abs, "%?#") {
+		return nil, fmt.Errorf("source path %q contains %%, ? or #, which SQLite would read as URI syntax "+
+			"rather than as part of the path. Rename or copy it to a plain path", abs)
 	}
 	info, err := os.Stat(abs)
 	if err != nil {
@@ -239,7 +254,10 @@ func (s *Source) readOnlyURI() string {
 func (s *Source) query(ctx context.Context, sql string) ([]map[string]any, error) {
 	// The shell is resolved through exec.LookPath above, and the only interpolated
 	// values are this package's fixed table allowlist and the database's own
-	// catalogue, never a caller-supplied string; sql is assembled by readTable.
+	// catalogue, never a caller-supplied string; sql is assembled by readTable, and
+	// the source path is refused at OpenSource if it contains URI syntax. No shell is
+	// involved: exec.Command does not go through one.
+	// nosemgrep: go.lang.security.audit.dangerous-exec-command.dangerous-exec-command -- arguments audited above
 	cmd := exec.CommandContext(ctx, s.bin, s.readOnlyURI(), "-json", sql)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -304,6 +322,33 @@ func (s *Source) MigrationVersions(ctx context.Context) ([]string, error) {
 		versions = append(versions, v)
 	}
 	return versions, nil
+}
+
+// UnknownTables lists the source's tables that this importer does not read.
+//
+// SQLite's own bookkeeping tables (sqlite_*) are ignored, and so is
+// schema_migrations, which describes the old migrator rather than the data.
+func (s *Source) UnknownTables(ctx context.Context) ([]string, error) {
+	rows, err := s.query(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name`)
+	if err != nil {
+		return nil, fmt.Errorf("enumerate source tables: %w", err)
+	}
+	known := map[string]bool{"schema_migrations": true}
+	for _, name := range Tables {
+		known[name] = true
+	}
+	var unknown []string
+	for _, row := range rows {
+		name, ok := row["name"].(string)
+		if !ok {
+			return nil, fmt.Errorf("source has a table whose name is not text: %v", row["name"])
+		}
+		if strings.HasPrefix(name, "sqlite_") || known[name] {
+			continue
+		}
+		unknown = append(unknown, name)
+	}
+	return unknown, nil
 }
 
 // CheckSourceMigrations refuses a source whose recorded versions are not
