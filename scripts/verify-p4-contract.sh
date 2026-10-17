@@ -16,8 +16,17 @@
 # names the contract it broke instead of "something went wrong".
 set -uo pipefail
 
-BASE="${1:?base url required, e.g. http://127.0.0.1:8788}"
-P="${2:?route prefix required, e.g. /yeciorez/teleport}"
+# The prefix is REQUIRED as an argument but may be EMPTY: the P6 deployment serves
+# the root path, and `"${2:?}"` would treat an explicit empty value as "missing"
+# and refuse to run. Distinguishing "no argument" from "empty argument" is the
+# whole point here — the same distinction the ROUTE_PREFIX env reader gets wrong
+# for empty strings (see .ai/runbooks/p6-cutover.md risk 13).
+if [ $# -lt 2 ]; then
+  echo "usage: $0 BASE PREFIX AGENT_SECRET ADMIN_PASSWORD   (PREFIX may be empty for a root-path deployment)" >&2
+  exit 2
+fi
+BASE="$1"
+P="$2"
 AGENT="${3:?agent secret (AGENT_SECRET_KEY) required}"
 ADMIN_PASSWORD="${4:?admin password required}"
 
@@ -108,9 +117,28 @@ check "GET $P/api/health is 200" "$([ "$CODE" = 200 ] && echo 0 || echo 1)" "got
 check "the success envelope is {ok:true,data,requestId}" \
   "$([ "$(jget "$BODY" 'd["ok"]')" = True ] && [ -n "$(jget "$BODY" 'd["data"]')" ] && [ -n "$(jget "$BODY" 'd["requestId"]')" ] && echo 0 || echo 1)" "$BODY"
 
-req GET "$BASE/api/health" ""
-check "the same path WITHOUT the prefix is not served (404)" \
-  "$([ "$CODE" = 404 ] && echo 0 || echo 1)" "got $CODE"
+if [ -n "$P" ]; then
+  # Non-empty prefix: it must be genuinely enforced, so the unprefixed path is a
+  # different path and must 404.
+  req GET "$BASE/api/health" ""
+  check "the same path WITHOUT the prefix is not served (404)" \
+    "$([ "$CODE" = 404 ] && echo 0 || echo 1)" "got $CODE"
+else
+  # Root-path deployment (P6). There is no "without the prefix" variant — $API and
+  # $BASE are the same URL — so that check would contradict the 200 asserted above.
+  # The analogous property is that the OLD prefix is not serving the API either.
+  #
+  # Measured against a bare backend (no Caddy): /yeciorez/teleport/api/health falls
+  # through to the SPA fallback — 200 text/html, NOT the JSON envelope. That is
+  # acceptable only because Caddy answers the old prefix with 410 before the request
+  # ever arrives, and it is why that Caddy rule is REQUIRED rather than cosmetic:
+  # without it an old link would receive a 200 HTML shell whose asset URLs point at
+  # the root of api.hcyj.xyz, which is a different service.
+  req GET "$BASE/yeciorez/teleport/api/health" ""
+  check "the OLD prefix is not serving the API (no JSON envelope)" \
+    "$([ "$CODE" = 200 ] && printf '%s' "$BODY" | grep -q '"ok":true' && echo 1 || echo 0)" \
+    "got $CODE ${BODY:0:60}"
+fi
 
 req GET "$API/api/reports" ""
 check "an unauthenticated call is 401 with {ok:false,error:{code,message},requestId}" \

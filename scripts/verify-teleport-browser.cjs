@@ -26,7 +26,11 @@ const net = require('node:net');
 const path = require('node:path');
 
 const BASE = process.argv[2] || 'http://127.0.0.1:8788';
-const PREFIX = process.argv[3] || '/yeciorez/teleport';
+// An EXPLICIT empty argument means "root path" and must NOT fall back to the old
+// prefix: `|| '/yeciorez/teleport'` silently turned the P6 root-path run into a
+// run against the old prefix (the same trap as ROUTE_PREFIX="" in the Go config,
+// see .ai/runbooks/p6-cutover.md risk 13).
+const PREFIX = process.argv.length > 3 ? process.argv[3] : '/yeciorez/teleport';
 const PASSWORD = process.argv[4];
 const SHARE = process.argv[5] || '';
 

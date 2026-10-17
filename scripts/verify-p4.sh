@@ -34,7 +34,15 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 
 PORT="${P4_PORT:-8788}"
-PREFIX="/yeciorez/teleport"
+# The route prefix is overridable so the same whole-chain verification can be run
+# against the P6 shape (root path). "/" is what config.normalizePrefix maps to
+# "no prefix" — an EMPTY value is treated as "unset" by the env reader and falls
+# back to the default prefix, which would silently test the wrong thing
+# (measured; see .ai/runbooks/p6-cutover.md risk 13).
+PREFIX="${P4_ROUTE_PREFIX:-/yeciorez/teleport}"
+# The Go side wants "/" for "no prefix"; the URL-building side wants "" (so that
+# "$BASE$URL_PREFIX/api/health" has no double slash).
+if [ "$PREFIX" = "/" ]; then URL_PREFIX=""; else URL_PREFIX="$PREFIX"; fi
 BASE="http://127.0.0.1:$PORT"
 # The existing test database, plus a schema this script owns and drops.
 DBNAME="${P4_DBNAME:-teleport_test}"
@@ -102,7 +110,12 @@ fi
 # ------------------------------------------------------------------ build ----
 if [ "${P4_SKIP_BUILD:-0}" != "1" ]; then
   say "release build (frontend -> //go:embed -> single binary)"
-  pnpm run --silent build || die "frontend build failed"
+  # VITE_ROUTE_PREFIX must be passed through: the SPA's asset base is baked in at
+  # build time (vite.config.ts), so a run with P4_ROUTE_PREFIX=/ that used the
+  # default build would test a root-path backend serving an old-prefix frontend —
+  # a mismatch that looks like a product bug. Same pairing the P6 runbook warns
+  # about (risk 9/13).
+  VITE_ROUTE_PREFIX="$PREFIX" pnpm run --silent build || die "frontend build failed"
   mkdir -p "$(dirname "$BIN")"
   ( cd backend && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
       -trimpath -tags embed_frontend -ldflags "-s -w" -o "$BIN" . ) || die "go build failed"
@@ -144,7 +157,7 @@ SESSION_SECRET="p4-session-$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-
 export AGENT_SECRET_KEY SESSION_SECRET
 echo "generated an admin password and two secrets (values not printed)"
 
-say "starting the server on $BASE$PREFIX"
+say "starting the server on $BASE$URL_PREFIX"
 mkdir -p "$(dirname "$LOG")"
 
 # Pre-flight: nothing may already be answering at this address. Without this, a server
@@ -153,8 +166,8 @@ mkdir -p "$(dirname "$LOG")"
 # against THAT process — which is pointing at a schema this run has just dropped and
 # recreated. The result was a single, unexplained check failure on one run out of
 # several. Failing loudly here turns that into an obvious message.
-if curl -sf -o /dev/null --max-time 2 "$BASE$PREFIX/api/health" 2>/dev/null; then
-  die "something is already serving $BASE$PREFIX (its /api/health answered).
+if curl -sf -o /dev/null --max-time 2 "$BASE$URL_PREFIX/api/health" 2>/dev/null; then
+  die "something is already serving $BASE$URL_PREFIX (its /api/health answered).
 Stop it (e.g. pkill -f teleport-linux-amd64) or choose another port with P4_PORT=."
 fi
 
@@ -171,13 +184,13 @@ COOKIE_SECURE=false \
 SERVER_PID=$!
 
 for _ in $(seq 1 60); do
-  if curl -sf -o /dev/null "$BASE$PREFIX/api/health"; then break; fi
+  if curl -sf -o /dev/null "$BASE$URL_PREFIX/api/health"; then break; fi
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "--- server log ---"; cat "$LOG"; die "the server exited during startup"
   fi
   sleep 0.5
 done
-curl -sf -o /dev/null "$BASE$PREFIX/api/health" || { echo "--- server log ---"; cat "$LOG"; die "server never became healthy"; }
+curl -sf -o /dev/null "$BASE$URL_PREFIX/api/health" || { echo "--- server log ---"; cat "$LOG"; die "server never became healthy"; }
 echo "server is up (pid $SERVER_PID)"
 
 # The startup log is evidence too: a schema migration should have run against a fresh
@@ -192,7 +205,7 @@ say "HTTP contract over a real socket"
 # Kept on disk: a green run's output is not interesting, but a failure that only shows
 # up once in several runs is impossible to diagnose after the terminal has scrolled.
 CONTRACT_LOG="$REPO/bin/e2e/p4-contract.log"
-bash scripts/verify-p4-contract.sh "$BASE" "$PREFIX" "$AGENT_SECRET_KEY" "$ADMIN_PASSWORD" 2>&1 | tee "$CONTRACT_LOG"
+bash scripts/verify-p4-contract.sh "$BASE" "$URL_PREFIX" "$AGENT_SECRET_KEY" "$ADMIN_PASSWORD" 2>&1 | tee "$CONTRACT_LOG"
 CONTRACT=${PIPESTATUS[0]}
 [ "$CONTRACT" = 0 ] || die "the HTTP contract check failed (full output: ${CONTRACT_LOG#$REPO/})"
 
@@ -230,7 +243,7 @@ PYSEED
 )"
   SEED="$(curl -sS -X POST -H 'Content-Type: application/json' \
       -H "Authorization: Bearer $AGENT_SECRET_KEY" --data-binary "$SEED_BODY" \
-      "$BASE$PREFIX/api/reports")"
+      "$BASE$URL_PREFIX/api/reports")"
   BROWSER_SHARE="$(printf '%s' "$SEED" | python3 -c 'import json,sys
 try:
     print(json.load(sys.stdin)["data"]["share"]["token"])
@@ -241,7 +254,7 @@ except Exception:
 
   say "real browser verification (headless Chromium over CDP)"
   BROWSER_LOG="$REPO/bin/e2e/p4-browser.log"
-  node scripts/verify-teleport-browser.cjs "$BASE" "$PREFIX" "$ADMIN_PASSWORD" "$BROWSER_SHARE" 2>&1 | tee "$BROWSER_LOG"
+  node scripts/verify-teleport-browser.cjs "$BASE" "$URL_PREFIX" "$ADMIN_PASSWORD" "$BROWSER_SHARE" 2>&1 | tee "$BROWSER_LOG"
   BROWSER=${PIPESTATUS[0]}
   [ "$BROWSER" = 0 ] || die "the browser verification failed (full output: ${BROWSER_LOG#$REPO/})"
 fi
