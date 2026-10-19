@@ -84,6 +84,87 @@ type Handler struct {
 	etagOnce sync.Once
 	etagMu   sync.Mutex
 	etags    map[string]string
+
+	// securityHeaders are applied to every response this handler writes, before
+	// the handler's own Cache-Control/Content-Type work.
+	//
+	// They live here rather than in the transport chain because they constrain the
+	// FRONTEND specifically: the share page already sets its own, much stricter
+	// policy, and the `format: "html"` report must stay free of any policy at all.
+	// A header set in the shared chain would hit all three.
+	securityHeaders http.Header
+}
+
+// SetSecurityHeaders installs headers to add to every response this handler
+// writes, replacing any previous set.
+//
+// The headers are applied lazily, at the moment the response is committed (see
+// headerWriter), not when ServeHTTP is entered. That ordering is the whole
+// point: a header set on entry would already be present when the handler set
+// Content-Type, so the two would collide and the security header would win — a
+// `text/plain` CSP on a JavaScript bundle. Applying at commit time means "fill
+// in what nothing else set" is actually true.
+func (h *Handler) SetSecurityHeaders(headers map[string]string) {
+	hdr := make(http.Header, len(headers))
+	for k, v := range headers {
+		hdr.Set(k, v)
+	}
+	h.securityHeaders = hdr
+}
+
+// headerWriter commits the configured security headers just before the status
+// line is written, skipping any key a handler in between already set.
+//
+// It must forward Flush, or a streaming response (http.ServeContent uses it for
+// ranges) would stop flushing through this wrapper.
+type headerWriter struct {
+	http.ResponseWriter
+	head      http.Header
+	committed bool
+}
+
+func (w *headerWriter) commit() {
+	if w.committed {
+		return
+	}
+	w.committed = true
+	dst := w.Header()
+	for key, values := range w.head {
+		if len(values) == 0 || dst.Get(key) != "" {
+			continue
+		}
+		dst.Set(key, values[0])
+	}
+}
+
+func (w *headerWriter) WriteHeader(status int) {
+	w.commit()
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *headerWriter) Write(p []byte) (int, error) {
+	// A handler that writes without calling WriteHeader commits implicitly.
+	if !w.committed {
+		w.commit()
+		w.ResponseWriter.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *headerWriter) Flush() {
+	w.commit()
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// applySecurityHeaders wraps w when any header is configured, and returns w
+// unchanged otherwise so the unconfigured path costs nothing.
+func (h *Handler) applySecurityHeaders(w http.ResponseWriter) http.ResponseWriter {
+	if len(h.securityHeaders) == 0 {
+		return w
+	}
+	return &headerWriter{ResponseWriter: w, head: h.securityHeaders}
 }
 
 // New builds a handler over a frontend build filesystem mounted at prefix
@@ -123,6 +204,8 @@ func NewDir(dir, prefix string) (*Handler, error) {
 func (h *Handler) Source() string { return h.source }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w = h.applySecurityHeaders(w)
+
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

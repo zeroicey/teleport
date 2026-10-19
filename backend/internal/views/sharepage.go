@@ -68,6 +68,96 @@ const HTMLReportContentSecurityPolicy = "default-src 'none'; " +
 // against: `format: "html"` reports are rendered, byte-for-byte, in an iframe.
 const HTMLReportsRenderVerbatim = true
 
+// DashboardContentSecurityPolicy is the CSP for the dashboard SPA shell, its
+// hashed bundles and its self-hosted fonts.
+//
+// It is REPORT-ONLY today, deliberately. A CSP that is wrong in the blocking
+// direction breaks the panel with no error message a human can act on; in the
+// report-only direction the same mistake produces a console violation and a
+// working page, so the policy can be verified on real traffic before it is
+// allowed to refuse anything. Promoting it is a one-word change in
+// dashboardSecurityHeaders, and the decision record names the evidence that
+// justifies it: a clean browser run with no reported violations.
+//
+// The policy is tight on purpose, and the frontend already fits it — that is a
+// property to keep, not an accident:
+//
+//   - No inline or bound styles anywhere in the panel. `style-src 'self'` is what
+//     `:style` bindings would violate, so a future one shows up as a reported
+//     violation now instead of a blank panel later.
+//   - No `eval`, no `new Function`, no template compiler at runtime.
+//   - `img-src 'self' data:` covers the SVG favicon and any inline data URL;
+//     `font-src 'self'` covers the self-hosted woff2 slices.
+//   - `frame-ancestors 'none'` matches the `X-Frame-Options: DENY` set for every
+//     response by httpx.SecurityHeaders.
+//
+// `form-action 'self'` rather than 'none': the panel has real <form> elements
+// (login, approve, edit, hand-off) whose submissions are intercepted by Vue.
+// 'none' would break the browser's own validation UI and the Enter key, which is
+// a usability regression for no security gain — the action is still same-origin.
+//
+// There is deliberately NO `upgrade-insecure-requests`, and that is not an
+// oversight. It is IGNORED in a report-only policy, and Chrome reports that as a
+// console error:
+//
+//	The Content Security Policy directive 'upgrade-insecure-requests' is
+//	ignored when delivered in a report-only policy.
+//
+// which was measured by the real-browser phase of scripts/verify-p4.sh — the
+// only check that could have caught it, because it is not a violation of the
+// policy but a complaint ABOUT the policy. Since the whole point of shipping
+// report-only first is a clean console, shipping a directive that guarantees a
+// console error would defeat it. (The share page still carries the directive: it
+// is served with an ENFORCING policy, where the directive is valid and useful.)
+//
+// Dropping it costs nothing here anyway: every source this policy allows is
+// 'self' or `data:`, so there is no plaintext subresource to upgrade. This
+// process is only ever reached over HTTPS through Caddy in production.
+const DashboardContentSecurityPolicy = "default-src 'none'; " +
+	"script-src 'self'; " +
+	"style-src 'self'; " +
+	"img-src 'self' data:; " +
+	"font-src 'self'; " +
+	"connect-src 'self'; " +
+	"frame-src 'self'; " +
+	"base-uri 'none'; " +
+	"form-action 'self'; " +
+	"frame-ancestors 'none'; " +
+	"object-src 'none'"
+
+// DashboardReportOnlyContentSecurityPolicy is the header value used while the
+// policy above is being verified: same policy, non-blocking.
+const DashboardReportOnlyContentSecurityPolicy = DashboardContentSecurityPolicy
+
+// DashboardPermissionsPolicy turns off browser features the panel never uses.
+//
+// Restricting them costs nothing today and means a future dependency cannot
+// silently start using the camera, the microphone or the user's location. The
+// clipboard is deliberately NOT denied: the panel's whole point is handing a
+// human a share link or a one-time credential, and copying it is the primary
+// action (see format.ts and share/main.ts).
+const DashboardPermissionsPolicy = "camera=(), microphone=(), geolocation=(), " +
+	"payment=(), usb=(), magnetometer=(), gyroscope=(), accelerometer=()"
+
+// DashboardSecurityHeaders is what the SPA handler adds to every asset and shell
+// response. Assembled here, next to the policy text it pairs with, so the two
+// cannot drift.
+//
+// enforce selects the header NAME, and the default (false) is report-only. See
+// config.Config.DashboardCSPEnforce for why that polarity matters.
+func DashboardSecurityHeaders(enforce bool) map[string]string {
+	headers := map[string]string{
+		"Permissions-Policy":                DashboardPermissionsPolicy,
+		"X-Permitted-Cross-Domain-Policies": "none",
+	}
+	if enforce {
+		headers["Content-Security-Policy"] = DashboardContentSecurityPolicy
+	} else {
+		headers["Content-Security-Policy-Report-Only"] = DashboardReportOnlyContentSecurityPolicy
+	}
+	return headers
+}
+
 // HTMLReportSandbox is the `sandbox` attribute applied to the report iframe.
 //
 // Empty on purpose: the AI-authored report is trusted to be a normal page, so

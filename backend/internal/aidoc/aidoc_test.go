@@ -346,3 +346,29 @@ func TestGuideDocumentsTheKeyHandoff(t *testing.T) {
 		t.Error("guide does not explain that the secret lives after '#'")
 	}
 }
+
+// TestGuideDocumentsTheTransportAbuseControls covers the failure an agent cannot
+// diagnose on its own.
+//
+// A 403 `ip_blocked` is address-level: rotating the key, the path or the body
+// changes nothing, and the credential the agent holds keeps looking valid. Without
+// this documented, the rational-but-wrong response is to retry or to re-apply —
+// which is what produced the ban.
+func TestGuideDocumentsTheTransportAbuseControls(t *testing.T) {
+	got := Markdown(testFacts())
+
+	// Section-unique needles, for the reason recorded in
+	// TestGuideDocumentsTheKeyHandoff: a needle that also appears in an unrelated
+	// section leaves the test green when the section is deleted.
+	for _, want := range []struct{ what, needle string }{
+		{"the block error code", "ip_blocked"},
+		{"that it is the address that is blocked, not the key", "地址"},
+		{"that a temporary block lifts on its own", "自动解封"},
+		{"that the block is not escaped by changing credentials", "换密钥"},
+	} {
+		if !strings.Contains(got, want.needle) {
+			t.Errorf("guide omits %s (expected %q); an agent that hits a 403 cannot tell "+
+				"an address block from a credential problem", want.what, want.needle)
+		}
+	}
+}

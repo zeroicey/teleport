@@ -1,5 +1,47 @@
 # Current task
 
+**追加（2026-10-18）：传输级滥用防护已实现并已过闸。** 决策见
+`.ai/decisions/2026-10-18-security-middleware.md`（✅ ACCEPTED，用户四项裁决）。
+在既有 7 个传输中间件之外新增：**四类独立限流桶**（`login` / `publicRead` / `write` /
+`global`，全局桶是**唯一与 IP 无关**的）、**源地址封禁**（自动临时封禁 + 手工永久名单，
+**永不作用于可信代理/回环地址**）、**面板 CSP / Permissions-Policy**（Report-Only）。
+监控点：`internal/httpx/guard.go`（原语）、`internal/api/router.go`（挂载）、
+`internal/views/sharepage.go`（策略）、`internal/spa/spa.go`（响应头在**提交时**才写）。
+默认：`ENVIRONMENT=production` 全开、其余环境全关（`SECURITY_MIDDLEWARE` 可覆盖）。
+
+**这次的两个实质发现（都由对抗性验证抓到，不是推理出来的）：**
+- 🔴 **「全局」限流桶第一版其实是 per-IP 的。** 文档写的是「与 IP 无关」，实现却写成
+  `RateLimit(globalLimiter, banList)` ——那只是一个窗口为 1 秒的 per-IP 桶，而单一 IPv6 /64
+  含 2^64 个地址，所以 per-IP 限制对它形同虚设：**这个「兼底」当时等于不存在**。
+  **是负向对照抓到的**（把桶键改回 `ClientIP` / 把挂载改回 `RateLimit` → 新测试变红），
+  普通测试当时全绿，因为我为「per-IP」写的断言对两者都成立。已改为常量桶键
+  （`globalBucketKey`），并且**绝不喂封禁名单**（全局超限是「进程饱和」而非「这个调用者可恶」，
+  否则洪流里会成批误封无辜用户），`/api/health` 按精确路径豁免。
+- 🔴 **`upgrade-insecure-requests` 在 report-only 策略里是无效指令**，Chrome 会把它当**console
+  error** 报出来。这是 `scripts/verify-p4.sh` 的**真实浏览器**阶段抓到的——单元测试永远抓不到，
+  因为它不是「违反了策略」，而是「对策略本身的抱怨」。已从面板策略移除（面板所有来源都是
+  `'self'`/`data:`，本来也无对象可升级），并加了守卫
+  `TestDashboardCSPAvoidsReportOnlyIncompatibleDirectives`。
+  **这也正是「先 Report-Only」的价值兑现**：策略第一版就有错，而代价只是一条 console 消息。
+- 🔴 **安全响应头若在进入 handler 时就写，会覆盖 handler 自己设的 `Content-Type`**
+  （实测：`text/plain` 的 CSP 打在 JS bundle 上）。已改为 `headerWriter` 在**响应提交时**才写，
+  只填没人设过的键；由 `TestSecurityHeadersDoNotOverwriteTheHandlersOwn` 盯着（它抓到了这处）。
+
+**已验证（本地，未部署）：** `check.sh`（无库档，168 SKIP 并大声提示）与 `test-pg.sh`（真库）
+全绿；`verify-p4.sh` 契约 **65/65** + 真实浏览器 **16/16**（console 干净，即面板 CSP 零违反）
++ 新增的**真实 socket 滥用防护阶段**（生产模式重启，10 项，含「全局桶跨地址共享」与
+「健康探针不受全局配额」）。所有新控制都做了**反证**：
+去掉限流判定 / 去掉可信代理豁免 / 永久名单不匹配 / `ClientIPAddrOK` 相信任意转发头 /
+登录限流未挂载 / 封禁中间件未挂载 / 写限流未挂载 / CSP 默认改为强制执行 /
+桶扫描不节流 / 满表不扫描 / 全局桶改回 per-IP / 豁免改成子串匹配 → 对应测试**逐一变红**。
+（其中两条我自己写的测试第一版是**不可能失败的**，已重写：一个用了冻结的时钟，
+一个把它要验证的属性交给了一个压根收不到 ban list 的函数。见决策记录的「被自己的对抗性验证抓到的两处真缺陷」。）
+
+**未做 / 需要人类：** ⛔ **未部署**（`teleport.env` 无需改动即可用默认值；部署前先问人类）。
+⛔ `DASHBOARD_CSP_ENFORCE` 仍是 `false`——把它翻成 `true` 需要一次真实浏览器零违反的复核，
+当前证据已具备（16/16 + console 干净），但**改动线上策略属于要人类点头的动作**。
+⛔ 未做大陆观测点（属部署）。
+
 **Status:** 🚧 **P0 ✅ / P1 ✅（附更正）/ P2 ✅（P2.1–P2.3）/ P3 ✅ / P4 ✅ / P5 ✅** —— store 是 **pgx + sqlc**，
 HTTP 层是 **Gin**，**全链路已在真二进制上验过**：HTTP 契约 **64/64** + 真实浏览器 **15/15**
 （`scripts/verify-p4.sh`，第三档闸门），并做了 **旧树 vs 新树的差分跑：108 请求只有 1 处已知差异**。

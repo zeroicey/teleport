@@ -10,6 +10,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -125,6 +126,81 @@ type Config struct {
 	// file the request, and a human still has to approve it. Zero disables the
 	// window entirely, restoring the old behaviour.
 	KeyRenewalGrace time.Duration
+
+	// -- transport-level abuse controls -------------------------------------
+	//
+	// These bound the public surface as a whole, as opposed to the KEY_* limits
+	// above which bound one endpoint's business logic. See internal/httpx/guard.go
+	// for the mechanisms and .ai/decisions/2026-10-18-security-middleware.md for
+	// why they are shaped this way.
+	//
+	// SecurityMiddleware enables all of them. It defaults to true in production
+	// and false elsewhere, because the fields below are deliberately tight: with
+	// them on by default in development, the contract harness (which fires ~90
+	// requests from one address in a few seconds) would fail with 429s that look
+	// like a regression rather than a working control.
+	SecurityMiddleware bool
+
+	// LoginRateLimit caps dashboard login attempts per source address per hour.
+	//
+	// This is the most sensitive knob in the set. One password protects the whole
+	// dashboard, and every attempt costs the server a 600k-iteration PBKDF2
+	// verification — so an unthrottled login endpoint is both a credential
+	// brute-force target and a CPU exhaustion vector. The limit is per hour, not
+	// per minute, because a human who mistypes their password does so a handful of
+	// times, not hundreds.
+	LoginRateLimit int
+	// PublicReadRateLimit caps anonymous reads (share pages, share JSON, the
+	// hand-off page, the AI guide) per source address per minute. Generous: these
+	// are the normal way a report is read, and a reader may well open several.
+	PublicReadRateLimit int
+	// WriteRateLimit caps authenticated writes (report create/update/delete,
+	// share creation, key self-service) per source address per minute. Also
+	// generous — it bounds a runaway agent loop, it does not police a human.
+	WriteRateLimit int
+	// GlobalRateLimit caps ALL requests per second across every source address.
+	//
+	// Per-IP limits do not stop a caller with many addresses, and a single IPv6
+	// /64 contains 2^64 of them. This cap is the backstop that makes the total
+	// cost to this process bounded no matter how many source addresses an
+	// attacker controls. It is deliberately set well above real traffic.
+	GlobalRateLimit int
+
+	// BanAfterRefusals is how many rate-limit refusals within BanStrikeTTL
+	// escalate a source address to a temporary block. Zero disables automatic
+	// banning and keeps only the permanent list.
+	BanAfterRefusals int
+	// BanStrikeTTL is the window those refusals are counted in.
+	BanStrikeTTL time.Duration
+	// BanTTL is how long an automatic block lasts. It expires on its own: a
+	// shared egress address (a university, a mobile carrier NAT) must not be
+	// locked out forever because one device on it misbehaved.
+	BanTTL time.Duration
+	// BlockedIPs is the operator's permanent blocklist, as plain addresses or
+	// CIDRs. It never expires and is the only control here that is not
+	// self-healing, so it is the one to use for a confirmed repeat offender.
+	//
+	// Parsed once during Load into BlockedPrefixes: an address is just its /32 or
+	// /128, so one code path serves both forms and a typo fails at startup.
+	BlockedIPs []string
+	// BlockedPrefixes is BlockedIPs after parsing, ready for netip matching.
+	BlockedPrefixes []netip.Prefix
+
+	// DashboardCSPEnforce serves the dashboard's Content-Security-Policy as the
+	// ENFORCING header instead of Content-Security-Policy-Report-Only.
+	//
+	// The polarity is deliberate and inverted from what the name suggests at a
+	// glance: the zero value must be the SAFE state. Report-only is safe (a wrong
+	// policy produces a console violation and a working page); enforcing is not (a
+	// wrong policy produces a broken panel with no actionable error). With this
+	// spelling, a Config that was never configured — a hand-built one in a test, a
+	// future caller that forgets a field — gets report-only. The opposite spelling
+	// meant the zero value silently started enforcing.
+	//
+	// It defaults to false. Flipping it to true is the deliberate act that starts
+	// enforcing; the decision record names the evidence required first (a clean
+	// browser run with zero reported violations).
+	DashboardCSPEnforce bool
 }
 
 // Load builds a Config from the environment, after optionally loading a .env
@@ -223,6 +299,51 @@ func Load() (*Config, error) {
 	if cfg.KeyRenewalGrace, err = envDurationAllowZero("KEY_RENEWAL_GRACE", 90*24*time.Hour); err != nil {
 		return nil, err
 	}
+
+	// Abuse controls default to ON in production and OFF everywhere else.
+	//
+	// The default is resolved from ENVIRONMENT rather than being a single value
+	// because the two audiences want opposite things: production is public and
+	// wants every guard on, while the test and contract harnesses drive the whole
+	// surface from one address in seconds and would read a working limiter as a
+	// regression. An explicit SECURITY_MIDDLEWARE always wins, in both directions.
+	securityDefault := cfg.Environment == "production"
+	if cfg.SecurityMiddleware, err = envBool("SECURITY_MIDDLEWARE", securityDefault); err != nil {
+		return nil, err
+	}
+	if cfg.LoginRateLimit, err = envInt("LOGIN_RATE_LIMIT", 10); err != nil {
+		return nil, err
+	}
+	if cfg.PublicReadRateLimit, err = envInt("PUBLIC_READ_RATE_LIMIT", 240); err != nil {
+		return nil, err
+	}
+	if cfg.WriteRateLimit, err = envInt("WRITE_RATE_LIMIT", 300); err != nil {
+		return nil, err
+	}
+	if cfg.GlobalRateLimit, err = envInt("GLOBAL_RATE_LIMIT", 200); err != nil {
+		return nil, err
+	}
+	if cfg.BanAfterRefusals, err = envInt("BAN_AFTER_REFUSALS", 20); err != nil {
+		return nil, err
+	}
+	if cfg.BanStrikeTTL, err = envDuration("BAN_STRIKE_TTL", 10*time.Minute); err != nil {
+		return nil, err
+	}
+	if cfg.BanTTL, err = envDuration("BAN_TTL", 30*time.Minute); err != nil {
+		return nil, err
+	}
+	cfg.BlockedIPs = splitList(env("BLOCKED_IPS", ""))
+	// Parsed and validated unconditionally, not only when the middleware is on.
+	// An unparseable entry must never be silent: with the guard off it would be
+	// inert, then activate as a blocklist that matches nothing the day someone
+	// flips SECURITY_MIDDLEWARE on. Failing at startup costs nothing and names
+	// the offending value.
+	if err := cfg.ResolveBlockedPrefixes(); err != nil {
+		return nil, err
+	}
+	if cfg.DashboardCSPEnforce, err = envBool("DASHBOARD_CSP_ENFORCE", false); err != nil {
+		return nil, err
+	}
 	// A zero or negative limit would reject every request, which reads as a
 	// broken deployment rather than a strict one. Reject it at startup instead.
 	if cfg.KeyApplyPerHour <= 0 {
@@ -257,7 +378,75 @@ func Load() (*Config, error) {
 	if cfg.CookieSecure, err = envBool("COOKIE_SECURE", true); err != nil {
 		return nil, err
 	}
+
+	// Validate the abuse controls only when they are actually in use. A negative
+	// limit would reject every request, which reads as a broken deployment rather
+	// than a strict one; zero is meaningful only for the ban threshold.
+	if cfg.SecurityMiddleware {
+		for _, c := range []struct {
+			name  string
+			value int
+		}{
+			{"LOGIN_RATE_LIMIT", cfg.LoginRateLimit},
+			{"PUBLIC_READ_RATE_LIMIT", cfg.PublicReadRateLimit},
+			{"WRITE_RATE_LIMIT", cfg.WriteRateLimit},
+			{"GLOBAL_RATE_LIMIT", cfg.GlobalRateLimit},
+		} {
+			if c.value <= 0 {
+				return nil, fmt.Errorf("%s must be positive (got %d)", c.name, c.value)
+			}
+		}
+		if cfg.BanAfterRefusals < 0 {
+			return nil, fmt.Errorf("BAN_AFTER_REFUSALS must not be negative (got %d)", cfg.BanAfterRefusals)
+		}
+		if cfg.BanStrikeTTL <= 0 {
+			return nil, fmt.Errorf("BAN_STRIKE_TTL must be positive (got %s)", cfg.BanStrikeTTL)
+		}
+		if cfg.BanTTL <= 0 {
+			return nil, fmt.Errorf("BAN_TTL must be positive (got %s)", cfg.BanTTL)
+		}
+	}
 	return cfg, nil
+}
+
+// ResolveBlockedPrefixes parses BlockedIPs into BlockedPrefixes.
+//
+// It is exported and separate from Load so that a hand-built Config — every test
+// fixture, and anything that constructs one programmatically — derives the
+// prefixes the same way production does, instead of silently matching nothing
+// because only BlockedIPs was filled in.
+func (c *Config) ResolveBlockedPrefixes() error {
+	c.BlockedPrefixes = nil
+	for _, entry := range c.BlockedIPs {
+		prefix, err := parseBlockEntry(entry)
+		if err != nil {
+			return err
+		}
+		c.BlockedPrefixes = append(c.BlockedPrefixes, prefix)
+	}
+	return nil
+}
+
+// parseBlockEntry turns one BLOCKED_IPS entry into a prefix.
+//
+// A bare address becomes a single-host prefix rather than a special case, so the
+// matcher has one shape to handle. The prefix is masked, so `10.1.2.3/8` means
+// what the human meant (10.0.0.0/8) instead of being rejected or matching
+// nothing.
+//
+// The error states the offending value: an unparsed entry would otherwise be a
+// permanent blocklist that silently blocks nothing.
+func parseBlockEntry(entry string) (netip.Prefix, error) {
+	if prefix, err := netip.ParsePrefix(entry); err == nil {
+		return prefix.Masked(), nil
+	}
+	addr, err := netip.ParseAddr(entry)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf(
+			"BLOCKED_IPS entry %q is not an IP address or CIDR", entry)
+	}
+	addr = addr.Unmap().WithZone("")
+	return netip.PrefixFrom(addr, addr.BitLen()), nil
 }
 
 // Prefix returns the normalized route prefix, always starting with "/" and

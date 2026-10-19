@@ -159,3 +159,75 @@ func TestOuterCSPKeepsScriptsStrict(t *testing.T) {
 		t.Error("the two policies are the same string; one of them is wrong")
 	}
 }
+
+// TestDashboardCSPAvoidsReportOnlyIncompatibleDirectives is the guard for a
+// defect that a real browser found and no unit test would have.
+//
+// `upgrade-insecure-requests` is only valid in an ENFORCING policy. In a
+// report-only policy Chrome ignores it and reports:
+//
+//	The Content Security Policy directive 'upgrade-insecure-requests' is ignored
+//	when delivered in a report-only policy.
+//
+// That is a console error, not a policy violation. It therefore does not show up
+// as a "violation" in any report — it shows up in scripts/verify-p4.sh's browser
+// phase, which asserts a clean console. Since the policy ships report-only
+// precisely so that a clean console can be observed before enforcing, a directive
+// that guarantees a console error defeats the entire exercise.
+//
+// The directive is also pointless here: every source the dashboard policy allows
+// is `'self'` or `data:`, so there is no plaintext subresource to upgrade.
+func TestDashboardCSPAvoidsReportOnlyIncompatibleDirectives(t *testing.T) {
+	// The set of directives Chrome ignores in report-only policies. Only
+	// upgrade-insecure-requests is in common use; the others are listed so a
+	// future edit is caught rather than argued about.
+	incompatible := []string{
+		"upgrade-insecure-requests",
+		"block-all-mixed-content",
+		"sandbox",
+	}
+	for _, directive := range incompatible {
+		if strings.Contains(DashboardContentSecurityPolicy, directive) {
+			t.Errorf("dashboard CSP contains %q, which is ignored (and reported as a console "+
+				"error) in a report-only policy — the policy ships report-only first, so this "+
+				"guarantees the console is never clean", directive)
+		}
+	}
+
+	// The share page is served with an ENFORCING policy, where the directive is
+	// valid — so its absence here must not have been "fixed" by copying that.
+	if !strings.Contains(ContentSecurityPolicy, "upgrade-insecure-requests") {
+		t.Log("note: the share page's enforcing policy no longer upgrades insecure requests")
+	}
+}
+
+// TestDashboardSecurityHeadersSelectsTheHeaderName pins the polarity of the
+// report-only/enforce switch, which is the switch that decides whether a policy
+// mistake is a console message or a broken panel.
+func TestDashboardSecurityHeadersSelectsTheHeaderName(t *testing.T) {
+	reportOnly := DashboardSecurityHeaders(false)
+	if _, ok := reportOnly["Content-Security-Policy"]; ok {
+		t.Error("DashboardSecurityHeaders(false) set the ENFORCING header; false must mean report-only")
+	}
+	if got := reportOnly["Content-Security-Policy-Report-Only"]; got != DashboardContentSecurityPolicy {
+		t.Errorf("report-only header = %q, want the dashboard policy", got)
+	}
+
+	enforcing := DashboardSecurityHeaders(true)
+	if got := enforcing["Content-Security-Policy"]; got != DashboardContentSecurityPolicy {
+		t.Errorf("enforcing header = %q, want the dashboard policy", got)
+	}
+	if _, ok := enforcing["Content-Security-Policy-Report-Only"]; ok {
+		t.Error("DashboardSecurityHeaders(true) also set the report-only header; exactly one must go out")
+	}
+
+	// The non-CSP headers are present in both states.
+	for _, headers := range []map[string]string{reportOnly, enforcing} {
+		if headers["Permissions-Policy"] == "" {
+			t.Error("Permissions-Policy missing")
+		}
+		if headers["X-Permitted-Cross-Domain-Policies"] != "none" {
+			t.Error("X-Permitted-Cross-Domain-Policies missing")
+		}
+	}
+}

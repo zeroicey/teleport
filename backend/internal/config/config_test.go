@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -129,6 +130,193 @@ func TestDatabaseConfigValidation(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "DB_MAX_CONNS") {
 			t.Errorf("error does not name the variable: %v", err)
+		}
+	})
+}
+
+// --- security middleware ---------------------------------------------------
+
+// TestSecurityMiddlewareDefaultsByEnvironment is the knob the whole feature hangs
+// off, and its default is conditional — which is exactly the kind of thing that
+// silently regresses if it is only ever tested one way.
+//
+// The two audiences want opposite defaults: production is public and wants every
+// guard on; the test and contract harnesses drive the whole surface from one
+// address in seconds and would read a working limiter as a regression.
+func TestSecurityMiddlewareDefaultsByEnvironment(t *testing.T) {
+	for _, tc := range []struct {
+		env  string
+		want bool
+	}{
+		{"production", true},
+		{"development", false},
+		{"test", false},
+		{"", false},
+	} {
+		t.Run("ENVIRONMENT="+tc.env, func(t *testing.T) {
+			requiredEnv(t)
+			t.Setenv("ENVIRONMENT", tc.env)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.SecurityMiddleware != tc.want {
+				t.Errorf("SecurityMiddleware = %v with ENVIRONMENT=%q, want %v",
+					cfg.SecurityMiddleware, tc.env, tc.want)
+			}
+		})
+	}
+}
+
+// TestSecurityMiddlewareExplicitSettingWins proves the default is a default and
+// not a policy: an operator must be able to force it either way.
+func TestSecurityMiddlewareExplicitSettingWins(t *testing.T) {
+	for _, tc := range []struct {
+		env   string
+		value string
+		want  bool
+	}{
+		{"production", "false", false},
+		{"development", "true", true},
+	} {
+		t.Run(tc.env+"+"+tc.value, func(t *testing.T) {
+			requiredEnv(t)
+			t.Setenv("ENVIRONMENT", tc.env)
+			t.Setenv("SECURITY_MIDDLEWARE", tc.value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.SecurityMiddleware != tc.want {
+				t.Errorf("SecurityMiddleware = %v, want %v", cfg.SecurityMiddleware, tc.want)
+			}
+		})
+	}
+}
+
+// TestBlockedIPsAreParsedAndValidated covers the one control in this set that is
+// not self-healing.
+//
+// Both directions matter and they fail differently: an entry that is accepted but
+// never matches is a blocklist that silently blocks nothing, and an entry that is
+// rejected at startup is merely annoying. The first is the dangerous one.
+func TestBlockedIPsAreParsedAndValidated(t *testing.T) {
+	t.Run("plain addresses and CIDRs both match", func(t *testing.T) {
+		requiredEnv(t)
+		t.Setenv("BLOCKED_IPS", "203.0.113.7, 198.51.100.0/24, 2001:db8::/32")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(cfg.BlockedPrefixes) != 3 {
+			t.Fatalf("BlockedPrefixes = %v, want 3 entries", cfg.BlockedPrefixes)
+		}
+
+		inPrefix := func(raw string) bool {
+			addr := netip.MustParseAddr(raw)
+			for _, p := range cfg.BlockedPrefixes {
+				if p.Contains(addr) {
+					return true
+				}
+			}
+			return false
+		}
+		for _, raw := range []string{"203.0.113.7", "198.51.100.99", "2001:db8::1"} {
+			if !inPrefix(raw) {
+				t.Errorf("%s is not blocked; the entry was parsed but never matches", raw)
+			}
+		}
+		if inPrefix("203.0.113.8") {
+			t.Error("203.0.113.8 blocked by a 203.0.113.7/32 entry")
+		}
+	})
+
+	t.Run("a non-address refuses to start", func(t *testing.T) {
+		requiredEnv(t)
+		t.Setenv("BLOCKED_IPS", "not-an-address")
+		if _, err := Load(); err == nil {
+			t.Fatal("Load accepted a BLOCKED_IPS entry that is not an address; " +
+				"a blocklist that silently blocks nothing is the failure mode to avoid")
+		}
+	})
+
+	t.Run("a masked prefix matches what the human meant", func(t *testing.T) {
+		requiredEnv(t)
+		t.Setenv("BLOCKED_IPS", "10.1.2.3/8")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		// Masked to 10.0.0.0/8, so a sibling address matches.
+		if !cfg.BlockedPrefixes[0].Contains(netip.MustParseAddr("10.9.9.9")) {
+			t.Errorf("10.1.2.3/8 parsed as %s; expected it masked to 10.0.0.0/8",
+				cfg.BlockedPrefixes[0])
+		}
+	})
+}
+
+// TestSecurityLimitsMustBePositive: a zero or negative budget would reject every
+// request, which reads as a broken deployment rather than a strict one.
+func TestSecurityLimitsMustBePositive(t *testing.T) {
+	for _, name := range []string{
+		"LOGIN_RATE_LIMIT",
+		"PUBLIC_READ_RATE_LIMIT",
+		"WRITE_RATE_LIMIT",
+		"GLOBAL_RATE_LIMIT",
+	} {
+		t.Run(name, func(t *testing.T) {
+			requiredEnv(t)
+			t.Setenv("ENVIRONMENT", "production")
+			t.Setenv(name, "0")
+			if _, err := Load(); err == nil {
+				t.Errorf("Load accepted %s=0; a zero budget rejects every request", name)
+			}
+		})
+	}
+}
+
+// TestBanAfterRefusalsZeroIsMeaningful: zero disables automatic banning while
+// leaving the permanent blocklist enforced, so it must be accepted.
+func TestBanAfterRefusalsZeroIsMeaningful(t *testing.T) {
+	requiredEnv(t)
+	t.Setenv("ENVIRONMENT", "production")
+	t.Setenv("BAN_AFTER_REFUSALS", "0")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.BanAfterRefusals != 0 {
+		t.Errorf("BanAfterRefusals = %d, want 0", cfg.BanAfterRefusals)
+	}
+}
+
+// TestDashboardCSPStartsOutNotEnforcing pins the deliberate first phase of the SPA
+// policy: it must not enforce until it has been verified on real traffic.
+//
+// The field is spelled for its safe state (DashboardCSPEnforce, default false) so
+// that a Config nobody configured also gets report-only. This test covers the
+// Load path; the zero-value case is covered by the API-level test that builds a
+// Config by hand.
+func TestDashboardCSPStartsOutNotEnforcing(t *testing.T) {
+	requiredEnv(t)
+	t.Setenv("ENVIRONMENT", "production")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.DashboardCSPEnforce {
+		t.Error("the dashboard CSP enforces by default; it must be verified against real traffic first")
+	}
+
+	t.Run("it can be turned on deliberately", func(t *testing.T) {
+		requiredEnv(t)
+		t.Setenv("DASHBOARD_CSP_ENFORCE", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.DashboardCSPEnforce {
+			t.Error("DASHBOARD_CSP_ENFORCE=true did not enable enforcement")
 		}
 	})
 }

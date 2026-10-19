@@ -590,22 +590,43 @@ var trustedProxyPrefixes = mustParsePrefixes(
 // IP-independent cap (KEY_MAX_PENDING), and that cap must be enforced
 // atomically or concurrent requests will overshoot it.
 func ClientIP(r *http.Request) string {
-	peer := peerHost(r.RemoteAddr)
-	peerAddr, ok := parseIP(peer)
+	if addr, ok := ClientIPAddrOK(r); ok {
+		return addr.String()
+	}
+	// RemoteAddr is not an IP at all. It comes from the connection, not from a
+	// header, so we pass it through unchanged: callers get one shared
+	// "unparseable" bucket, which fails closed rather than fresh.
+	return peerHost(r.RemoteAddr)
+}
+
+// ClientIPAddr is ClientIP as a parsed address, for a caller that has already
+// established the request names one (see ClientIPAddrOK).
+func ClientIPAddr(r *http.Request) netip.Addr {
+	addr, _ := ClientIPAddrOK(r)
+	return addr
+}
+
+// ClientIPAddrOK is ClientIP's decision as a netip.Addr, with ok reporting
+// whether the request names an address at all.
+//
+// It exists so the ban list and the limiter can never disagree about who the
+// caller is: both must be driven by the same trust rules, and duplicating that
+// walk is how one of them silently starts believing a forged header after a
+// refactor. ok=false means RemoteAddr was not an address either — the address
+// returned is then the zero value and must not be used to key state.
+func ClientIPAddrOK(r *http.Request) (netip.Addr, bool) {
+	peerAddr, ok := parseIP(peerHost(r.RemoteAddr))
 	if !ok {
-		// RemoteAddr is not an IP at all. It comes from the connection, not from
-		// a header, so we pass it through unchanged: callers get one shared
-		// "unparseable" bucket, which fails closed rather than fresh.
-		return peer
+		return netip.Addr{}, false
 	}
 	if !isTrustedProxy(peerAddr) {
 		// Direct connection: all forwarded headers are attacker-controlled.
-		return peerAddr.String()
+		return peerAddr, true
 	}
 
 	if TrustCloudflare {
 		if addr, ok := parseIP(r.Header.Get("Cf-Connecting-Ip")); ok {
-			return addr.String()
+			return addr, true
 		}
 	}
 
@@ -619,9 +640,9 @@ func ClientIP(r *http.Request) string {
 		if !ok || isTrustedProxy(addr) {
 			continue
 		}
-		return addr.String()
+		return addr, true
 	}
-	return peerAddr.String()
+	return peerAddr, true
 }
 
 // forwardedFor flattens every X-Forwarded-For header, in received order.

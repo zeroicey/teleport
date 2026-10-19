@@ -262,6 +262,7 @@ curl -sS "$TELEPORT_BASE/api/agent-keys/me" -H "Authorization: Bearer $TELEPORT_
 | `code: "too_many_active_keys"` | `409` | 领取时活跃密钥总数已达上限 | 申请单**仍然有效**：让人类撤销无用密钥或等一把过期，然后在窗口内重试领取 |
 | `code: "too_many_pending"` | `409` | 提交申请时，待审批队列已满 | 等队列消化后重新提交；不要连发申请 |
 | `code: "rate_limited"` | `429` | 提交申请过于频繁：**每个 IP 每小时最多 {{KEY_APPLY_PER_HOUR}} 次申请**。响应头带 `Retry-After`（秒） | 按 `Retry-After` **退避等待**，不要立即重试 —— 立即重试只会继续撞限流；也不要换 IP / 换身份绕过 |
+| `code: "ip_blocked"` | `403` | 来源地址被**封禁**：同一地址在短时间内反复触发限流，会被临时封禁一段时间（到期自动解封，`Retry-After` 给剩余秒数）；运维也可以手工永久拉黑 | 停止所有请求，按 `Retry-After` 等待。**换密钥、换路径都没用**——封的是地址。若你确信是误封，把响应里的 `requestId` 交给人类 |
 
 > 上表中的申请单存活期与领取窗口是**服务端当前配置值**（本文档每次请求都会注入最新值）；
 > 某张申请单的确切失效时刻，永远以响应里的 `expires_at` 为准。
@@ -681,7 +682,8 @@ curl -sS "$TELEPORT_BASE/api/health"
 | `404` | `not_found` | 见第 5 节（也可能是"这份报告不属于你"） |
 | `409` | `renewal_exists` · `too_many_pending` · `too_many_active_keys` | 状态冲突：已有待批准续期 / 待审批队列满 / 活跃密钥数满。见 2.4、2.5 |
 | `410` | `gone` | 分享链接已过期，或申请单过期 / 领取窗口已关闭（见 2.4） |
-| `429` | `rate_limited` | 限流（申请接口**每个 IP 每小时最多 {{KEY_APPLY_PER_HOUR}} 次申请**，响应头带 `Retry-After` 秒数）。**退避等待**后再试，不要立即重试 |
+| `403` | `ip_blocked` | **你这个来源地址被封禁了**（持续触发限流，或被运维手工拉黑）。响应头带 `Retry-After`（秒，手工永久封禁时没有）。这是**地址级**封禁，换密钥不解决问题 |
+| `429` | `rate_limited` | 限流。申请接口是**每个 IP 每小时最多 {{KEY_APPLY_PER_HOUR}} 次申请**；其余接口也有各自的配额（写接口与公开读都远高于正常用量）。响应头带 `Retry-After` 秒数。**退避等待**后再试，不要立即重试 |
 | `500` | `internal_error` | 服务端问题。可以稍后重试一次，仍失败则报告用户 |
 
 **报错时把 `requestId` 一并带上**，用户排查问题需要它。

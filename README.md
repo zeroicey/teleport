@@ -47,7 +47,7 @@ Node、不需要 Go、也没有任何需要与二进制同步的静态目录。
 | 内容渲染 | Markdown **服务端渲染**（Go + goldmark + Chroma）+ Mermaid 客户端懒加载 |
 | 管理面板 | Vue 3 SPA，登录后查看报告、管理分享链接、复制 / 调期 / 禁用 |
 | 密钥自助申请 | agent 提交申请 → 面板批准 → agent 一次性领取明文密钥（服务端只存哈希） |
-| 安全 | markdown 报告不渲染原始 HTML、严格 CSP、常量时间鉴权比较、失效链接语义化 404/410；`format: "html"` 报告按用户裁决原样渲染（见「安全模型」） |
+| 安全 | markdown 报告不渲染原始 HTML、严格 CSP、常量时间鉴权比较、失效链接语义化 404/410、分级限流 + 源地址封禁；`format: "html"` 报告按用户裁决原样渲染（见「安全模型」） |
 
 ---
 
@@ -426,6 +426,10 @@ pnpm run dev:web    # http://127.0.0.1:5173/
 浏览器请求的路径与后端看到的路径逐字节相同，dev 与 prod 不会出现
 「本地能跑、线上 404」的偏差。
 
+> 开发环境**默认不开启**滥用防护（`ENVIRONMENT` 不是 `production` 时全关），
+> 所以上面这套开发命令不会被限流打断。要本地试限流行为，
+> 加 `SECURITY_MIDDLEWARE=true LOGIN_RATE_LIMIT=3` 即可（见「滥用防护」）。
+>
 > 若只想验证后端（不跑前端），可以完全不构建前端：`webui` 在没有
 > `embed_frontend` 构建标签时会报告「无前端」，服务退化为纯 API。
 > 想在没有重新编译的情况下换前端资源，可用 `STATIC_DIR=/path/to/dist` 指向磁盘目录。
@@ -693,7 +697,30 @@ base-uri 'none'; form-action 'none'; frame-ancestors 'none'; upgrade-insecure-re
 - 所有响应：`X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、
   `X-Frame-Options: DENY`、`X-Robots-Tag: noindex`
 - 分享页额外带严格 CSP（见上）
+- **管理面板（SPA）**额外带自己的 CSP + `Permissions-Policy` +
+  `X-Permitted-Cross-Domain-Policies: none`，由 `internal/spa` 在**响应提交时**才写
+  （进入时就写会覆盖 handler 自己的 `Content-Type`，见
+  `.ai/pitfalls/cases/2026-10-18-decorator-writes-headers-before-handler.md`）
 - 静态资源与 API 走同一套中间件，不存在「一种资源有头、另一种没有」的空档
+
+#### 面板 CSP 目前是 Report-Only
+
+```
+Content-Security-Policy-Report-Only: default-src 'none'; script-src 'self';
+style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self';
+frame-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none';
+object-src 'none'
+```
+
+**故意的，而且是安全的那一侧**：策略写错时，Report-Only 只产生一条 console 违反和一个
+能用的页面；强制执行则是一个坏掉、且没有任何可操作错误的面板。翻成强制的开关是
+`DASHBOARD_CSP_ENFORCE=true`（默认 false，所以**零值就是安全态**），前置条件是
+`scripts/verify-p4.sh` 的真实浏览器阶段 console 干净 —— 当前已满足（16/16）。
+
+> 该策略**不含** `upgrade-insecure-requests`：这个指令在 Report-Only 策略里被忽略，且
+> Chrome 会把它当 **console error** 报出来。面板允许的所有来源都是 `'self'`/`data:`，
+> 本来也没有明文子资源可升级。见
+> `.ai/pitfalls/cases/2026-10-18-report-only-csp-ignored-directive.md`。
 
 **缓存**：由 `internal/spa` 按**文件名形态**决定，分两档：
 
@@ -879,6 +906,34 @@ CF 官方的大陆加速（China Network）需要企业版 + 域名 ICP 备案�
   唯一的例外是 `GET /s/:token/html`：它要能被本服务的分享页框住，
   所以显式删掉 `X-Frame-Options`，换成 CSP 的 `frame-ancestors 'self'`
   （限制强度相同：只允许同源 frame）。
+- **滥用防护（2026-10-18）**：四类**互相独立**的滑动窗口配额 + 源地址封禁。默认在
+  `ENVIRONMENT=production` 全开、其余环境全关（`SECURITY_MIDDLEWARE` 可强制覆盖）。
+
+  | 类 | 默认 | 覆盖的入口 |
+  | --- | --- | --- |
+  | `login` | 10 / 小时 / IP | `POST /api/admin/login`。**在口令验证之前**拒绝，所以爆破既不成功也不花 PBKDF2 |
+  | `publicRead` | 240 / 分钟 / IP | 分享页、`/s/:token/html`、分享 JSON、`/k/`、AI 指南。计数的是**文档**，hashed bundle 与字体不计 |
+  | `write` | 300 / 分钟 / IP | 报告增删改、分享创建/吊销、密钥自助 |
+  | `global` | 200 / 秒（**与源地址无关**，用常量桶键） | 全部请求（`/api/health` 按精确路径豁免）。单一 IPv6 /64 含 2^64 个地址，per-IP 限制对它无效，这是唯一的兜底 |
+
+  `global` 桶**绝不喂封禁名单**：全局超限意味着「进程饱和」而不是「这个调用者可恶」，
+  把超限归因给恰好下一个请求的人，会在洪流里把无辜用户成批封掉。
+  `/api/health` 也不在任何配额里：答 429 的存活探针会被轮询方读成「服务挂了」，
+  而限流状态是进程内的——监督进程重启会同时清掉窗口与封禁，于是探针就成了重置计数器的路子。
+  （`global` 桶第一版曾被我写成 per-IP 的，是负向对照抓到的；见决策记录。）
+
+  拒绝是统一的 JSON 封套 + `429` + `Retry-After`；被封地址统一 `403` + `code: "ip_blocked"`。
+  **桶键只来自 `httpx.ClientIP`**（不是 `RealIP`）：后者无条件相信 `Cf-Connecting-Ip` 并取
+  `X-Forwarded-For` 的**最左**一项 —— 正是客户端能伪造的那一项。限流与封禁由**同一个函数**
+  决定「你是谁」，各自重写一遍遍历逻辑就是其中一条开始相信伪造头的方式。
+
+  **封禁永不作用于可信代理 / 回环地址**：一旦部署丢了 `X-Forwarded-For`，`ClientIP` 会把所有
+  客户端塌缩成 Caddy 自己的地址，封它一条请求就能把整个服务打挂。此时限流仍生效并打一行
+  `SECURITY:` 警告。封禁分两种：**自动临时**（窗口内被拒 `BAN_AFTER_REFUSALS` 次 → 封
+  `BAN_TTL`，到期自愈，避免共享出口被永久误伤）与**手工永久**（`BLOCKED_IPS`，写错会拒绝启动）。
+
+  状态是**进程内**的，重启清零（单二进制的已知取舍）。详见
+  `.ai/decisions/2026-10-18-security-middleware.md`。
 - **静态资源缓存分层**：`/assets/*` 由 Vite 内容哈希命名，发
   `immutable` + 一年；`index.html` 与 `share.js` 是稳定文件名，发 `no-cache`，
   保证部署后立刻生效、不会把客户端钉在旧构建上。

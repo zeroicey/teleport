@@ -270,6 +270,209 @@ except Exception:
   [ "$BROWSER" = 0 ] || die "the browser verification failed (full output: ${BROWSER_LOG#$REPO/})"
 fi
 
+# ------------------------------------------------------------ abuse controls ----
+# Every phase above runs with ENVIRONMENT=development, where the abuse controls are
+# deliberately OFF. That proves the guards do not break the product; it cannot prove
+# they are wired to the PRODUCTION defaults, which is the whole point of the feature
+# and the one thing no in-process test can show (those build a Config by hand and so
+# never exercise config.Load()'s production branch).
+#
+# So the server is restarted in production mode and the controls are exercised over a
+# real socket. Every request carries an X-Forwarded-For, because the peer here IS
+# 127.0.0.1 — a trusted proxy — so ClientIP takes the forwarded value exactly as it
+# does behind Caddy. That path (trusted peer → rightmost untrusted XFF entry) is the
+# one the whole control depends on and the one a "looks like it works" test misses.
+if [ "${P4_SKIP_ABUSE:-0}" = "1" ]; then
+  say "abuse-control phase SKIPPED (P4_SKIP_ABUSE=1)"
+else
+  say "abuse controls over a real socket (production defaults)"
+
+  kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null
+  SERVER_PID=""
+
+  ABUSE_PORT="${P4_ABUSE_PORT:-$((PORT + 1))}"
+  ABUSE_BASE="http://127.0.0.1:$ABUSE_PORT"
+  ABUSE_LOG="$REPO/bin/e2e/p4-abuse.log"
+  # Deliberately tiny budgets: the point is the wiring, not the numbers.
+  ABUSE_LOGIN_LIMIT=3
+  BLOCKED_ADDR="203.0.113.7"
+  OK_ADDR="198.51.100.5"
+
+  : >"$ABUSE_LOG"
+  env LISTEN_ADDR="127.0.0.1:$ABUSE_PORT" \
+      ROUTE_PREFIX="$PREFIX" \
+      PUBLIC_BASE_URL="$ABUSE_BASE" \
+      DATABASE_URL="$DB_URL" \
+      DB_MAX_CONNS=4 \
+      ADMIN_PASSWORD_HASH="$ADMIN_HASH" \
+      ENVIRONMENT=production \
+      COOKIE_SECURE=false \
+      SECURITY_MIDDLEWARE=true \
+      LOGIN_RATE_LIMIT="$ABUSE_LOGIN_LIMIT" \
+      BLOCKED_IPS="$BLOCKED_ADDR" \
+      GLOBAL_RATE_LIMIT=5000 \
+      "$BIN" >>"$ABUSE_LOG" 2>&1 &
+  SERVER_PID=$!
+
+  for _ in $(seq 1 60); do
+    if curl -sf -o /dev/null -H "X-Forwarded-For: $OK_ADDR" "$ABUSE_BASE$URL_PREFIX/api/health"; then break; fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "--- server log ---"; cat "$ABUSE_LOG"; die "the server exited during startup (production mode)"
+    fi
+    sleep 0.5
+  done
+
+  abuse_fail=0
+  abuse_check() { # <label> <expected-status> <actual-status> [detail]
+    if [ "$2" = "$3" ]; then
+      printf 'PASS  %s\n' "$1"
+    else
+      printf 'FAIL  %s — status %s, want %s%s\n' "$1" "$3" "$2" "${4:+ ($4)}"
+      abuse_fail=1
+    fi
+  }
+
+  # The startup log is evidence: production mode must say so, and an explicit
+  # SECURITY_MIDDLEWARE=true must be in effect rather than inferred.
+  grep -q 'environment=production' "$ABUSE_LOG" || { echo "--- server log ---"; cat "$ABUSE_LOG"; die "the server did not start in production mode"; }
+  echo "log: started with environment=production"
+
+  # 1. The permanent blocklist refuses a listed address...
+  status=$(curl -s -o /tmp/p4-abuse-blocked.json -w '%{http_code}' \
+    -H "X-Forwarded-For: $BLOCKED_ADDR" "$ABUSE_BASE$URL_PREFIX/api/health")
+  abuse_check "a blocked address (via a trusted proxy's XFF) is refused" 403 "$status"
+  grep -q '"ip_blocked"' /tmp/p4-abuse-blocked.json \
+    && echo "      envelope: ip_blocked" \
+    || { echo "FAIL  the 403 body is not the ip_blocked envelope: $(cat /tmp/p4-abuse-blocked.json)"; abuse_fail=1; }
+
+  # 2. ...while an unlisted address is not, which is what proves check 1 was the
+  #    blocklist and not "everything is 403".
+  status=$(curl -s -o /dev/null -w '%{http_code}' \
+    -H "X-Forwarded-For: $OK_ADDR" "$ABUSE_BASE$URL_PREFIX/api/health")
+  abuse_check "an unlisted address is served normally" 200 "$status"
+
+  # 3. The login budget is spent, then refused — with Retry-After and the envelope.
+  login_status=""
+  for _ in $(seq 1 $((ABUSE_LOGIN_LIMIT + 1))); do
+    login_status=$(curl -s -o /tmp/p4-abuse-login.json -w '%{http_code}' \
+      -X POST -H 'Content-Type: application/json' -H "X-Forwarded-For: $OK_ADDR" \
+      --data '{"password":"definitely-wrong"}' "$ABUSE_BASE$URL_PREFIX/api/admin/login")
+  done
+  abuse_check "the login budget is enforced (429 after $ABUSE_LOGIN_LIMIT attempts)" 429 "$login_status"
+  grep -q '"rate_limited"' /tmp/p4-abuse-login.json \
+    && echo "      envelope: rate_limited" \
+    || { echo "FAIL  the 429 body is not the rate_limited envelope: $(cat /tmp/p4-abuse-login.json)"; abuse_fail=1; }
+
+  # 4. A *correct* password must also be refused: the limiter runs before the handler,
+  #    so a flood costs no PBKDF2 work. If the password were accepted here, the limiter
+  #    would be sitting after verification and the CPU vector would still be open.
+  status=$(curl -s -o /dev/null -w '%{http_code}' \
+    -X POST -H 'Content-Type: application/json' -H "X-Forwarded-For: $OK_ADDR" \
+    --data "{\"password\":\"$ADMIN_PASSWORD\"}" "$ABUSE_BASE$URL_PREFIX/api/admin/login")
+  abuse_check "a CORRECT password is refused too (limiter runs before verification)" 429 "$status"
+
+  # 5. Budgets are per address: a different source is unaffected by that flood.
+  status=$(curl -s -o /dev/null -w '%{http_code}' \
+    -X POST -H 'Content-Type: application/json' -H "X-Forwarded-For: 192.0.2.44" \
+    --data '{"password":"definitely-wrong"}' "$ABUSE_BASE$URL_PREFIX/api/admin/login")
+  abuse_check "another address has its own login budget" 401 "$status"
+
+  # 6. The dashboard CSP goes out report-only on the real binary, and never enforcing.
+  csp_headers="$(curl -s -D- -o /dev/null -H "X-Forwarded-For: $OK_ADDR" \
+    "$ABUSE_BASE$URL_PREFIX/dashboard")"
+  printf '%s' "$csp_headers" | grep -qi '^content-security-policy-report-only:' \
+    && echo "PASS  the dashboard CSP is served report-only" \
+    || { echo "FAIL  no report-only CSP on the dashboard shell"; abuse_fail=1; }
+  if printf '%s' "$csp_headers" | grep -qi '^content-security-policy:'; then
+    echo "FAIL  the dashboard CSP is enforcing; it must stay report-only until verified"; abuse_fail=1
+  else
+    echo "PASS  no enforcing CSP on the dashboard"
+  fi
+
+  # 7. The GLOBAL bucket is shared, not per address — and the health probe is
+  #    exempt from it. Both are properties that were wrong in the first
+  #    implementation of this feature (it was keyed per IP, which makes the backstop
+  #    useless against a caller with many addresses), and both are invisible to a
+  #    check that only looks at one address.
+  #
+  #    This restarts the server once more with GLOBAL_RATE_LIMIT=2 so the ceiling is
+  #    reachable from a handful of requests.
+  kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null
+  SERVER_PID=""
+  GLOBAL_PORT="${P4_GLOBAL_PORT:-$((PORT + 2))}"
+  GLOBAL_BASE="http://127.0.0.1:$GLOBAL_PORT"
+  GLOBAL_LOG="$REPO/bin/e2e/p4-global.log"
+  : >"$GLOBAL_LOG"
+  env LISTEN_ADDR="127.0.0.1:$GLOBAL_PORT" \
+      ROUTE_PREFIX="$PREFIX" \
+      PUBLIC_BASE_URL="$GLOBAL_BASE" \
+      DATABASE_URL="$DB_URL" \
+      DB_MAX_CONNS=4 \
+      ADMIN_PASSWORD_HASH="$ADMIN_HASH" \
+      ENVIRONMENT=production \
+      COOKIE_SECURE=false \
+      SECURITY_MIDDLEWARE=true \
+      GLOBAL_RATE_LIMIT=2 \
+      BAN_AFTER_REFUSALS=0 \
+      "$BIN" >>"$GLOBAL_LOG" 2>&1 &
+  SERVER_PID=$!
+  for _ in $(seq 1 60); do
+    if curl -sf -o /dev/null -H "X-Forwarded-For: 192.0.2.44" "$GLOBAL_BASE$URL_PREFIX/api/health"; then break; fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+      echo "--- server log ---"; cat "$GLOBAL_LOG"; die "the server exited during the global-bucket phase"
+    fi
+    sleep 0.5
+  done
+
+  # Distinct source addresses, so a per-address bucket would allow every one of
+  # them while a shared bucket refuses after the ceiling. Ten tight requests against
+  # a ceiling of 2/second cannot all fit in one window on any plausible machine, so
+  # "no refusal at all" means the bucket is genuinely per address.
+  global_refused=0
+  for i in $(seq 1 10); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H "X-Forwarded-For: 198.51.100.$i" \
+      "$GLOBAL_BASE$URL_PREFIX/ai.md")
+    [ "$code" = "429" ] && global_refused=$((global_refused + 1))
+  done
+  if [ "$global_refused" -gt 0 ]; then
+    printf 'PASS  the global bucket is shared across addresses (%s of 10 refused with a ceiling of 2)\n' "$global_refused"
+  else
+    printf 'FAIL  ten requests from ten addresses were all allowed with GLOBAL_RATE_LIMIT=2;\n'
+    printf '      the global bucket is keyed per address, so it cannot bound a caller with many addresses\n'
+    abuse_fail=1
+  fi
+
+  # The health probe must never be refused by the global bucket, or the liveness
+  # signal becomes a way to look dead — and, since the limit state is in-process, a
+  # way to get the counters cleared by a supervisor restart.
+  #
+  # The ceiling is re-exhausted immediately before probing, so "health was served"
+  # cannot be explained by the window having drained in the meantime. If /api/health
+  # were NOT exempt this would be several 429s.
+  for i in 1 2 3 4; do
+    curl -s -o /dev/null -H "X-Forwarded-For: 192.0.2.77" "$GLOBAL_BASE$URL_PREFIX/ai.md"
+  done
+  health_refused=0
+  for i in $(seq 1 12); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H "X-Forwarded-For: 192.0.2.99" \
+      "$GLOBAL_BASE$URL_PREFIX/api/health")
+    [ "$code" = "429" ] && health_refused=$((health_refused + 1))
+  done
+  if [ "$health_refused" = 0 ]; then
+    echo "PASS  the health probe is exempt from the global ceiling"
+  else
+    printf 'FAIL  /api/health was rate limited %s time(s); a liveness probe that answers 429\n' "$health_refused"
+    printf '      reads as "down" to its poller, and a restart would clear every window and ban\n'
+    abuse_fail=1
+  fi
+
+  if [ "$abuse_fail" != 0 ]; then
+    echo "--- server log ---"; tail -20 "$ABUSE_LOG"
+    die "the abuse-control checks failed (full log: ${ABUSE_LOG#$REPO/})"
+  fi
+  echo "----- abuse controls: all checks passed -----"
+fi
+
 say "P4 PASSED — the assembled binary serves the contract and renders in a browser"
 echo "  database: $DBNAME.$SCHEMA (the schema is dropped on exit)"
 echo "  log:      ${LOG#$REPO/}"

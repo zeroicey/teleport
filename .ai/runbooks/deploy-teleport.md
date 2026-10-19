@@ -131,6 +131,50 @@ ssh hcyj '/data/services/teleport/teleport hash-password'
 > systemd 的 `EnvironmentFile=` 按字面读取，不受影响。
 > 见 `.ai/pitfalls/cases/env-file-dollar-expansion.md`。
 
+#### 4.1 滥用防护（2026-10-18 起）
+
+**无需改动即可用**：`ENVIRONMENT=production` 时全部按默认值自动开启。
+要调整或关闭，在同文件中加（完整说明与取舍见 `backend/deploy/teleport.env.example`
+与 `.ai/decisions/2026-10-18-security-middleware.md`）：
+
+```bash
+SECURITY_MIDDLEWARE=true      # 默认在 production 就是 true；显式 false 可整组关闭
+LOGIN_RATE_LIMIT=10           # 每 IP 每小时登录尝试；最该先调的一个
+PUBLIC_READ_RATE_LIMIT=240    # 每 IP 每分钟公开读
+WRITE_RATE_LIMIT=300          # 每 IP 每分钟写
+GLOBAL_RATE_LIMIT=200         # 与 IP 无关的全局上限（每秒），单一 IPv6 /64 的兼底
+BAN_AFTER_REFUSALS=20         # 窗口内被拒多少次升级为临时封禁；0 = 只保留手工名单
+BAN_TTL=30m                   # 临时封禁时长，到期自动解封
+BLOCKED_IPS=                  # 手工永久名单，IP 或 CIDR，逗号分隔；写错会拒绝启动
+DASHBOARD_CSP_ENFORCE=false   # 面板 CSP 先 Report-Only；见下方「翻成强制」
+```
+
+**部署后要验证的三件事**（`scripts/verify-p4.sh` 的 abuse 阶段就是这三条的自动化版本）：
+
+```bash
+# 1. 登录限额生效（第 N+1 次是 429，且带 Retry-After）
+for i in 1 2 3 4 5 6 7 8 9 10 11; do
+  curl -s -o /dev/null -w '%{http_code} ' -X POST -H 'Content-Type: application/json' \
+    --data '{"password":"wrong"}' https://teleport.hcyj.xyz/api/admin/login
+done; echo   # 最后一串应是 429
+
+# 2. 手工名单生效（把测试地址换成 BLOCKED_IPS 里的值）
+curl -s -o /dev/null -w '%{http_code}\n' https://teleport.hcyj.xyz/api/health   # 未被封时应是 200
+
+# 3. 面板 CSP 仍然是 Report-Only（不是强制）
+curl -sI https://teleport.hcyj.xyz/dashboard | grep -i 'content-security-policy'
+# 期望：只有 content-security-policy-report-only，没有裸的 content-security-policy
+```
+
+> ⚠️ **如果日志里出现** `SECURITY: every client collapses into one rate-limit bucket`，
+> 说明 Caddy 没有把 `X-Forwarded-For` 传过来，所有客户端共用一个桶。**先修转发头**，
+> 不要靠调大 `GLOBAL_RATE_LIMIT` 掩盖。自动封禁对可信代理/回环地址是**刻意豁免**的，
+> 因为一旦丢头，封代理地址一条请求就能把整个服务打挂。
+
+> **把面板 CSP 翻成强制**（`DASHBOARD_CSP_ENFORCE=true`）之前必须先有一次**真实浏览器
+> 零违反**：`scripts/verify-p4.sh` 的浏览器阶段会断言 console 干净。不要只验证响应头内容——
+> 本仓库已经踩过这个坑（`.ai/pitfalls/cases/2026-10-18-report-only-csp-ignored-directive.md`）。
+
 ## Verification
 
 ```bash

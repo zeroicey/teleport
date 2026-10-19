@@ -45,7 +45,7 @@ Teleport 是**个人 AI 报告展示与时效分享**平台。AI 在终端/工�
 | `backend/main.go` | 进程入口、信号处理、`hash-password`/`migrate`/`version` 子命令 | config, store |
 | `backend/internal/config/` | `.env` 读取与校验；**前缀的唯一来源**（`Route()`、`AppBaseURL()`） | 无 |
 | `backend/internal/api/` | 路由挂载与 handler，全部挂在 `cfg.RoutePrefix` 下 | config, store, views, markdown, aidoc |
-| `backend/internal/httpx/` | 中间件链、响应封套、Session HMAC、Bearer 常量时间比较 | 无 |
+| `backend/internal/httpx/` | 中间件链、响应封套、Session HMAC、Bearer 常量时间比较、**滥用防护原语**（滑动窗口限流、源地址封禁，见 `2026-10-18-security-middleware.md`） | 无 |
 | `backend/internal/password/` | PBKDF2-HMAC-SHA256 | 无 |
 | `backend/internal/store/` | 全部 SQL、内嵌迁移、UUID/token 生成、advisory lock | postgres |
 | `backend/internal/store/queries/` | sqlc 查询源（`*.sql`）—— SQL 的唯一真源 | 无 |
@@ -56,7 +56,7 @@ Teleport 是**个人 AI 报告展示与时效分享**平台。AI 在终端/工�
 | `backend/internal/markdown/` | goldmark + Chroma 渲染器 | 无 |
 | `backend/internal/validate/` | 请求体校验（**复刻 JS 语义**，见 §5.4） | 无 |
 | `backend/internal/views/` | 分享页 HTML + CSP 常量 | 无 |
-| `backend/internal/spa/` | 内嵌静态托管：SPA 回退、缓存头、**路径穿越防护** | 无 |
+| `backend/internal/spa/` | 内嵌静态托管：SPA 回退、缓存头、**路径穿越防护**、面板安全响应头（提交时才写，避免覆盖 handler 自己的头） | 无 |
 | `backend/internal/aidoc/` | 给 AI 读的使用说明（`guide.md` + 占位符替换） | config, markdown |
 | `backend/internal/webui/` | `//go:embed dist/`，构建标签 `embed_frontend` 切换桩实现 | 无 |
 | `web/src/` | Vue 面板（登录/列表/详情）+ 分享页客户端入口 | api.ts 封套 |
@@ -134,6 +134,32 @@ Cookie 是**第一方**的（不受 Safari ITP / Chrome 第三方 Cookie 淘汰�
     浏览器才显示它。**Enforced**：`TestKeyHandoffLinkCarriesTheSecretOnlyInTheFragment`
     （fragment 不得含 `=`、URL 不得含 `?`）、`TestHandoffPageIsInertWithoutJavaScript`
     （按钮必须带 `hidden`），反证 F1/F3/F9/F10。
+12. **限流桶键只能是 `httpx.ClientIP`**（不是 `RealIP`）。两者是**精确反向**的：`RealIP`
+    是展示用的，无条件相信 `Cf-Connecting-Ip` 并取 `X-Forwarded-For` 的**最左**一项（正是
+    客户端能伪造的那一项）；`ClientIP` 只在直连 peer 是已知代理时才读转发头，并从**右往左**
+    取第一个不可信地址。限流与封禁必须由**同一个函数**决定「你是谁」——`ClientIPAddrOK` 是
+    两者共用的那个，各自重写一遍遍历逻辑就是其中一条在重构后开始相信伪造头的方式。
+    **Enforced**：`TestClientIPIgnoresForwardedHeadersFromAnUntrustedPeer`（F1）、
+    `TestClientIPAddrOK*`、`TestApplicationRateLimit` 的伪造 XFF 子测试。
+    另：**per-IP 限制只是减速带**，一个 IPv6 /64 含 2^64 个地址；真正的兼底是
+    `GLOBAL_RATE_LIMIT` 与 `KEY_MAX_PENDING`。
+    ⚠️ `GLOBAL_RATE_LIMIT` 必须用**常量桶键**（`globalBucketKey`），不能复用 `ClientIP`
+    ——写成 per-IP 就与「兜住手握大量地址的调用者」正好相反。它**绝不喂封禁名单**
+    （全局超限是「进程饱和」而不是「这个调用者可恶」），且 `内部 api/health` 按精确路径豁免，
+    因为一个会答 429 的存活探针会被轮询方读成「服务挂了」，而重启会同时清掉窗口与封禁。
+    **Enforced**：`TestGlobalBucketIsAddressIndependent`、
+    `TestGlobalBucketExemptsExactPaths`、`TestGlobalRateLimitIsSharedAcrossAddresses`、
+    `TestGlobalRateLimitDoesNotBanTheCaller`（后两个在 `internal/api`，因为共享的
+    `BanList` 在装配层）——第一版真写成 per-IP，是负向对照抓到的。
+13. **自动封禁永不作用于可信代理/回环地址**。一旦部署丢了 `X-Forwarded-For`，`ClientIP`
+    会把所有客户端塌缩成代理自己的地址，封它一条请求就能把整个服务打挂。此时限流仍生效
+    （并打一行 `SECURITY:` 警告），封禁不生效。**Enforced**：
+    `TestBanListNeverBansATrustedProxy`（反证：去掉豁免即红）。
+14. **面板 CSP 的零值是安全态**：字段拼作 `DashboardCSPEnforce`（默认 false = Report-Only），
+    而**不是** `DashboardCSPReportOnly`。零值必须是「不强制执行」：策略写错时，report-only
+    只给一条 console 违反 + 一个能用的页面，enforce 给一个坏掉且没有可操作错误的面板。
+    **Enforced**：`TestDashboardCSPIsReportOnlyByDefault`（反证：把默认改成就地执行即红）、
+    `TestDashboardCSPStartsOutNotEnforcing`。
 
 ## 6. Boundaries and known debts
 

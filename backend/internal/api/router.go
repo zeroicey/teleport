@@ -46,6 +46,81 @@ type Server struct {
 	// applyLimiter throttles the public application endpoint. In-process by
 	// design: one binary, and a restart merely resets the window.
 	applyLimiter *applyLimiter
+
+	// guards holds the transport-level abuse controls (rate limiting, source
+	// bans). It is nil when SECURITY_MIDDLEWARE is off, and every method on it is
+	// nil-safe, so a disabled control means "no limiting" rather than "reject".
+	guards *guards
+}
+
+// guards is the set of per-class limiters plus the shared ban list.
+//
+// The classes are keyed by what the caller may do, not by URL shape, because the
+// budget a legitimate client needs is a property of the work: an agent posting
+// reports is different from a reader opening share links, and a login attempt
+// runs 600k PBKDF2 iterations while everything else is cheap.
+type guards struct {
+	bans       *httpx.BanList
+	login      *httpx.Limiter
+	publicRead *httpx.Limiter
+	write      *httpx.Limiter
+	global     *httpx.Limiter
+}
+
+// newGuards builds the abuse controls from configuration, or returns nil when
+// they are switched off.
+func newGuards(cfg *config.Config) *guards {
+	if !cfg.SecurityMiddleware {
+		return nil
+	}
+	return &guards{
+		bans: httpx.NewBanList(cfg.BlockedPrefixes, cfg.BanAfterRefusals,
+			cfg.BanStrikeTTL, cfg.BanTTL),
+		login:      httpx.NewLimiter(cfg.LoginRateLimit, time.Hour),
+		publicRead: httpx.NewLimiter(cfg.PublicReadRateLimit, time.Minute),
+		write:      httpx.NewLimiter(cfg.WriteRateLimit, time.Minute),
+		global:     httpx.NewLimiter(cfg.GlobalRateLimit, time.Second),
+	}
+}
+
+// The four accessors below exist so a nil *guards (guards disabled) yields a nil
+// limiter and a nil ban list, both of which are documented no-ops. That is what
+// keeps `if guards == nil` out of every call site and, more importantly, makes it
+// impossible for a disabled guard to accidentally become a rejecting one.
+
+func (g *guards) banList() *httpx.BanList {
+	if g == nil {
+		return nil
+	}
+	return g.bans
+}
+
+func (g *guards) loginLimiter() *httpx.Limiter {
+	if g == nil {
+		return nil
+	}
+	return g.login
+}
+
+func (g *guards) publicReadLimiter() *httpx.Limiter {
+	if g == nil {
+		return nil
+	}
+	return g.publicRead
+}
+
+func (g *guards) writeLimiter() *httpx.Limiter {
+	if g == nil {
+		return nil
+	}
+	return g.write
+}
+
+func (g *guards) globalLimiter() *httpx.Limiter {
+	if g == nil {
+		return nil
+	}
+	return g.global
 }
 
 // New builds the HTTP handler for the whole API.
@@ -60,6 +135,7 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 		render:       markdown.New(),
 		kDerive:      agentkey.KDerive(cfg.SessionSecret),
 		applyLimiter: newApplyLimiter(cfg.KeyApplyPerHour, time.Hour),
+		guards:       newGuards(cfg),
 	}
 
 	authCfg := httpx.AuthConfig{
@@ -113,6 +189,20 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 
 	p := cfg.RoutePrefix
 
+	// Route-level rate-limit classes, as Gin middleware.
+	//
+	// Applied per ROUTE rather than globally so one class's budget cannot be spent
+	// by another class's traffic: a reader paging through share links must not be
+	// able to exhaust the budget that a login attempt or an agent write needs.
+	// The global cap in the transport chain is the separate, address-independent
+	// backstop.
+	//
+	// Each falls through to c.Next() exactly like any other Gin middleware, so
+	// when the guards are off (development, tests) these are no-ops.
+	limitLogin := httpx.GinMiddleware(httpx.RateLimit(s.guards.loginLimiter(), s.guards.banList()))
+	limitPublicRead := httpx.GinMiddleware(httpx.RateLimit(s.guards.publicReadLimiter(), s.guards.banList()))
+	limitWrite := httpx.GinMiddleware(httpx.RateLimit(s.guards.writeLimiter(), s.guards.banList()))
+
 	// route registers one middleware+handler chain for each of the given methods.
 	// Middleware comes first, the handler last.
 	route := func(path string, methods []string, chain ...gin.HandlerFunc) {
@@ -134,13 +224,20 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	}
 
 	// -- public ---------------------------------------------------------------
+	//
+	// The health probe is deliberately NOT behind any limiter. It is what systemd,
+	// Caddy and the mainland observation points poll, and it is also the one route
+	// whose refusal would be read as "the service is down". Putting it behind a
+	// shared bucket would let a flood from one address make the service look dead
+	// to its own supervisor — a denial of service caused by the guard. It does
+	// still pass the transport chain, so a banned address is refused here too.
 	get(p+"/api/health", s.handleHealth)
-	get(p+"/api/share/:token", s.handleReadShare)
-	get(p+"/s/:token", s.handleSharePage)
+	get(p+"/api/share/:token", limitPublicRead, s.handleReadShare)
+	get(p+"/s/:token", limitPublicRead, s.handleSharePage)
 	// The body of a `format: "html"` report, framed by the share page above.
 	// Registered explicitly because unmatched /s/ paths are a JSON 404: an
 	// unregistered sub-path would answer the iframe with JSON.
-	get(p+"/s/:token/html", s.handleShareHTML)
+	get(p+"/s/:token/html", limitPublicRead, s.handleShareHTML)
 
 	// The one-step key hand-off page. Public by design: the link is forwarded to
 	// whoever should get the credential, and the thing that authorises the claim
@@ -148,8 +245,8 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	//
 	// The bare /k/ is registered too, so a truncated link renders the "this link
 	// is incomplete" page instead of falling through to the SPA shell.
-	get(p+"/k/:id", s.handleKeyHandoffPage)
-	get(p+"/k/", s.handleKeyHandoffPage)
+	get(p+"/k/:id", limitPublicRead, s.handleKeyHandoffPage)
+	get(p+"/k/", limitPublicRead, s.handleKeyHandoffPage)
 
 	// -- machine-readable usage guide -----------------------------------------
 	//
@@ -160,17 +257,17 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	// These sit at stable paths rather than behind a share link on purpose. A
 	// share link expires, so a guide distributed as one would eventually 410 on
 	// every agent that had cached it — the opposite of what this is for.
-	get(p+"/ai", s.handleAIGuideHTML)
-	get(p+"/ai.md", s.handleAIGuideMarkdown)
-	get(p+"/llms.txt", s.handleLLMsTxt)
+	get(p+"/ai", limitPublicRead, s.handleAIGuideHTML)
+	get(p+"/ai.md", limitPublicRead, s.handleAIGuideMarkdown)
+	get(p+"/llms.txt", limitPublicRead, s.handleLLMsTxt)
 
 	// -- agent ----------------------------------------------------------------
-	route(p+"/api/reports", []string{http.MethodPost}, requireAgent, s.handleCreateReport)
+	route(p+"/api/reports", []string{http.MethodPost}, requireAgent, limitWrite, s.handleCreateReport)
 	get(p+"/api/reports", requireAgent, s.handleListOwnReports)
 	get(p+"/api/reports/:id", requireAgent, s.handleGetReport)
-	route(p+"/api/reports/:id", []string{http.MethodPatch}, requireAgent, s.handleUpdateReport)
-	route(p+"/api/reports/:id", []string{http.MethodDelete}, requireAgent, s.handleDeleteReport)
-	route(p+"/api/share/:token/revoke", []string{http.MethodPost}, requireAgent, s.handleRevoke)
+	route(p+"/api/reports/:id", []string{http.MethodPatch}, requireAgent, limitWrite, s.handleUpdateReport)
+	route(p+"/api/reports/:id", []string{http.MethodDelete}, requireAgent, limitWrite, s.handleDeleteReport)
+	route(p+"/api/share/:token/revoke", []string{http.MethodPost}, requireAgent, limitWrite, s.handleRevoke)
 
 	// Key self-service. The application and renewal poll endpoints are their own
 	// public surface, protected by the claim secret in X-Teleport-Claim rather
@@ -179,7 +276,7 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	// POST applications is the one write an anonymous caller may make, so it is
 	// the one route behind the per-IP limiter.
 	route(p+"/api/agent-keys/applications", []string{http.MethodPost},
-		s.limitKeyApplications(), s.handleCreateKeyApplication)
+		s.limitKeyApplications(), limitWrite, s.handleCreateKeyApplication)
 	get(p+"/api/agent-keys/applications/:id", s.handlePollKeyApplication)
 	get(p+"/api/agent-keys/renewals/:id", s.handlePollRenewal)
 
@@ -188,38 +285,43 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	// recoverable by the agent itself instead of orphaning every report it ever
 	// published. Everything it can reach is a *request*; a human still decides.
 	route(p+"/api/agent-keys/renewals", []string{http.MethodPost},
-		requireAgentRenewal, s.handleCreateRenewal)
+		requireAgentRenewal, limitWrite, s.handleCreateRenewal)
 
 	// -- dashboard ------------------------------------------------------------
-	route(p+"/api/admin/login", []string{http.MethodPost}, s.handleLogin)
+	//
+	// Login is the tightest limit in the whole service: one password guards the
+	// dashboard, and each attempt costs a 600k-iteration PBKDF2 verification. The
+	// limiter runs BEFORE the handler, so a flood is refused without spending that
+	// CPU at all.
+	route(p+"/api/admin/login", []string{http.MethodPost}, limitLogin, s.handleLogin)
 	route(p+"/api/admin/logout", []string{http.MethodPost}, s.handleLogout)
 	get(p+"/api/admin/session", requireSession, s.handleSession)
 	get(p+"/api/admin/reports", requireSession, s.handleListReports)
 	get(p+"/api/admin/reports/:id", requireSession, s.handleAdminGetReport)
-	route(p+"/api/admin/reports/:id", []string{http.MethodPatch}, requireSession, s.handleAdminUpdateReport)
-	route(p+"/api/admin/reports/:id", []string{http.MethodDelete}, requireSession, s.handleAdminDeleteReport)
-	route(p+"/api/admin/reports/:id/shares", []string{http.MethodPost}, requireSession, s.handleCreateShare)
-	route(p+"/api/admin/shares/:token", []string{http.MethodPatch}, requireSession, s.handlePatchShare)
-	route(p+"/api/admin/shares/:token", []string{http.MethodDelete}, requireSession, s.handleDeleteShare)
+	route(p+"/api/admin/reports/:id", []string{http.MethodPatch}, requireSession, limitWrite, s.handleAdminUpdateReport)
+	route(p+"/api/admin/reports/:id", []string{http.MethodDelete}, requireSession, limitWrite, s.handleAdminDeleteReport)
+	route(p+"/api/admin/reports/:id/shares", []string{http.MethodPost}, requireSession, limitWrite, s.handleCreateShare)
+	route(p+"/api/admin/shares/:token", []string{http.MethodPatch}, requireSession, limitWrite, s.handlePatchShare)
+	route(p+"/api/admin/shares/:token", []string{http.MethodDelete}, requireSession, limitWrite, s.handleDeleteShare)
 
 	// Key administration. Every one of these is Session-gated: a human manages all
 	// keys, and no agent credential reaches this surface at all.
 	get(p+"/api/admin/keys", requireSession, s.handleAdminListKeys)
-	route(p+"/api/admin/keys", []string{http.MethodPost}, requireSession, s.handleAdminCreateKey)
+	route(p+"/api/admin/keys", []string{http.MethodPost}, requireSession, limitWrite, s.handleAdminCreateKey)
 	// One-step issuance: the administrator's decision is made here, when the link
 	// is generated, so the recipient never waits for a second action.
-	route(p+"/api/admin/key-handoffs", []string{http.MethodPost}, requireSession, s.handleCreateKeyHandoff)
-	route(p+"/api/admin/keys/:id", []string{http.MethodPatch}, requireSession, s.handleAdminPatchKey)
+	route(p+"/api/admin/key-handoffs", []string{http.MethodPost}, requireSession, limitWrite, s.handleCreateKeyHandoff)
+	route(p+"/api/admin/keys/:id", []string{http.MethodPatch}, requireSession, limitWrite, s.handleAdminPatchKey)
 	get(p+"/api/admin/key-applications", requireSession, s.handleAdminListKeyApplications)
 	route(p+"/api/admin/key-applications/:id/approve", []string{http.MethodPost},
-		requireSession, s.handleAdminApproveKeyApplication)
+		requireSession, limitWrite, s.handleAdminApproveKeyApplication)
 	route(p+"/api/admin/key-applications/:id/reject", []string{http.MethodPost},
-		requireSession, s.handleAdminRejectKeyApplication)
+		requireSession, limitWrite, s.handleAdminRejectKeyApplication)
 	get(p+"/api/admin/key-renewals", requireSession, s.handleAdminListRenewals)
 	route(p+"/api/admin/key-renewals/:id/approve", []string{http.MethodPost},
-		requireSession, s.handleAdminApproveRenewal)
+		requireSession, limitWrite, s.handleAdminApproveRenewal)
 	route(p+"/api/admin/key-renewals/:id/reject", []string{http.MethodPost},
-		requireSession, s.handleAdminRejectRenewal)
+		requireSession, limitWrite, s.handleAdminRejectRenewal)
 
 	// Serve the frontend from this same process when one is available. It is
 	// mounted as the unmatched-path fallback, so the SPA shell, its hashed assets
@@ -238,11 +340,17 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 	}
 	var static http.Handler
 	if build != nil {
-		static, err = spa.New(build, p, buildSource)
+		handler, err := spa.New(build, p, buildSource)
 		if err != nil {
 			return nil, fmt.Errorf("frontend build at %s is unusable: %w", buildSource, err)
 		}
-		slog.Info("serving frontend", "source", buildSource, "prefix", p)
+		// The dashboard shell and its assets get a CSP of their own. Report-only
+		// for now — see views.DashboardContentSecurityPolicy for why, and for the
+		// evidence that promotes it to enforcing.
+		handler.SetSecurityHeaders(views.DashboardSecurityHeaders(cfg.DashboardCSPEnforce))
+		static = handler
+		slog.Info("serving frontend", "source", buildSource, "prefix", p,
+			"cspEnforce", cfg.DashboardCSPEnforce)
 	} else {
 		slog.Warn("no frontend build available; serving API only")
 	}
@@ -297,6 +405,23 @@ func New(cfg *config.Config, st *store.Store) (http.Handler, error) {
 		httpx.LogRequests,
 		httpx.SecurityHeaders,
 		httpx.CORS(cfg.FrontendOrigins),
+		// The ban list runs before routing, so a blocked caller is refused on
+		// every path — including paths that do not exist. After SecurityHeaders
+		// and CORS so its 403 carries the same headers as every other response;
+		// before the encoded-slash check so a banned scanner costs nothing.
+		s.guards.banList().Blocked(),
+		// The global, address-independent backstop. Per-IP limits cannot bound a
+		// caller with many addresses (a single IPv6 /64 holds 2^64), so this is
+		// what makes the total cost to the process bounded regardless of where
+		// the traffic comes from.
+		//
+		// The health route is exempt by exact path. A liveness probe that answers
+		// 429 reads as "the service is down" to whatever is polling it, and
+		// because the limiter state is in-process, a supervisor restart would
+		// clear every window AND every ban — so a probe that can be pushed to 429
+		// is a way to reset the counters under attack. Its cost is one pooled
+		// database ping, so exempting it cannot be amplified into a write storm.
+		httpx.RateLimitGlobal(s.guards.globalLimiter(), cfg.Route("/api/health")),
 		// Before the engine, because routing is exactly what must not see it:
 		// Gin decodes %2F into a path separator while ServeMux did not, so
 		// /api%2Fhealth used to 404 and would otherwise now match /api/health —

@@ -533,3 +533,83 @@ func TestShellRevalidationReturns304(t *testing.T) {
 		t.Errorf("304 carried %d body bytes", rec.Body.Len())
 	}
 }
+
+// --- security headers ------------------------------------------------------
+
+// TestSecurityHeadersApplyToEveryPathThisHandlerServes is the mounting guard for
+// the dashboard's CSP.
+//
+// It is asserted through ServeHTTP, and over *every* kind of response this
+// handler produces, because the failure mode is a header set on the shell but
+// not on the hashed bundles (or vice versa) — a policy that silently stops
+// covering part of the surface. A unit assertion on the map would not catch
+// that.
+func TestSecurityHeadersApplyToEveryPathThisHandlerServes(t *testing.T) {
+	h := newTestHandler(t, "/p")
+	h.SetSecurityHeaders(map[string]string{
+		"Content-Security-Policy":           "default-src 'none'",
+		"Permissions-Policy":                "camera=()",
+		"X-Permitted-Cross-Domain-Policies": "none",
+	})
+
+	for _, path := range []string{
+		"/p/",                       // the shell
+		"/p/dashboard/reports/xyz",  // a client-side route → shell
+		"/p/assets/index-abc123.js", // a hashed bundle
+		"/p/fonts/fonts.css",        // a stable asset
+		"/p/favicon.ico",            // a real file
+	} {
+		rec := get(h, path)
+		if rec.Code != http.StatusOK {
+			t.Errorf("%s: status = %d, want 200", path, rec.Code)
+			continue
+		}
+		for header, want := range map[string]string{
+			"Content-Security-Policy":           "default-src 'none'",
+			"Permissions-Policy":                "camera=()",
+			"X-Permitted-Cross-Domain-Policies": "none",
+		} {
+			if got := rec.Header().Get(header); got != want {
+				t.Errorf("%s: %s = %q, want %q", path, header, got, want)
+			}
+		}
+	}
+}
+
+// TestSecurityHeadersDoNotOverwriteTheHandlersOwn keeps the other direction
+// honest: a policy that clobbered Content-Type or Cache-Control would break the
+// app while looking like hardening.
+func TestSecurityHeadersDoNotOverwriteTheHandlersOwn(t *testing.T) {
+	h := newTestHandler(t, "/p")
+	// Deliberately collides with a header the handler sets for real.
+	h.SetSecurityHeaders(map[string]string{
+		"Content-Type": "text/plain",
+	})
+
+	rec := get(h, "/p/assets/index-abc123.js")
+	if got := rec.Header().Get("Content-Type"); strings.HasPrefix(got, "text/plain") {
+		t.Errorf("Content-Type = %q; the security headers must not overwrite a decision made closer to the bytes", got)
+	}
+	if cc := rec.Header().Get("Cache-Control"); cc == "" {
+		t.Error("Cache-Control was lost")
+	}
+}
+
+// TestNoSecurityHeadersConfiguredChangesNothing is the disabled-state guard: the
+// zero value must add nothing at all, so the SPA handler behaves exactly as it
+// did before this feature existed.
+func TestNoSecurityHeadersConfiguredChangesNothing(t *testing.T) {
+	h := newTestHandler(t, "/p")
+
+	rec := get(h, "/p/")
+	for _, header := range []string{
+		"Content-Security-Policy",
+		"Content-Security-Policy-Report-Only",
+		"Permissions-Policy",
+		"X-Permitted-Cross-Domain-Policies",
+	} {
+		if got := rec.Header().Get(header); got != "" {
+			t.Errorf("%s = %q with nothing configured, want it absent", header, got)
+		}
+	}
+}
